@@ -66,6 +66,11 @@ class RouteNodeInfoSerializationTest {
   }
 
   @Test
+  fun routeTag_defaultSentinel_throwsIllegalArgumentException() {
+    assertFailsWith<IllegalArgumentException> { Route.Tag(Route.DEFAULT_ROUTE_SENTINEL) }
+  }
+
+  @Test
   fun route_nonPrimitiveValue_failsAsASerializationError() {
     assertFailsWith<SerializationException> { adkJson.decodeFromString(Route.serializer(), "{}") }
   }

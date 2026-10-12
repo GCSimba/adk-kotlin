@@ -48,7 +48,8 @@ import kotlin.jvm.JvmSynthetic
  *
  * When constructed, the [Workflow] checks the graph these edges form.
  *
- * @throws IllegalArgumentException if a routing map has no entries.
+ * @throws IllegalArgumentException if a routing map has no entries, or a string route is
+ *   [Route.DEFAULT_ROUTE_SENTINEL].
  * @throws IllegalStateException if an `on` was never completed with `then`.
  */
 @ExperimentalWorkflowApi

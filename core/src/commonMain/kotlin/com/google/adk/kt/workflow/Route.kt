@@ -43,8 +43,17 @@ import kotlinx.serialization.json.longOrNull
 @Serializable(with = RouteSerializer::class)
 sealed interface Route {
 
-  /** A route identified by a string, the common case. */
-  data class Tag(val value: String) : Route
+  /**
+   * A route identified by a string, the common case. Throws [IllegalArgumentException] for
+   * [DEFAULT_ROUTE_SENTINEL], which would read back from JSON as [Default].
+   */
+  data class Tag(val value: String) : Route {
+    init {
+      require(value != DEFAULT_ROUTE_SENTINEL) {
+        "Route.Tag cannot be \"$DEFAULT_ROUTE_SENTINEL\"; use Route.Default."
+      }
+    }
+  }
 
   /** A route identified by an integer. */
   data class Num(val value: Long) : Route
