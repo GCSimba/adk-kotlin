@@ -340,9 +340,14 @@ internal fun GenAiGenerateContentConfig.fromGenaiSdk(): GenerateContentConfig =
     continuationToken = continuationToken,
   )
 
-/** Converts an ADK [GenerateContentConfig] to a [GenAiGenerateContentConfig] for the GenAI SDK. */
-internal fun GenerateContentConfig.toGenaiSdk(): GenAiGenerateContentConfig =
-  GenAiGenerateContentConfig(
+/**
+ * Converts an ADK [GenerateContentConfig] to a [GenAiGenerateContentConfig] for the GenAI SDK. Any
+ * fields that ADK does not model come from [base].
+ */
+internal fun GenerateContentConfig.toGenaiSdk(
+  base: GenAiGenerateContentConfig = GenAiGenerateContentConfig()
+): GenAiGenerateContentConfig =
+  base.copy(
     tools = tools?.map { it.toGenaiSdk() },
     labels = labels,
     systemInstruction = systemInstruction?.toGenaiSdk(),

@@ -502,8 +502,12 @@ class GeminiContinuationTest {
       assertThat(responses.last().content?.parts?.single()?.text).isEqualTo("The answer is 42.")
       assertThat(responses.last().finishReason).isEqualTo(FinishReason.STOP)
       assertThat(server.takeRequestJson()).doesNotContainKey("continuationToken")
-      assertThat(server.takeRequestJson()["continuationToken"]?.jsonPrimitive?.content)
-        .isEqualTo(base64("state"))
+      val resumed = server.takeRequestJson()
+      assertThat(resumed["continuationToken"]?.jsonPrimitive?.content).isEqualTo(base64("state"))
+      assertThat(
+          resumed["contents"]?.jsonArray?.last()?.jsonObject?.get("role")?.jsonPrimitive?.content
+        )
+        .isEqualTo("model")
     }
   }
 

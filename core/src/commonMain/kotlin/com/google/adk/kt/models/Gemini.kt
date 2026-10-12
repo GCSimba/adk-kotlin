@@ -21,6 +21,7 @@ import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.logging.LoggerFactory
 import com.google.adk.kt.serialization.Json
+import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.GenerateContentConfig
 import com.google.adk.kt.types.GenerateContentResponse
@@ -34,6 +35,7 @@ import com.google.adk.kt.types.toGenaiSdk
 import com.google.genai.kotlin.Client
 import com.google.genai.kotlin.ClientException
 import com.google.genai.kotlin.GenAiApiException
+import com.google.genai.kotlin.types.GenerateContentConfig as GenAiGenerateContentConfig
 import com.google.genai.kotlin.types.HttpOptions
 import com.google.genai.kotlin.types.HttpRetryOptions
 import com.google.genai.kotlin.types.LiveConnectConfig as GenAiLiveConnectConfig
@@ -138,7 +140,11 @@ internal constructor(
       config: GenerateContentConfig,
     ): Flow<GenerateContentResponse> =
       delegate
-        .generateContentStream(model, contents.map { it.toGenaiSdk() }, config.toGenaiSdk())
+        .generateContentStream(
+          model,
+          contents.map { it.toGenaiSdk() },
+          config.toGenaiSdk(base = NO_AUTOMATIC_CONTINUATION),
+        )
         .map { it.fromGenaiSdk() }
 
     override suspend fun generateContent(
@@ -147,8 +153,26 @@ internal constructor(
       config: GenerateContentConfig,
     ): GenerateContentResponse =
       delegate
-        .generateContent(model, contents.map { it.toGenaiSdk() }, config.toGenaiSdk())
+        .generateContent(
+          model,
+          contents.map { it.toGenaiSdk() },
+          config.toGenaiSdk(base = NO_AUTOMATIC_CONTINUATION),
+        )
         .fromGenaiSdk()
+
+    companion object {
+      /**
+       * Turns off the GenAI SDK's automatic continuation because [Gemini] resumes paused
+       * generations itself. Decoding it from JSON lets ADK still build against SDK releases that
+       * lack the flag; those releases ignore it.
+       */
+      @OptIn(FrameworkInternalApi::class)
+      private val NO_AUTOMATIC_CONTINUATION: GenAiGenerateContentConfig =
+        adkJson.decodeFromString(
+          GenAiGenerateContentConfig.serializer(),
+          """{"automaticContinuation":false}""",
+        )
+    }
   }
 
   /**
