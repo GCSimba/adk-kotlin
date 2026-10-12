@@ -19,8 +19,10 @@ package com.google.adk.kt.agents
 import com.google.adk.kt.agents.LlmAgent.IncludeContents
 import com.google.adk.kt.callbacks.AfterToolCallback
 import com.google.adk.kt.callbacks.BeforeModelCallback
+import com.google.adk.kt.callbacks.BeforeToolCallback
 import com.google.adk.kt.callbacks.CallbackChoice
 import com.google.adk.kt.callbacks.OnModelErrorCallback
+import com.google.adk.kt.callbacks.OnToolErrorCallback
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.ids.Uuid
@@ -44,6 +46,7 @@ import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.Schema
 import com.google.adk.kt.types.Type
+import com.google.common.truth.Truth.assertThat
 import kotlin.test.assertFailsWith
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
@@ -864,6 +867,163 @@ class LlmAgentTest {
 
       assertFailsWith<IllegalArgumentException> { agent.runAsync(context).toList() }
     }
+
+  @Test
+  fun runAsync_toolNamedSetModelResponse_modelStillGivesTheFinalAnswer() {
+    runBlocking {
+      val model =
+        DummyModel.createSequential(
+          "gemini-3.0-pro",
+          listOf(
+            modelFunctionCallResponse("set_model_response", mapOf("answer" to "42"), id = "call_1"),
+            LlmResponse(content = modelMessage("The answer is 42.")),
+          ),
+        )
+      val userTool =
+        DummyTool("set_model_response", onRun = { _, _ -> mapOf("from" to "the user's tool") })
+      val agent =
+        LlmAgent(name = "test-agent", model = model, tools = listOf(userTool), outputKey = "result")
+      val session =
+        InMemorySessionService().createSession(SessionKey("app", "user", "test-session"))
+      val context = InvocationContext(agent = agent, session = session, runConfig = null)
+
+      val events = agent.runAsync(context).toList()
+
+      val finalEvent = events.last()
+      assertThat(finalEvent.content?.parts?.single()?.text).isEqualTo("The answer is 42.")
+      assertThat(finalEvent.actions.stateDelta["result"]).isEqualTo("The answer is 42.")
+    }
+  }
+
+  @Test
+  fun runAsync_withOutputSchemaAndTools_gemini3_unregisteredSetModelResponseCall_isNotTheAnswer() {
+    runBlocking {
+      val schema =
+        Schema(
+          type = Type.OBJECT,
+          properties = mapOf("answer" to Schema(type = Type.STRING)),
+          required = listOf("answer"),
+        )
+      // Gemini 3 registers no set_model_response tool, so this call is answered as tool-not-found.
+      val model =
+        DummyModel.createSequential(
+          "gemini-3.0-pro",
+          listOf(
+            modelFunctionCallResponse("set_model_response", mapOf("answer" to "42"), id = "call_1"),
+            LlmResponse(content = modelMessage("""{"answer": "42"}""")),
+          ),
+        )
+      val agent =
+        LlmAgent(
+          name = "test-agent",
+          model = model,
+          tools = listOf(DummyTool("my_tool")),
+          outputSchema = schema,
+          outputKey = "result",
+        )
+      val session =
+        InMemorySessionService().createSession(SessionKey("app", "user", "test-session"))
+      val context = InvocationContext(agent = agent, session = session, runConfig = null)
+
+      val events = agent.runAsync(context).toList()
+
+      val finalEvent = events.last()
+      assertThat(finalEvent.content?.parts?.single()?.text).isEqualTo("""{"answer": "42"}""")
+      assertThat(finalEvent.actions.stateDelta["result"]).isEqualTo(mapOf("answer" to "42"))
+    }
+  }
+
+  @Test
+  fun runAsync_gemini2_onToolErrorAnswersInvalidSetModelResponse_modelRetries() {
+    runBlocking {
+      val schema =
+        Schema(
+          type = Type.OBJECT,
+          properties = mapOf("answer" to Schema(type = Type.STRING)),
+          required = listOf("answer"),
+        )
+      val model =
+        DummyModel.createSequential(
+          "gemini-2.5-flash",
+          listOf(
+            modelFunctionCallResponse(
+              "set_model_response",
+              mapOf("wrong" to "value"),
+              id = "call_1",
+            ),
+            modelFunctionCallResponse("set_model_response", mapOf("answer" to "42"), id = "call_2"),
+          ),
+        )
+      // Like a retry plugin, the callback answers the failed call with guidance for the model.
+      val retryGuidance = OnToolErrorCallback { _, _, _, _ ->
+        CallbackChoice.Break(mapOf("error" to "Fix the arguments and call again."))
+      }
+      val agent =
+        LlmAgent(
+          name = "test-agent",
+          model = model,
+          tools = listOf(DummyTool("my_tool")),
+          outputSchema = schema,
+          outputKey = "result",
+          onToolErrorCallbacks = listOf(retryGuidance),
+        )
+      val session =
+        InMemorySessionService().createSession(SessionKey("app", "user", "test-session"))
+      val context = InvocationContext(agent = agent, session = session, runConfig = null)
+
+      val events = agent.runAsync(context).toList()
+
+      val finalEvent = events.last()
+      assertThat(finalEvent.content?.parts?.single()?.text).isEqualTo("""{"answer":"42"}""")
+      assertThat(finalEvent.actions.stateDelta["result"]).isEqualTo(mapOf("answer" to "42"))
+    }
+  }
+
+  @Test
+  fun runAsync_gemini2_beforeToolCallbackAnswersSetModelResponse_doesNotEndTurn() {
+    runBlocking {
+      val schema =
+        Schema(
+          type = Type.OBJECT,
+          properties = mapOf("answer" to Schema(type = Type.STRING)),
+          required = listOf("answer"),
+        )
+      val model =
+        DummyModel.createSequential(
+          "gemini-2.0-flash",
+          listOf(
+            modelFunctionCallResponse("set_model_response", mapOf("answer" to "42"), id = "call_1"),
+            modelFunctionCallResponse("set_model_response", mapOf("answer" to "43"), id = "call_2"),
+          ),
+        )
+      // The callback answers only the first call, so only the second reaches the tool.
+      val callback = BeforeToolCallback { context, _, args ->
+        if (context.functionCallId == "call_1") {
+          CallbackChoice.Break(mapOf("answer" to "from the callback"))
+        } else {
+          CallbackChoice.Continue(args)
+        }
+      }
+      val agent =
+        LlmAgent(
+          name = "test-agent",
+          model = model,
+          tools = listOf(DummyTool("my_tool")),
+          outputSchema = schema,
+          outputKey = "result",
+          beforeToolCallbacks = listOf(callback),
+        )
+      val session =
+        InMemorySessionService().createSession(SessionKey("app", "user", "test-session"))
+      val context = InvocationContext(agent = agent, session = session, runConfig = null)
+
+      val events = agent.runAsync(context).toList()
+
+      val finalEvent = events.last()
+      assertThat(finalEvent.content?.parts?.single()?.text).isEqualTo("""{"answer":"43"}""")
+      assertThat(finalEvent.actions.stateDelta["result"]).isEqualTo(mapOf("answer" to "43"))
+    }
+  }
 
   /**
    * Tool sets `toolContext.actions.endOfAgent = true` mid-invocation: the per-step loop in
