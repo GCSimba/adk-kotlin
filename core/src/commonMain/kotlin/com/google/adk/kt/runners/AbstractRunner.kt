@@ -56,6 +56,7 @@ import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.workflow.Node
 import com.google.adk.kt.workflow.NodeRunner
+import com.google.adk.kt.workflow.findUserMessageForInvocation
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
@@ -817,21 +818,6 @@ abstract class AbstractRunner : Runner {
           !event.branch.isNullOrEmpty()
       ) {
         return event.branch
-      }
-    }
-    return null
-  }
-
-  private fun findUserMessageForInvocation(events: List<Event>, invocationId: String): Content? {
-    for (event in events) {
-      if (
-        event.invocationId == invocationId &&
-          event.author == "user" &&
-          event.content != null &&
-          event.content.parts.isNotEmpty() &&
-          event.content.parts[0].text?.isNotEmpty() == true
-      ) {
-        return event.content
       }
     }
     return null

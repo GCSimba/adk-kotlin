@@ -43,10 +43,16 @@ internal class NodeState(
   fun toCheckpoint(): TypedData.MapValue =
     TypedData.MapValue(
       mapOf(
-        "status" to TypedData.IntValue(status.code),
-        "interrupts" to TypedData.ListValue(interrupts.map { TypedData.StringValue(it) }),
+        STATUS_KEY to TypedData.IntValue(status.code),
+        INTERRUPTS_KEY to TypedData.ListValue(interrupts.map { TypedData.StringValue(it) }),
       )
     )
+
+  companion object {
+    const val NODES_KEY: String = "nodes"
+    const val STATUS_KEY: String = "status"
+    const val INTERRUPTS_KEY: String = "interrupts"
+  }
 }
 
 /**

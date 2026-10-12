@@ -168,6 +168,11 @@ class LlmAgent(
     disallowTransferToPeers = disallowTransferToPeers,
   ) {
 
+  /** Always true, so a resumed agent node shows its model the answers to its long-running calls. */
+  @ExperimentalWorkflowApi
+  override val rerunOnResume: Boolean
+    get() = true
+
   /**
    * Controls how prior conversation history is included in this agent's model request.
    *
