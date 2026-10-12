@@ -21,6 +21,7 @@ package com.google.adk.kt.tools.mcp
 import com.google.adk.kt.testing.testToolContext
 import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.tools.ToolContext
+import com.google.adk.kt.tools.ToolFilter
 import com.google.adk.kt.types.FunctionDeclaration
 import com.google.common.truth.Truth.assertThat
 import kotlin.test.Test
@@ -68,12 +69,7 @@ class McpToolsetCoreTest {
   fun resources_areAddedOutsideTheServerToolFilter() = runBlocking {
     val session = FakeSession(supportsResources = true)
     val manager = FakeSessionManager(session)
-    val toolset =
-      core(
-        manager,
-        toolFilter = com.google.adk.kt.tools.ToolFilter.allowList("echo"),
-        useMcpResources = true,
-      )
+    val toolset = core(manager, toolFilter = ToolFilter.allowList("echo"), useMcpResources = true)
 
     assertThat(toolset.getTools().map { it.name })
       .containsExactly(
@@ -83,6 +79,38 @@ class McpToolsetCoreTest {
         "list_mcp_resource_templates",
       )
     Unit
+  }
+
+  @Test
+  fun reservedToolNames_areSkippedBeforeTheServerToolFilter() {
+    runBlocking {
+      val namesSeenByFilter = mutableListOf<String>()
+      val session =
+        FakeSession(
+          extraDefinitions =
+            listOf(
+                "transfer_to_agent",
+                "set_model_response",
+                "adk_request_input",
+                "transfer_to_agent_v2",
+              )
+              .map { McpToolDefinition(it, "Server tool") }
+        )
+      val toolset =
+        core(
+          FakeSessionManager(session),
+          toolFilter =
+            ToolFilter.Predicate { tool, _ ->
+              namesSeenByFilter += tool.name
+              true
+            },
+        )
+
+      assertThat(toolset.getTools().map { it.name })
+        .containsExactly("echo", "transfer_to_agent_v2")
+        .inOrder()
+      assertThat(namesSeenByFilter).containsExactly("echo", "transfer_to_agent_v2").inOrder()
+    }
   }
 
   @Test
@@ -566,6 +594,7 @@ class McpToolsetCoreTest {
     private val failToolDiscovery: Boolean = false,
     override val supportsResources: Boolean = false,
     private val definition: McpToolDefinition = McpToolDefinition("echo", "Echoes input"),
+    private val extraDefinitions: List<McpToolDefinition> = emptyList(),
     private val resourceContents: Map<String, List<McpClientResourceContent>> = emptyMap(),
     private val resourcePages: Map<String?, McpClientResourcePage> = emptyMap(),
     private val resourceTemplatePages: Map<String?, McpClientResourceTemplatePage> = emptyMap(),
@@ -594,7 +623,7 @@ class McpToolsetCoreTest {
     override suspend fun listTools(): List<McpToolDefinition> {
       listToolsCalls++
       if (failToolDiscovery) throw IllegalStateException("simulated discovery failure")
-      return listOf(definition)
+      return listOf(definition) + extraDefinitions
     }
 
     val callOptions = mutableListOf<McpToolCallOptions>()
@@ -679,7 +708,7 @@ class McpToolsetCoreTest {
 
 private fun core(
   sessionManager: McpClientSessionManager,
-  toolFilter: com.google.adk.kt.tools.ToolFilter? = null,
+  toolFilter: ToolFilter? = null,
   headerProvider: (suspend (com.google.adk.kt.agents.ReadonlyContext) -> Map<String, String>)? =
     null,
   useMcpResources: Boolean = false,
