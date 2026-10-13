@@ -86,7 +86,7 @@ fun BaseTool.asNode(name: String = this.name, config: NodeConfig = NodeConfig())
   ToolNode(this, name, config)
 
 /** Runs a [BaseTool] as a workflow node. Created by [asNode], which documents its behavior. */
-internal class ToolNode(private val tool: BaseTool, name: String, config: NodeConfig) :
+internal class ToolNode(internal val tool: BaseTool, name: String, config: NodeConfig) :
   BaseNode(name = name, description = tool.description, config = config) {
 
   init {

@@ -56,6 +56,8 @@ import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.workflow.Node
 import com.google.adk.kt.workflow.NodeRunner
+import com.google.adk.kt.workflow.ToolNode
+import com.google.adk.kt.workflow.Workflow
 import com.google.adk.kt.workflow.findUserMessageForInvocation
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.flow.Flow
@@ -275,11 +277,10 @@ abstract class AbstractRunner : Runner {
    * Closes this runner, releasing the resources it owns.
    *
    * Closes, in order, every [Toolset][com.google.adk.kt.tools.Toolset] and [BaseTool] reachable
-   * from [root]'s subtree (walking [BaseAgent.subAgents]), then the [pluginManager]. Mirrors ADK
-   * Python's `Runner.close`, which likewise collects toolsets recursively across the agent tree
-   * before closing plugins.
+   * from the root node or agent (walking sub-agents, workflow graphs, and tool nodes), then the
+   * [pluginManager].
    *
-   * Each resource is closed exactly once even when shared by several agents.
+   * Each resource is closed once, even when reached by multiple paths.
    *
    * A failure closing one resource never prevents the rest from being closed. Every failure is
    * collected; if there were any, the first is rethrown with the others attached to it via
@@ -290,16 +291,16 @@ abstract class AbstractRunner : Runner {
    *
    * Services that were supplied by the caller ([sessionService], [artifactService],
    * [memoryService]) are deliberately *not* closed -- the runner does not own them, and closing a
-   * shared client would break other users of it. Unlike ADK Python's `Runner.close`, it does not
-   * flush [sessionService] either; what a canceled run, or one that failed with an [Error], left
-   * pending is for the service's owner to flush.
+   * shared client would break other users of it. Nor does it flush [sessionService]; what a
+   * canceled run, or one that failed with an [Error], left pending is for the service's owner to
+   * flush.
    */
   override fun close() {
     val exceptions = mutableListOf<Exception>()
 
-    // Deduplicates so a tool shared by several agents is closed once.
+    // Deduplicates tools reached by multiple paths.
     val toolsToClose = mutableSetOf<AutoCloseable>()
-    (root as? BaseAgent)?.let { collectToolsToClose(it, toolsToClose) }
+    collectToolsToClose(root, toolsToClose)
 
     for (tool in toolsToClose) {
       closeQuietly(tool, if (tool is BaseTool) "tool '${tool.name}'" else "toolset", exceptions)
@@ -331,21 +332,21 @@ abstract class AbstractRunner : Runner {
   }
 
   /**
-   * Recursively collects every [Toolset][com.google.adk.kt.tools.Toolset] and [BaseTool] reachable
-   * from [current] and its [BaseAgent.subAgents] into [into]. Only [LlmAgent] carries tools, so
-   * other agent types contribute solely their sub-agents.
+   * Collects every [Toolset][com.google.adk.kt.tools.Toolset] and [BaseTool] reachable from
+   * [current] into [into], walking [BaseAgent.subAgents], [Workflow] graphs, and [ToolNode]s.
    */
-  private fun collectToolsToClose(current: BaseAgent, into: MutableSet<AutoCloseable>) {
-    if (current is LlmAgent) {
-      for (toolset in current.toolsets) {
-        into.add(toolset)
+  @OptIn(ExperimentalWorkflowApi::class)
+  private fun collectToolsToClose(current: Node, into: MutableSet<AutoCloseable>) {
+    when (current) {
+      is LlmAgent -> {
+        into.addAll(current.toolsets)
+        into.addAll(current.tools)
       }
-      for (tool in current.tools) {
-        into.add(tool)
-      }
+      is ToolNode -> into.add(current.tool)
+      is Workflow -> current.graph?.nodes?.forEach { collectToolsToClose(it, into) }
     }
-    for (sub in current.subAgents) {
-      collectToolsToClose(sub, into)
+    if (current is BaseAgent) {
+      for (sub in current.subAgents) collectToolsToClose(sub, into)
     }
   }
 

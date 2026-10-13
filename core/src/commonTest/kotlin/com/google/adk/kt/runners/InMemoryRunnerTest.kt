@@ -24,6 +24,7 @@ import com.google.adk.kt.agents.ResumabilityConfig
 import com.google.adk.kt.agents.RunConfig
 import com.google.adk.kt.agents.StreamingMode
 import com.google.adk.kt.agents.TypedData
+import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.apps.App
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
@@ -53,6 +54,10 @@ import com.google.adk.kt.types.FunctionDeclaration
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.UsageMetadata
+import com.google.adk.kt.workflow.Edge
+import com.google.adk.kt.workflow.Start
+import com.google.adk.kt.workflow.Workflow
+import com.google.adk.kt.workflow.asNode
 import com.google.common.truth.Truth.assertThat
 import kotlin.test.assertFailsWith
 import kotlinx.coroutines.flow.flowOf
@@ -259,6 +264,81 @@ class InMemoryRunnerTest {
     runner.close()
 
     assertThat(nestedTool.closeCount).isEqualTo(1)
+  }
+
+  @OptIn(ExperimentalWorkflowApi::class)
+  @Test
+  fun close_llmAgentInWorkflowRoot_closesItsToolsAndToolsets() {
+    // Arrange
+    val tool = RecordingTool("tool")
+    val toolset = RecordingToolset()
+    val subAgentTool = RecordingTool("sub-agent-tool")
+    val subAgent = llmAgent(name = "sub", tools = listOf(subAgentTool))
+    val agent =
+      llmAgent(
+        name = "graph-agent",
+        tools = listOf(tool),
+        toolsets = listOf(toolset),
+        subAgents = listOf(subAgent),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, agent)))
+    val runner = InMemoryRunner(app = App(appName = "app", rootNode = workflow))
+
+    // Act
+    runner.close()
+
+    // Assert
+    assertThat(tool.closeCount).isEqualTo(1)
+    assertThat(toolset.closeCount).isEqualTo(1)
+    assertThat(subAgentTool.closeCount).isEqualTo(1)
+  }
+
+  @OptIn(ExperimentalWorkflowApi::class)
+  @Test
+  fun close_toolNodeInWorkflowRoot_closesItsTool() {
+    // Arrange
+    val tool = RecordingTool("tool")
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, tool.asNode())))
+    val runner = InMemoryRunner(app = App(appName = "app", rootNode = workflow))
+
+    // Act
+    runner.close()
+
+    // Assert
+    assertThat(tool.closeCount).isEqualTo(1)
+  }
+
+  @OptIn(ExperimentalWorkflowApi::class)
+  @Test
+  fun close_nestedWorkflow_closesToolsInTheInnerGraph() {
+    // Arrange
+    val tool = RecordingTool("tool")
+    val inner = Workflow(name = "inner", edges = listOf(Edge(Start, tool.asNode())))
+    val outer = Workflow(name = "outer", edges = listOf(Edge(Start, inner)))
+    val runner = InMemoryRunner(app = App(appName = "app", rootNode = outer))
+
+    // Act
+    runner.close()
+
+    // Assert
+    assertThat(tool.closeCount).isEqualTo(1)
+  }
+
+  @OptIn(ExperimentalWorkflowApi::class)
+  @Test
+  fun close_toolReachedThroughAgentAndToolNode_closesItOnce() {
+    // Arrange
+    val shared = RecordingTool("shared")
+    val agent = llmAgent(name = "graph-agent", tools = listOf(shared))
+    val toolNode = shared.asNode(name = "shared-node")
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, agent), Edge(agent, toolNode)))
+    val runner = InMemoryRunner(app = App(appName = "app", rootNode = workflow))
+
+    // Act
+    runner.close()
+
+    // Assert
+    assertThat(shared.closeCount).isEqualTo(1)
   }
 
   @Test
