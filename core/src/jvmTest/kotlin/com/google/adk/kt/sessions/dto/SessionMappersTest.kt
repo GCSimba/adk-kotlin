@@ -16,24 +16,37 @@
 
 package com.google.adk.kt.sessions.dto
 
+import com.google.adk.kt.agents.TypedData
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
+import com.google.adk.kt.events.EventCompaction
+import com.google.adk.kt.events.ToolConfirmation
+import com.google.adk.kt.models.CacheMetadata
 import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.sessions.State
 import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.types.Blob
+import com.google.adk.kt.types.Citation
+import com.google.adk.kt.types.CitationMetadata
+import com.google.adk.kt.types.FinishReason
 import com.google.adk.kt.types.FunctionCall
+import com.google.adk.kt.types.GroundingMetadata
 import com.google.adk.kt.types.InteractionStatus
 import com.google.adk.kt.types.LiveServerSessionResumptionUpdate
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Transcription
 import com.google.adk.kt.types.TurnCompleteReason
+import com.google.adk.kt.types.UsageMetadata
 import com.google.adk.kt.types.VoiceActivity
 import com.google.adk.kt.types.VoiceActivityType
 import com.google.adk.kt.types.WordInfo
+import com.google.adk.kt.workflow.NodeInfo
+import com.google.adk.kt.workflow.Route
 import com.google.common.truth.Truth.assertThat
+import kotlinx.serialization.descriptors.elementNames
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -307,8 +320,8 @@ class SessionMappersTest {
   }
 
   @Test
-  fun eventToDto_transcriptionsRoundTrip_otherLiveSignalsAreNotCarried() {
-    // Transcriptions are proto fields; the other live signals are not.
+  fun eventToDto_withoutRawEvent_keepsOnlyTranscriptions() {
+    // Transcriptions are proto fields; the other live signals are only in rawEvent.
     val event =
       Event(
         author = "agent",
@@ -321,7 +334,7 @@ class SessionMappersTest {
         liveSessionResumptionUpdate = LiveServerSessionResumptionUpdate(newHandle = "handle-1"),
       )
 
-    val restored = event.toDto().toAdk()
+    val restored = event.toDto().copy(rawEvent = null).toAdk()
 
     assertThat(restored.inputTranscription).isEqualTo(event.inputTranscription)
     assertThat(restored.outputTranscription).isEqualTo(event.outputTranscription)
@@ -357,7 +370,8 @@ class SessionMappersTest {
 
   @OptIn(FrameworkInternalApi::class)
   @Test
-  fun sessionEventDtoToAdk_typedAndRawTranscriptions_typedWins() {
+  fun sessionEventDtoToAdk_typedAndRawTranscriptions_rawWins() {
+    // A readable rawEvent holds the whole event, so it wins over the typed fields.
     val dto =
       adkJson.decodeFromString(
         SessionEventDto.serializer(),
@@ -369,7 +383,25 @@ class SessionMappersTest {
       )
 
     assertThat(dto.toAdk().inputTranscription)
-      .isEqualTo(Transcription(text = "typed", finished = true))
+      .isEqualTo(Transcription(text = "raw", finished = true))
+  }
+
+  @OptIn(FrameworkInternalApi::class)
+  @Test
+  fun sessionEventDtoToAdk_unreadableRawEventWithTranscription_readsTranscription() {
+    // The timestamp makes the rawEvent unreadable as an Event, so the typed-field read runs.
+    val dto =
+      adkJson.decodeFromString(
+        SessionEventDto.serializer(),
+        """
+        {"author": "agent",
+         "rawEvent": {"timestamp": "x",
+           "inputTranscription": {"text": "is the room free", "finished": true}}}
+        """,
+      )
+
+    assertThat(dto.toAdk().inputTranscription)
+      .isEqualTo(Transcription(text = "is the room free", finished = true))
   }
 
   @OptIn(FrameworkInternalApi::class)
@@ -410,5 +442,160 @@ class SessionMappersTest {
     val keys = event.toDto().eventMetadata?.inputTranscription?.jsonObject?.keys
 
     assertThat(keys).containsExactly("text", "finished")
+  }
+
+  @OptIn(FrameworkInternalApi::class)
+  @Test
+  fun event_roundTripThroughRawEvent_restoresWholeEvent() {
+    val original =
+      Event(
+        id = "event-1",
+        invocationId = "inv-1",
+        author = "agent",
+        timestamp = 1_700_000_000_123L,
+        content =
+          modelMessage(
+            Part(
+              text = "hi",
+              thoughtSignature = byteArrayOf(-5, -1, 1),
+              partMetadata = mapOf("k" to "v"),
+            ),
+            Part(inlineData = Blob(mimeType = "image/png", data = byteArrayOf(1, 2, 3))),
+          ),
+        longRunningToolIds = setOf("call-1"),
+        partial = true,
+        turnComplete = true,
+        errorCode = "ERROR",
+        errorMessage = "message",
+        finishReason = FinishReason.STOP,
+        usageMetadata = UsageMetadata(promptTokenCount = 10, totalTokenCount = 12),
+        avgLogProbs = -0.5,
+        interrupted = true,
+        branch = "root.child",
+        groundingMetadata = GroundingMetadata(webSearchQueries = listOf("query")),
+        modelVersion = "model-1",
+        citationMetadata = CitationMetadata(listOf(Citation(uri = "https://example.com"))),
+        cacheMetadata =
+          CacheMetadata(
+            fingerprint = "fp",
+            contentsCount = 2,
+            cacheName = "projects/p/locations/l/cachedContents/c",
+            expireTime = 1_700_000_600_500L,
+            invocationsUsed = 1,
+            createdAt = 1_700_000_000_250L,
+          ),
+        customMetadata = mapOf("k" to "v"),
+        output = mapOf("n" to 1L),
+        nodeInfo = NodeInfo(path = "wf@1/a@1"),
+        turnCompleteReason = TurnCompleteReason.NEED_MORE_INPUT,
+        interactionStatus = InteractionStatus.IN_PROGRESS,
+        inputTranscription = Transcription(text = "hola", finished = true, languageCode = "es-ES"),
+        outputTranscription = Transcription(text = "hi", finished = false),
+        liveSessionId = "live-1",
+        liveSessionResumptionUpdate =
+          LiveServerSessionResumptionUpdate(newHandle = "handle-1", resumable = true),
+        voiceActivity = VoiceActivity(voiceActivityType = VoiceActivityType.ACTIVITY_START),
+        actions =
+          EventActions(
+              skipSummarization = true,
+              artifactDelta = mutableMapOf("file.txt" to 1),
+              transferToAgent = "other",
+              escalate = true,
+              endOfAgent = true,
+              requestedToolConfirmations =
+                mutableMapOf("call-1" to ToolConfirmation(confirmed = true, hint = "ok?")),
+              rewindBeforeInvocationId = "inv-0",
+              route = listOf(Route.Tag("next")),
+              agentState = TypedData.MapValue(mapOf("step" to TypedData.IntValue(2))),
+              compaction =
+                EventCompaction(
+                  startTimestamp = 1_700_000_000_100L,
+                  endTimestamp = 1_700_000_000_200L,
+                  compactedContent = modelMessage("summary"),
+                ),
+            )
+            .apply {
+              stateDelta["k"] = "v"
+              stateDelta["gone"] = State.REMOVED
+            },
+      )
+    // Every field is set, so a field the round trip loses fails the equality below.
+    assertThat(adkJson.encodeToJsonElement(Event.serializer(), original).jsonObject.keys)
+      .containsExactlyElementsIn(Event.serializer().descriptor.elementNames)
+    assertThat(
+        adkJson.encodeToJsonElement(EventActions.serializer(), original.actions).jsonObject.keys
+      )
+      .containsExactlyElementsIn(EventActions.serializer().descriptor.elementNames)
+
+    val restored = original.toDto().copy(name = "sessions/s1/events/server-id").toAdk()
+
+    assertThat(restored).isEqualTo(original)
+  }
+
+  @Test
+  fun eventToDto_outputNotJsonNative_isLeftOutOfRawEvent() {
+    data class NodeResult(val n: Int)
+    val event = Event(author = "node", timestamp = 1000L, output = NodeResult(3))
+
+    val rawEvent = event.toDto().rawEvent!!.jsonObject
+
+    assertThat(rawEvent.keys).doesNotContain("output")
+    assertThat(rawEvent["author"]!!.jsonPrimitive.content).isEqualTo("node")
+  }
+
+  @Test
+  fun eventToDto_rawEventCannotBeEncoded_isLeftOut() {
+    data class Payload(val n: Int)
+    val event =
+      Event(
+        author = "agent",
+        timestamp = 1000L,
+        content = modelMessage("kept"),
+        actions =
+          EventActions(
+            requestedToolConfirmations =
+              mutableMapOf("call-1" to ToolConfirmation(confirmed = false, payload = Payload(1)))
+          ),
+      )
+
+    val dto = event.toDto()
+
+    // The typed fields still store what they can.
+    assertThat(dto.rawEvent).isNull()
+    assertThat(dto.toAdk().content!!.parts.single().text).isEqualTo("kept")
+  }
+
+  @Test
+  fun sessionEventDtoToAdk_emptyRawEvent_usesTypedFields() {
+    val dto =
+      SessionEventDto(
+        name = "sessions/s1/events/server-id",
+        author = "agent",
+        timestamp = TimestampDto.fromEpochMillis(1000L),
+        content = Json.parseToJsonElement("""{"parts": [{"text": "typed"}]}"""),
+        rawEvent = JsonObject(emptyMap()),
+      )
+
+    val event = dto.toAdk()
+
+    assertThat(event.id).isEqualTo("server-id")
+    assertThat(event.content!!.parts.single().text).isEqualTo("typed")
+  }
+
+  @Test
+  fun sessionEventDtoToAdk_unreadableRawEvent_usesTypedFields() {
+    val dto =
+      SessionEventDto(
+        name = "sessions/s1/events/server-id",
+        author = "agent",
+        timestamp = TimestampDto.fromEpochMillis(1000L),
+        content = Json.parseToJsonElement("""{"parts": [{"text": "typed"}]}"""),
+        rawEvent = Json.parseToJsonElement("""{"id": "raw-id", "timestamp": "not a number"}"""),
+      )
+
+    val event = dto.toAdk()
+
+    assertThat(event.id).isEqualTo("server-id")
+    assertThat(event.content!!.parts.single().text).isEqualTo("typed")
   }
 }

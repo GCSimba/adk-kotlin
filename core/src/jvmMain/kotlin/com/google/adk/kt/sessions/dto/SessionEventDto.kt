@@ -24,8 +24,9 @@ import kotlinx.serialization.json.JsonElement
  * [JsonElement] that the mapper decodes to [com.google.adk.kt.types.Content].
  *
  * [name] is populated only on read (the resource-name path whose last segment is the local event
- * id) and never emitted on write. [rawEvent] is read only, for the transcriptions ADK Python stores
- * there and nowhere else, and this port never writes it.
+ * id) and never emitted on write. [rawEvent] holds the whole [com.google.adk.kt.events.Event] in
+ * this library's JSON form, since the API drops some typed fields; ADK Python writes its own form
+ * there.
  */
 @Serializable
 internal data class SessionEventDto(

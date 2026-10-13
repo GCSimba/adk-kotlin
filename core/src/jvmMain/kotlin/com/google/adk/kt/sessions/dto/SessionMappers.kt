@@ -30,6 +30,7 @@ import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.GroundingMetadata
 import com.google.adk.kt.types.Transcription
 import com.google.adk.kt.types.UsageMetadata
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Instant
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -72,11 +73,40 @@ internal fun Event.toDto(): SessionEventDto {
     content = content?.let { encodeContentToWire(it) },
     actions = actionsDto,
     eventMetadata = metadata,
+    rawEvent = toRawEvent(),
   )
 }
 
+/**
+ * Encodes the whole event for `rawEvent`, since the API drops some typed fields, or returns null
+ * when it cannot be encoded. An output that is not JSON-native is left out instead.
+ */
+@OptIn(FrameworkInternalApi::class)
+private fun Event.toRawEvent(): JsonElement? {
+  val storable =
+    if (output == null || convertOrNull("output") { anyToJsonElement(output) } != null) this
+    else copy(output = null)
+  return convertOrNull("rawEvent") { adkJson.encodeToJsonElement(Event.serializer(), storable) }
+}
+
+/**
+ * Converts an API event into an [Event], from `rawEvent` when it holds a readable event and from
+ * the typed fields otherwise.
+ */
 @OptIn(FrameworkInternalApi::class)
 internal fun SessionEventDto.toAdk(): Event {
+  val stored =
+    (rawEvent as? JsonObject)
+      ?.takeIf { it.isNotEmpty() }
+      ?.let { raw ->
+        convertOrNull("rawEvent") { adkJson.decodeFromJsonElement(Event.serializer(), raw) }
+      } ?: return fromTypedFields()
+  // The API's timestamp wins, since rawEvent's is read as seconds when it falls before 1973.
+  return timestamp?.let { stored.copy(timestamp = it.toEpochMillis()) } ?: stored
+}
+
+@OptIn(FrameworkInternalApi::class)
+private fun SessionEventDto.fromTypedFields(): Event {
   val id = name?.substringAfterLast('/') ?: ""
   val metadata = eventMetadata
   return Event(
@@ -248,6 +278,25 @@ private fun customMetadataFromDto(customMetadata: JsonElement): Map<String, Any?
         put(key, jsonElementToAny(value))
       }
     }
+  }
+
+/**
+ * Runs [convert], or logs the failure's type and returns null so that one bad value cannot fail a
+ * whole session load or append. The log omits the exception message, which can quote user data.
+ */
+private inline fun <T> convertOrNull(what: String, convert: () -> T): T? =
+  try {
+    convert()
+  } catch (e: CancellationException) {
+    throw e
+  } catch (e: IllegalArgumentException) {
+    // SerializationException is an IllegalArgumentException.
+    logger.warn { "Ignoring $what that cannot be converted (${e::class.simpleName})." }
+    null
+  } catch (e: IllegalStateException) {
+    // AnySerializer throws this for a JSON null where a non-null value is required.
+    logger.warn { "Ignoring $what that cannot be converted (${e::class.simpleName})." }
+    null
   }
 
 private val logger = LoggerFactory.getLogger(SessionEventDto::class)
