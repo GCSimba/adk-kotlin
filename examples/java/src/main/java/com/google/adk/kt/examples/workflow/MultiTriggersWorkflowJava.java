@@ -48,7 +48,7 @@ public final class MultiTriggersWorkflowJava {
         .edges(
             g -> {
               // START hands each branch the user's message as Content.
-              g.fromStart().then(List.of(makeUppercase, countCharacters, reverseString));
+              g.fromStart().then(makeUppercase, countCharacters, reverseString);
               // Without a JoinNode, each predecessor triggers its own run of send_message.
               g.from(makeUppercase).then(sendMessage);
               g.from(countCharacters).then(sendMessage);

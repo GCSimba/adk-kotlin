@@ -193,7 +193,7 @@ public final class OrderProcessingWorkflowJava {
               // Stage 1: the three branches run concurrently; risk_join waits for all of them.
               g.fromStart()
                   .then(parseOrder)
-                  .then(List.of(fraudCheck, inventory, creditCheck))
+                  .then(fraudCheck, inventory, creditCheck)
                   .joinTo(riskJoin)
                   .chain(assessRisk, riskDecision)
                   // Stage 2: route on risk decision; a route mapped to two nodes fans out.
@@ -205,7 +205,7 @@ public final class OrderProcessingWorkflowJava {
                         r.on("fraud").then(freezeAccount, alertSecOps);
                         r.otherwise(cancelOrder);
                       });
-              g.from(List.of(financeReview, complianceReview))
+              g.from(financeReview, complianceReview)
                   .joinTo(reviewJoin)
                   .then(reviewGate)
                   .route(
@@ -215,7 +215,7 @@ public final class OrderProcessingWorkflowJava {
                         r.on("recheck").then(assessRisk);
                         r.otherwise(cancelOrder);
                       });
-              g.from(List.of(freezeAccount, alertSecOps)).joinTo(auditJoin).then(cancelOrder);
+              g.from(freezeAccount, alertSecOps).joinTo(auditJoin).then(cancelOrder);
               // Stage 3: only one outcome runs per order, so the receipt needs no JoinNode.
               g.from(chargeCard).chain(shipOrder, sendReceipt);
               g.from(cancelOrder).then(sendReceipt);

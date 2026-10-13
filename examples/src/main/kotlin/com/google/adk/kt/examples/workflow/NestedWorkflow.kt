@@ -55,7 +55,7 @@ object NestedWorkflow {
 
     return workflow("nested_workflow") {
       Start.then(processInput)
-        .then(nodes(findFamousPerson, findHistoricalEvent))
+        .then(findFamousPerson, findHistoricalEvent)
         .joinTo(join)
         .then(aggregateResults)
     }

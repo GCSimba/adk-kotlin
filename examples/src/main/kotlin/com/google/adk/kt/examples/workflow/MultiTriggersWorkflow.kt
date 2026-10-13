@@ -39,7 +39,7 @@ object MultiTriggersWorkflow {
   fun create(): Workflow =
     workflow("multi_triggers") {
       // START hands each branch the user's message as Content.
-      Start.then(nodes(makeUppercase, countCharacters, reverseString))
+      Start.then(makeUppercase, countCharacters, reverseString)
       // With no JoinNode in between, each predecessor triggers its own run of send_message.
       makeUppercase.then(sendMessage)
       countCharacters.then(sendMessage)

@@ -96,6 +96,21 @@ class EdgeChainTest {
   }
 
   @Test
+  fun then_severalNodes_fansOutLikeTheKotlinDsl() {
+    // Arrange
+    val web = StubNode("web")
+    val docs = StubNode("docs")
+    val news = StubNode("news")
+    val gather = JoinNode("gather")
+
+    // Act
+    val chained = edges { from(Start).then(web, docs, news).joinTo(gather) }
+
+    // Assert
+    assertEquals(edges { Start.then(nodes(web, docs, news)).joinTo(gather) }, chained)
+  }
+
+  @Test
   fun from_group_joinsWithoutAFanOut() {
     // Arrange
     val web = StubNode("web")
@@ -123,6 +138,22 @@ class EdgeChainTest {
 
     // Assert
     assertEquals(edges { listOf(web, docs).joinTo(gather).then(write) }, chained)
+  }
+
+  @Test
+  fun from_severalNodes_joinsLikeTheKotlinDsl() {
+    // Arrange
+    val web = StubNode("web")
+    val docs = StubNode("docs")
+    val news = StubNode("news")
+    val gather = JoinNode("gather")
+    val write = StubNode("write")
+
+    // Act
+    val chained = edges { from(web, docs, news).joinTo(gather).then(write) }
+
+    // Assert
+    assertEquals(edges { nodes(web, docs, news).joinTo(gather).then(write) }, chained)
   }
 
   @Test

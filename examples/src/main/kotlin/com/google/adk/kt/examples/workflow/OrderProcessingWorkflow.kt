@@ -61,7 +61,7 @@ object OrderProcessingWorkflow {
       workflow("order_processing") {
         // Stage 1: the three branches run concurrently; risk_join waits for all of them.
         Start.then(parseOrder)
-          .then(nodes(fraudCheck, inventory, creditCheck))
+          .then(fraudCheck, inventory, creditCheck)
           .joinTo(riskJoin)
           .chain(assessRisk, riskDecision)
           // Stage 2: route on risk decision; a route mapped to two nodes fans out.

@@ -67,7 +67,7 @@ public final class ResearchWorkflowJava {
                 g.fromStart()
                     .then(plan)
                     // Fans out: both researchers run concurrently.
-                    .then(List.of(searchWeb, searchDocs))
+                    .then(searchWeb, searchDocs)
                     // Waits for both.
                     .joinTo(gather)
                     .chain(write, review, gate)

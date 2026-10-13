@@ -64,7 +64,7 @@ public final class NestedWorkflowJava {
             g ->
                 g.fromStart()
                     .then(new ProcessInput())
-                    .then(List.of(findFamousPerson, findHistoricalEvent))
+                    .then(findFamousPerson, findHistoricalEvent)
                     .joinTo(join)
                     .then(new AggregateResults()))
         .build();

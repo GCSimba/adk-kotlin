@@ -103,9 +103,8 @@ class EdgesBuilder internal constructor() {
     rest.fold(this then first then second) { last, node -> last then node }
 
   /**
-   * Fans out by connecting this node to each node in [targets] so they run concurrently, as in
-   * `a.then(nodes(b, c))`. Returns [targets], which [joinTo] connects to a [JoinNode] to continue
-   * once they all complete.
+   * Fans out to each node in [targets] so they run concurrently, as in `a then nodes(b, c)`.
+   * Returns [targets], which [joinTo] connects to a [JoinNode] to continue once they all complete.
    */
   @CanIgnoreReturnValue
   @JvmSynthetic
@@ -123,17 +122,27 @@ class EdgesBuilder internal constructor() {
   infix fun Node.then(targets: Collection<Node>): NodeGroup = then(NodeGroup(targets.toList()))
 
   /**
-   * Groups [nodes] without connecting them, for a fan-out `then` or a [joinTo], as in
-   * `a.then(nodes(b, c))` or `nodes(b, c).joinTo(join)`. Prefer it over `listOf(b, c)` for a
-   * fan-out or a join, because `listOf` infers the nodes' closest common supertype. For some
-   * built-in nodes of different types, such as a [Workflow] and a [JoinNode], that supertype is the
+   * Fans out by connecting this node to [first], [second], and each node in [rest] so they run
+   * concurrently, as in `a.then(b, c)`. Returns them as a [NodeGroup] for [joinTo]. Infix chains
+   * still need `a then nodes(b, c)` because an infix call takes one argument.
+   */
+  @CanIgnoreReturnValue
+  @JvmSynthetic
+  fun Node.then(first: Node, second: Node, vararg rest: Node): NodeGroup =
+    then(nodes(first, second, *rest))
+
+  /**
+   * Groups [nodes] without connecting them, as in `a then nodes(b, c)` for an infix fan-out or
+   * `nodes(b, c).joinTo(join)` for a join. Prefer this over `listOf(b, c)` for fan-outs and joins
+   * because `listOf` infers the nodes' closest common supertype. For some built-in nodes of
+   * different types, such as a [Workflow] and a [JoinNode], that supertype is the
    * framework-internal `BaseNode`, so the call fails to compile.
    */
   fun nodes(vararg nodes: Node): NodeGroup = NodeGroup(nodes.toList())
 
   /**
    * Fans in by connecting each node of this group to [join], which runs once all of them complete.
-   * Returns [join] so the chain continues from it: `a.then(nodes(b, c)).joinTo(join).then(d)`.
+   * Returns [join] so the chain continues from it: `a.then(b, c).joinTo(join).then(d)`.
    */
   @CanIgnoreReturnValue
   @JvmSynthetic
@@ -240,18 +249,26 @@ class EdgesBuilder internal constructor() {
   @AdkJavaInteropApi fun fromStart(): EdgeChain = from(Start)
 
   /**
-   * Starts a chain of edges at [group] for Java callers, so the group can join without a fan-out:
-   * `g.from(g.nodes(a, b)).joinTo(join)`.
+   * Starts a chain of edges at [group] (such as one built with [nodes]) for Java callers so the
+   * group can join without a fan-out.
    */
   @AdkJavaInteropApi fun from(group: NodeGroup): NodeGroupChain = NodeGroupChain(this, group)
 
   /**
-   * Starts a chain of edges at [nodes] for Java callers, so they can join without a fan-out:
-   * `g.from(List.of(a, b)).joinTo(join)`.
+   * Starts a chain of edges at [nodes] (such as a computed list) for Java callers so the nodes can
+   * join without a fan-out. For a fixed set of nodes, the `g.from(a, b)` overload is shorter.
    */
   @AdkJavaInteropApi
   fun from(nodes: Collection<Node>): NodeGroupChain =
     NodeGroupChain(this, NodeGroup(nodes.toList()))
+
+  /**
+   * Starts a chain of edges at [first], [second], and each node in [rest] for Java callers so they
+   * can join without a fan-out: `g.from(a, b).joinTo(join)`.
+   */
+  @AdkJavaInteropApi
+  fun from(first: Node, second: Node, vararg rest: Node): NodeGroupChain =
+    from(nodes(first, second, *rest))
 
   /** Returns the edges declared so far, failing if an [on] was left without a target. */
   internal fun build(): List<Edge> {
@@ -512,12 +529,20 @@ class EdgeChain internal constructor(private val builder: EdgesBuilder, private 
     with(builder) { NodeGroupChain(builder, node.then(targets)) }
 
   /**
-   * Fans out from the current node to each node in [targets] and continues from them as a group. An
-   * empty collection adds no edges.
+   * Fans out from the current node to each node in [targets] (such as a computed list) and
+   * continues from them as a group. An empty collection adds no edges.
    */
   @CanIgnoreReturnValue
   fun then(targets: Collection<Node>): NodeGroupChain =
     with(builder) { NodeGroupChain(builder, node.then(targets)) }
+
+  /**
+   * Fans out from the current node to [first], [second], and each node in [rest], and continues
+   * from them as a group: `g.from(a).then(b, c).joinTo(join)`.
+   */
+  @CanIgnoreReturnValue
+  fun then(first: Node, second: Node, vararg rest: Node): NodeGroupChain =
+    with(builder) { NodeGroupChain(builder, node.then(first, second, *rest)) }
 
   /**
    * Starts an edge that fires when the current node emits [route] as a [Route.Tag];

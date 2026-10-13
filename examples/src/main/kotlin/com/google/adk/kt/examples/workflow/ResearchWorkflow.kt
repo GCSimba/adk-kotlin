@@ -62,7 +62,7 @@ object ResearchWorkflow {
 
     return workflow("research") {
       Start.then(plan)
-        .then(nodes(searchWeb, searchDocs)) // Fans out: both researchers run concurrently.
+        .then(searchWeb, searchDocs) // Fans out: both researchers run concurrently.
         .joinTo(gather) // Waits for both.
         .chain(write, review, gate)
         .route {

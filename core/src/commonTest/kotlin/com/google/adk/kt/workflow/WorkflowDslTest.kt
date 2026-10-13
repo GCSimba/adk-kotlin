@@ -183,6 +183,33 @@ class WorkflowDslTest {
   }
 
   @Test
+  fun then_varargNodes_fansOutToEachAndReturnsTheGroup() {
+    // Arrange
+    val plan = StubNode("plan")
+    val web = StubNode("web")
+    val docs = StubNode("docs")
+    val news = StubNode("news")
+    val gather = JoinNode("gather")
+
+    // Act
+    val edges = edges { Start.then(plan).then(web, docs, news).joinTo(gather) }
+
+    // Assert
+    assertEquals(
+      listOf(
+        Edge(Start, plan),
+        Edge(plan, web),
+        Edge(plan, docs),
+        Edge(plan, news),
+        Edge(web, gather),
+        Edge(docs, gather),
+        Edge(news, gather),
+      ),
+      edges,
+    )
+  }
+
+  @Test
   fun then_emptyCollection_addsNoEdges() {
     // Arrange
     val plan = StubNode("plan")
