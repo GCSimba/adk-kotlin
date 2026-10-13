@@ -102,8 +102,7 @@ internal data class AndroidMcpTimeouts(
  * stdio, legacy SSE, and OAuth flows remain application concerns.
  *
  * ADK declares the Kotlin MCP SDK and Ktor OkHttp engine as `compileOnly`. The app that uses this
- * toolset must add those dependencies. Gemini (google-genai-kotlin 1.4.0 / Ktor 2) and MCP (Ktor 3)
- * still cannot share one Android process until genai-kotlin moves to Ktor 3.
+ * toolset must add those dependencies.
  */
 @OptIn(ExperimentalAtomicApi::class)
 internal class AndroidMcpToolset
@@ -293,24 +292,23 @@ private constructor(
     override fun close() = closeConnection()
   }
 
-  private suspend fun activeConnection(): Connection =
-    connectionMutex.withLock {
-      check(!closed) { "AndroidMcpToolset is closed." }
-      connection.load()
-        ?: createConnection().also { newConnection ->
-          if (closed) {
-            closeAfterToolsetClose(newConnection)
-            throw IllegalStateException("AndroidMcpToolset is closed.")
-          }
-          connection.store(newConnection)
-          // close() may set `closed` after the check above but before publication. Detach and close
-          // this just-created client so it cannot outlive the closed toolset.
-          if (closed && connection.compareAndSet(newConnection, null)) {
-            closeAfterToolsetClose(newConnection)
-            throw IllegalStateException("AndroidMcpToolset is closed.")
-          }
+  private suspend fun activeConnection(): Connection = connectionMutex.withLock {
+    check(!closed) { "AndroidMcpToolset is closed." }
+    connection.load()
+      ?: createConnection().also { newConnection ->
+        if (closed) {
+          closeAfterToolsetClose(newConnection)
+          throw IllegalStateException("AndroidMcpToolset is closed.")
         }
-    }
+        connection.store(newConnection)
+        // close() may set `closed` after the check above but before publication. Detach and close
+        // this just-created client so it cannot outlive the closed toolset.
+        if (closed && connection.compareAndSet(newConnection, null)) {
+          closeAfterToolsetClose(newConnection)
+          throw IllegalStateException("AndroidMcpToolset is closed.")
+        }
+      }
+  }
 
   private suspend fun createConnection(): Connection {
     var newHttpClient: HttpClient? = null
@@ -338,13 +336,12 @@ private constructor(
   }
 
   private suspend fun invalidateConnection(expected: Connection? = null) {
-    val closing =
-      connectionMutex.withLock {
-        val active = connection.load()
-        if (active != null && (expected == null || active === expected)) {
-          active.takeIf { connection.compareAndSet(active, null) }
-        } else null
-      }
+    val closing = connectionMutex.withLock {
+      val active = connection.load()
+      if (active != null && (expected == null || active === expected)) {
+        active.takeIf { connection.compareAndSet(active, null) }
+      } else null
+    }
     closing?.let { stale ->
       try {
         stale.transport.terminateSession()
@@ -713,14 +710,13 @@ private class ProtocolVersionTransport(private val http: StreamableHttpClientTra
 
   override fun onError(block: (Throwable) -> Unit) = http.onError(block)
 
-  override fun onMessage(block: suspend (JSONRPCMessage) -> Unit) =
-    http.onMessage { message ->
-      val result = (message as? JSONRPCResponse)?.result
-      if (result is InitializeResult) {
-        http.protocolVersion = result.protocolVersion
-      }
-      block(message)
+  override fun onMessage(block: suspend (JSONRPCMessage) -> Unit) = http.onMessage { message ->
+    val result = (message as? JSONRPCResponse)?.result
+    if (result is InitializeResult) {
+      http.protocolVersion = result.protocolVersion
     }
+    block(message)
+  }
 }
 
 /**

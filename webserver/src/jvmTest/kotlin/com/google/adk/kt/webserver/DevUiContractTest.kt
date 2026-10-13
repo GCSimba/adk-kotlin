@@ -20,8 +20,7 @@ import com.google.adk.kt.webserver.dev.adkDevModule
 import com.google.common.truth.Truth.assertWithMessage
 import io.ktor.client.request.get
 import io.ktor.server.application.plugin
-import io.ktor.server.routing.Route
-import io.ktor.server.routing.Routing
+import io.ktor.server.routing.RoutingRoot
 import io.ktor.server.routing.getAllRoutes
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
@@ -86,7 +85,7 @@ class DevUiContractTest {
     val routes = mutableListOf<String>()
     application {
       adkDevModule(testConfig())
-      routes += plugin(Routing).getAllRoutes().map(Route::toString)
+      routes += plugin(RoutingRoot).getAllRoutes().map { it.toString() }
     }
     // testApplication builds the Application lazily, so force it.
     client.get("/health")

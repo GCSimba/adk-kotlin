@@ -28,7 +28,6 @@ import com.google.adk.kt.webserver.models.AgentRunRequest
 import com.google.adk.kt.webserver.models.SseError
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
-import io.ktor.server.application.call
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytesWriter
 import io.ktor.server.routing.Route
@@ -38,10 +37,8 @@ import io.ktor.utils.io.writeStringUtf8
 import java.lang.invoke.MethodHandles
 import java.util.UUID
 import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.toList
-import kotlinx.serialization.encodeToString
 import org.slf4j.LoggerFactory
 
 private val logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass())
@@ -92,8 +89,7 @@ internal fun Route.runRoutes(
 
     val sessionId = request.sessionId ?: UUID.randomUUID().toString()
 
-    // Ktor 2.x has no SSE plugin, so stream manually. Use async respondBytesWriter, not
-    // respondTextWriter, whose blocking bridge parks via a coroutines internal gone in 1.11.0.
+    // respondBytesWriter, not respondTextWriter, which writes through a blocking Writer.
     call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
       runner
         .runAsync(

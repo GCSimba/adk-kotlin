@@ -198,9 +198,7 @@ data class RemoteMcpToolsetConfig(
    * SDK/transport types.
    *
    * On Android, ADK declares the Kotlin MCP SDK and Ktor OkHttp engine as `compileOnly`. An app
-   * that uses this toolset must add those dependencies itself. google-genai-kotlin 1.4.0 still
-   * depends on Ktor 2, so an Android app cannot use Gemini and MCP in the same process until
-   * genai-kotlin moves to Ktor 3.
+   * that uses this toolset must add those dependencies itself.
    */
   @JvmOverloads
   fun toToolset(

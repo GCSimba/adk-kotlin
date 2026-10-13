@@ -21,10 +21,8 @@ import com.google.adk.kt.tools.Toolset
 
 internal const val ANDROID_MCP_RUNTIME_MISSING =
   "Android MCP requires io.modelcontextprotocol:kotlin-sdk-client and io.ktor:ktor-client-okhttp " +
-    "on the runtime classpath. ADK declares them as compileOnly so apps that do not use MCP are " +
-    "not forced onto Ktor 3 (which currently conflicts with google-genai-kotlin's Ktor 2). " +
-    "An app that uses both MCP and Gemini on Android will still conflict until genai-kotlin " +
-    "moves to Ktor 3."
+    "on the runtime classpath. ADK declares them as compileOnly so apps that do not use MCP " +
+    "don't inherit them."
 
 internal fun ensureAndroidMcpRuntime(loadClass: (String) -> Class<*> = { Class.forName(it) }) {
   try {

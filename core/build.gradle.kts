@@ -137,11 +137,9 @@ kotlin {
         implementation(libs.kotlinx.coroutines.guava)
         // compileOnly, not implementation: don't force the SDK onto every consumer of core.
         compileOnly(libs.androidx.appfunctions)
-        // compileOnly so Android apps that only use Gemini are not upgraded onto Ktor 3 via the
-        // MCP Kotlin SDK. Apps that call RemoteMcpToolsetConfig.toToolset() must add these
-        // themselves.
+        // compileOnly: the MCP SDK's newer kotlin-stdlib would raise Android apps' Kotlin floor.
         compileOnly(libs.mcp.kotlin.client)
-        compileOnly(libs.ktor.client.okhttp.mcp)
+        compileOnly(libs.ktor.client.okhttp)
       }
     }
     getByName("androidHostTest") {
@@ -160,8 +158,8 @@ kotlin {
         // The real dependency here (not compileOnly) so the Robolectric AppFunctions tests run.
         implementation(libs.androidx.appfunctions)
         implementation(libs.mcp.kotlin.client)
-        implementation(libs.ktor.client.okhttp.mcp)
-        implementation(libs.ktor.client.mock.mcp)
+        implementation(libs.ktor.client.okhttp)
+        implementation(libs.ktor.client.mock)
       }
     }
 
