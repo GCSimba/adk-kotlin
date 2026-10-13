@@ -35,6 +35,7 @@ import com.google.genai.kotlin.GenAiApiException
 import com.google.genai.kotlin.types.HttpOptions
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import java.util.Base64
 import java.util.Date
 import java.util.concurrent.TimeUnit
 import kotlin.test.AfterTest
@@ -43,6 +44,7 @@ import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.test.assertSame
 import kotlin.time.Duration.Companion.minutes
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
@@ -267,6 +269,106 @@ class GeminiJvmTest {
   }
 
   @Test
+  fun generateContent_pausedGeneration_isResumedWithSummedUsage() {
+    mockServer.enqueue(
+      json(
+        responseJson(
+          "The answer is",
+          candidateFields("CONTINUATION", token = "state"),
+          usageJson(prompt = 10, candidates = 5, total = 15),
+        )
+      )
+    )
+    mockServer.enqueue(
+      json(
+        responseJson(
+          " 42.",
+          candidateFields("STOP"),
+          usageJson(prompt = 15, candidates = 3, total = 18),
+        )
+      )
+    )
+
+    val response = runBlocking { generateThroughMockServer(stream = false) }.single()
+
+    assertThat(response.content?.parts?.map { it.text })
+      .containsExactly("The answer is", " 42.")
+      .inOrder()
+    assertThat(response.finishReason).isEqualTo(FinishReason.STOP)
+    assertUsage(response, prompt = 10 + 15, candidates = 5 + 3, total = 15 + 18)
+    val first = takeRequestBody()
+    val resumed = takeRequestBody()
+    assertThat(first).doesNotContain("continuationToken")
+    assertThat(resumed).contains(""""continuationToken":"${base64("state")}"""")
+    // The SDK resends the original request, not the output so far.
+    assertThat(resumed).doesNotContain("The answer is")
+  }
+
+  @Test
+  fun generateContent_pausedStream_isResumedWithSummedUsage() {
+    mockServer.enqueue(
+      sse(
+        responseJson("The answer"),
+        responseJson(
+          " is",
+          candidateFields("CONTINUATION", token = "state"),
+          usageJson(prompt = 10, candidates = 5, total = 15),
+        ),
+      )
+    )
+    mockServer.enqueue(
+      sse(
+        responseJson(
+          " 42.",
+          candidateFields("STOP"),
+          usageJson(prompt = 15, candidates = 3, total = 18),
+        )
+      )
+    )
+
+    val responses = runBlocking { generateThroughMockServer(stream = true) }
+
+    assertResponse(
+      responses.last(),
+      expectedText = "The answer is 42.",
+      isPartial = false,
+      expectedFinishReason = "STOP",
+    )
+    assertUsage(responses.last(), prompt = 10 + 15, candidates = 5 + 3, total = 15 + 18)
+    assertThat(responses.map { it.finishReason }).doesNotContain(FinishReason.CONTINUATION)
+    assertThat(mockServer.requestCount).isEqualTo(2)
+  }
+
+  @Test
+  fun generateContent_streamCollectorThrows_sendsNoFurtherRequest() {
+    mockServer.enqueue(
+      sse(
+        responseJson("The answer", candidateFields(token = "checkpoint")),
+        responseJson(" is", candidateFields("CONTINUATION", token = "state")),
+      )
+    )
+    mockServer.enqueue(sse(responseJson(" 42.", candidateFields("STOP"))))
+
+    assertFailsWith<CollectorException> {
+      runBlocking { generateContentFlow(stream = true).collect { throw CollectorException() } }
+    }
+
+    assertThat(mockServer.requestCount).isEqualTo(1)
+  }
+
+  @Test
+  fun generateContent_maxTokensWithToken_isNotResumed() {
+    mockServer.enqueue(
+      json(responseJson("The answer is", candidateFields("MAX_TOKENS", token = "state")))
+    )
+
+    val response = runBlocking { generateThroughMockServer(stream = false) }.single()
+
+    assertThat(response.finishReason).isEqualTo(FinishReason.MAX_TOKENS)
+    assertThat(mockServer.requestCount).isEqualTo(1)
+  }
+
+  @Test
   fun generateContent_streaming_emitsPartialAndFinalResponses() = runTest {
     val client = Client(apiKey = "fake")
     val mockModels = mock<Gemini.GeminiModels>()
@@ -447,11 +549,11 @@ class GeminiJvmTest {
       }
 
   /**
-   * Drives a [Gemini.generateContent] flow against the mock server through the test-only
+   * Returns a [Gemini.generateContent] flow from the mock server through the test-only
    * [Gemini.withBaseUrl] factory, which applies the production HTTP options (tracking headers and
    * retries).
    */
-  private suspend fun collectGenerateContent(stream: Boolean) {
+  private fun generateContentFlow(stream: Boolean): Flow<LlmResponse> =
     Gemini.withBaseUrl(
         name = "gemini-3.1-flash-preview",
         apiKey = "fake-key",
@@ -461,7 +563,49 @@ class GeminiJvmTest {
         LlmRequest(contents = listOf(userMessage("Hello")), config = GenerateContentConfig()),
         stream = stream,
       )
-      .toList()
+
+  private suspend fun generateThroughMockServer(stream: Boolean): List<LlmResponse> =
+    generateContentFlow(stream).toList()
+
+  /** Runs [generateThroughMockServer] for tests that check only the requests it sends. */
+  private suspend fun collectGenerateContent(stream: Boolean) {
+    val unused = generateThroughMockServer(stream)
+  }
+
+  private fun takeRequestBody(): String =
+    mockServer.takeRequest(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)?.body?.utf8().orEmpty()
+
+  private fun json(body: String) =
+    MockResponse(headers = Headers.headersOf("Content-Type", "application/json"), body = body)
+
+  /** A server-sent event stream with one `data:` event per chunk. */
+  private fun sse(vararg chunks: String) =
+    MockResponse(
+      headers = Headers.headersOf("Content-Type", "text/event-stream"),
+      body = chunks.joinToString("") { "data: $it\n\n" },
+    )
+
+  /** A response with one candidate holding [text] and [candidateFields], then [usage]. */
+  private fun responseJson(text: String, candidateFields: String = "", usage: String = "") =
+    """{"candidates":[{"content":{"role":"model","parts":[{"text":"$text"}]}$candidateFields}]$usage}"""
+
+  /** Candidate fields with [finishReason] and [token], each left out when null. */
+  private fun candidateFields(finishReason: String? = null, token: String? = null): String =
+    finishReason?.let { ""","finishReason":"$it"""" }.orEmpty() +
+      token?.let { ""","continuationToken":"${base64(it)}"""" }.orEmpty()
+
+  private fun usageJson(prompt: Int, candidates: Int, total: Int) =
+    ""","usageMetadata":{"promptTokenCount":$prompt,"candidatesTokenCount":$candidates,""" +
+      """"totalTokenCount":$total}"""
+
+  private fun base64(token: String): String =
+    Base64.getEncoder().encodeToString(token.encodeToByteArray())
+
+  private fun assertUsage(response: LlmResponse, prompt: Int, candidates: Int, total: Int) {
+    val usage = checkNotNull(response.usageMetadata)
+    assertThat(usage.promptTokenCount).isEqualTo(prompt)
+    assertThat(usage.candidatesTokenCount).isEqualTo(candidates)
+    assertThat(usage.totalTokenCount).isEqualTo(total)
   }
 
   private fun fakeVertexCredentials(): VertexCredentials =
@@ -506,6 +650,8 @@ class GeminiJvmTest {
     assertThat(request.headers.values("x-goog-api-client").firstOrNull()).contains(expected)
     assertThat(request.headers.values("user-agent").firstOrNull()).contains(expected)
   }
+
+  private class CollectorException : RuntimeException("collector failed")
 
   companion object {
     private const val GENERATE_CONTENT_RESPONSE =

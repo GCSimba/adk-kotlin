@@ -51,9 +51,8 @@ constructor(
   val responseModalities: List<String>? = null,
   val seed: Int? = null,
   /**
-   * An opaque token that resumes a generation the model paused with [FinishReason.CONTINUATION].
-   * The framework typically sets it: ADK's Gemini model resumes paused generations itself. A token
-   * set here, such as on an agent's config, is sent with every request using this config.
+   * An opaque token that resumes a generation the model paused with [FinishReason.CONTINUATION]. A
+   * token set here, such as on an agent's config, is sent with every request using this config.
    */
   @Serializable(with = LenientByteArraySerializer::class) val continuationToken: ByteArray? = null,
 ) {

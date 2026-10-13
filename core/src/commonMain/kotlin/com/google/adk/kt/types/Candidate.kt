@@ -38,10 +38,7 @@ constructor(
   val avgLogprobs: Double? = null,
   /** Detailed log probabilities for the chosen and top candidate tokens. */
   val logprobsResult: LogprobsResult? = null,
-  /**
-   * An opaque token that resumes generation when [finishReason] is [FinishReason.CONTINUATION]. The
-   * framework typically handles it: ADK's Gemini model resumes paused generations itself.
-   */
+  /** An opaque token that resumes generation when [finishReason] is [FinishReason.CONTINUATION]. */
   val continuationToken: ByteArray? = null,
 ) {
   // Hand-written because of the ByteArray: add new properties here and in hashCode, Builder,

@@ -308,20 +308,6 @@ class GenaiConvertersTest {
   }
 
   @Test
-  fun generateContentConfig_withBase_keepsBaseOnlyForFieldsAdkDoesNotModel() {
-    val base =
-      com.google.genai.kotlin.types.GenerateContentConfig(
-        shouldReturnHttpResponse = true,
-        temperature = 1.0,
-      )
-
-    val genaiConfig = GenerateContentConfig(temperature = 0.5f).toGenaiSdk(base)
-
-    assertEquals(true, genaiConfig.shouldReturnHttpResponse)
-    assertEquals(0.5, genaiConfig.temperature)
-  }
-
-  @Test
   fun generateContentConfig_topKFractionalFromGenaiSdk_truncatesToInt() {
     val genaiConfig = com.google.genai.kotlin.types.GenerateContentConfig(topK = 40.7)
 

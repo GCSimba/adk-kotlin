@@ -86,7 +86,7 @@ enum class FinishReason {
 
   /**
    * Token generation reached the per-request token limit before generation was complete. The
-   * candidate's continuation token resumes it; ADK's Gemini model does so automatically.
+   * candidate's continuation token resumes it.
    */
   CONTINUATION,
 

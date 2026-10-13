@@ -21,7 +21,6 @@ import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.logging.LoggerFactory
 import com.google.adk.kt.serialization.Json
-import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.GenerateContentConfig
 import com.google.adk.kt.types.GenerateContentResponse
@@ -35,7 +34,6 @@ import com.google.adk.kt.types.toGenaiSdk
 import com.google.genai.kotlin.Client
 import com.google.genai.kotlin.ClientException
 import com.google.genai.kotlin.GenAiApiException
-import com.google.genai.kotlin.types.GenerateContentConfig as GenAiGenerateContentConfig
 import com.google.genai.kotlin.types.HttpOptions
 import com.google.genai.kotlin.types.HttpRetryOptions
 import com.google.genai.kotlin.types.LiveConnectConfig as GenAiLiveConnectConfig
@@ -47,9 +45,11 @@ import kotlin.jvm.JvmStatic
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
@@ -140,11 +140,9 @@ internal constructor(
       config: GenerateContentConfig,
     ): Flow<GenerateContentResponse> =
       delegate
-        .generateContentStream(
-          model,
-          contents.map { it.toGenaiSdk() },
-          config.toGenaiSdk(base = NO_AUTOMATIC_CONTINUATION),
-        )
+        .generateContentStream(model, contents.map { it.toGenaiSdk() }, config.toGenaiSdk())
+        // Keeps collector exceptions out of the SDK's resume-after-error catch, which would resend.
+        .buffer(Channel.RENDEZVOUS)
         .map { it.fromGenaiSdk() }
 
     override suspend fun generateContent(
@@ -153,26 +151,8 @@ internal constructor(
       config: GenerateContentConfig,
     ): GenerateContentResponse =
       delegate
-        .generateContent(
-          model,
-          contents.map { it.toGenaiSdk() },
-          config.toGenaiSdk(base = NO_AUTOMATIC_CONTINUATION),
-        )
+        .generateContent(model, contents.map { it.toGenaiSdk() }, config.toGenaiSdk())
         .fromGenaiSdk()
-
-    companion object {
-      /**
-       * Turns off the GenAI SDK's automatic continuation because [Gemini] resumes paused
-       * generations itself. Decoding it from JSON lets ADK still build against SDK releases that
-       * lack the flag; those releases ignore it.
-       */
-      @OptIn(FrameworkInternalApi::class)
-      private val NO_AUTOMATIC_CONTINUATION: GenAiGenerateContentConfig =
-        adkJson.decodeFromString(
-          GenAiGenerateContentConfig.serializer(),
-          """{"automaticContinuation":false}""",
-        )
-    }
   }
 
   /**
@@ -292,51 +272,28 @@ internal constructor(
     logger.debug { "LLM Request:\n${Json.toJsonString(buildLoggingRequestMap(finalRequest))}" }
 
     try {
-      // Loops so ADK can resume a long generation when the model pauses and returns a token.
-      val continuation = Continuation(finalRequest.contents)
-      var contents = finalRequest.contents
-      var config = finalRequest.config
       if (stream) {
         val aggregator = StreamingResponseAggregator()
 
-        while (true) {
-          val output = StreamedOutput(continuation)
-          models.generateContentStream(name, contents, config).collect { response ->
-            logger.debug {
-              "LLM Streaming Response chunk: ${response.candidates.size} candidates, " +
-                "finishReason=${response.candidates.firstOrNull()?.finishReason}"
-            }
-            val chunk = output.record(response)
-            emit(aggregator.processResponse(LlmResponse.from(chunk)))
-          }
-          val next = continuation.advance(output.token, output.parts, output.usage) ?: break
-          contents = next.contents
-          config = finalRequest.config.copy(continuationToken = next.token)
-        }
-
-        // Emit the aggregated response, with usage summed over all requests and any cache metadata.
-        aggregator.aggregate()?.let {
-          emit(it.copy(usageMetadata = continuation.usage, cacheMetadata = cacheMetadata))
-        }
-      } else {
-        var llmResponse: LlmResponse
-        while (true) {
-          val response = models.generateContent(name, contents, config)
+        models.generateContentStream(name, finalRequest.contents, finalRequest.config).collect {
+          response ->
           logger.debug {
-            "LLM Response: ${response.candidates.size} candidates, " +
+            "LLM Streaming Response chunk: ${response.candidates.size} candidates, " +
               "finishReason=${response.candidates.firstOrNull()?.finishReason}"
           }
-          llmResponse = LlmResponse.from(response)
-          val next =
-            continuation.advance(
-              response.resumeToken(),
-              llmResponse.content?.parts.orEmpty(),
-              llmResponse.usageMetadata,
-            ) ?: break
-          contents = next.contents
-          config = finalRequest.config.copy(continuationToken = next.token)
+          emit(aggregator.processResponse(LlmResponse.from(response)))
         }
-        emit(continuation.complete(llmResponse).copy(cacheMetadata = cacheMetadata))
+
+        // After stream loop ends, emit final aggregated response with any cache metadata attached
+        aggregator.aggregate()?.let { emit(it.copy(cacheMetadata = cacheMetadata)) }
+      } else {
+        val response = models.generateContent(name, finalRequest.contents, finalRequest.config)
+        logger.debug {
+          "LLM Response: ${response.candidates.size} candidates, " +
+            "finishReason=${response.candidates.firstOrNull()?.finishReason}"
+        }
+        val llmResponse = LlmResponse.from(response)
+        emit(llmResponse.copy(cacheMetadata = cacheMetadata))
       }
     } catch (e: ClientException) {
       // Enhance a quota error with a pointer to the mitigation guidance, matching Python ADK.
