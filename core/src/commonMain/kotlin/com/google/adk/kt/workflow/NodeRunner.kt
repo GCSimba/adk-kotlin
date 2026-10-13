@@ -108,6 +108,8 @@ private constructor(
     while (true) {
       val activation = Activation(newContext(attempt))
       val context = activation.run(nodeInput, validateInput)
+      // A workflow reports a child's failure by setting it on the context and returning, not by
+      // raising, so both thrown exceptions and child failures run through the retry policy here.
       val failure = context.requireNodeState().failure
       if (
         activation.canRetry &&
@@ -154,6 +156,7 @@ private constructor(
       attemptCount = attempt,
       resumeInputs = resolvedResumeInputs,
       useAsOutput = useAsOutput,
+      // A retried workflow re-runs its whole graph, so its nodes number from 1 again.
       childRunIds = if (node is Workflow) ChildRunIds() else childRunIds,
       history = rootHistory,
     )
@@ -193,8 +196,8 @@ private constructor(
         runAttempt(nodeInput, validateInput)
         flushPending()
       } catch (e: NodeInterruptedException) {
-        // A dynamically dispatched child interrupted. Its ids are already on the context, and the
-        // node is waiting rather than failing, so this attempt counts as finished.
+        // A dispatched child paused, or raiseOnWait aborted the run. Any interrupt ids are already
+        // recorded where the child was dispatched, so this attempt counts as finished.
         flushPending()
       } catch (e: DynamicNodeFailedException) {
         // A dynamically dispatched child failed; carry its failure up without retrying here.

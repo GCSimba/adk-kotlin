@@ -32,6 +32,7 @@ import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlinx.coroutines.delay
@@ -296,7 +297,7 @@ class SchedulerTest {
       assertFailsWith<IllegalArgumentException> { runScheduler(workflow, branch = "root") }
 
     // Assert
-    assertIs<WorkflowConfigurationError>(error)
+    assertIs<WorkflowConfigurationException>(error)
     assertContains(error.message!!, "multiple terminal nodes produced output")
   }
 
@@ -356,6 +357,7 @@ class SchedulerTest {
     val (root, _) = runScheduler(workflow, branch = "root")
 
     // Assert
+    assertFalse(root.hasProducedOutput)
     assertNull(root.output)
   }
 

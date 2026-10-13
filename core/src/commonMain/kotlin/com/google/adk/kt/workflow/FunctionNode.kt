@@ -121,7 +121,7 @@ private constructor(
     if (maxParallelWorkers != null) {
       require(itemNode != null) { "maxParallelWorkers requires an item node." }
       if (maxParallelWorkers < 1) {
-        throw WorkflowConfigurationError("maxParallelWorkers must be at least 1.")
+        throw WorkflowConfigurationException("maxParallelWorkers must be at least 1.")
       }
     }
   }
@@ -301,7 +301,7 @@ inline fun <reified I, reified O> node(
  * [waitForOutput] and [stateSchema], has no retry or timeout, and always reruns on resume.
  *
  * @param maxParallelWorkers Maximum number of items run at a time, or `null` for no limit.
- * @throws WorkflowConfigurationError if [maxParallelWorkers] is less than 1.
+ * @throws WorkflowConfigurationException if [maxParallelWorkers] is less than 1.
  */
 @ExperimentalWorkflowApi
 inline fun <reified I, reified O> parallelNode(
@@ -337,7 +337,7 @@ inline fun <reified I, reified O> parallelNode(
  * input order. [node]'s configuration applies to each item's run.
  *
  * @param maxParallelWorkers Maximum number of items run at a time, or `null` for no limit.
- * @throws WorkflowConfigurationError if [maxParallelWorkers] is less than 1.
+ * @throws WorkflowConfigurationException if [maxParallelWorkers] is less than 1.
  */
 @ExperimentalWorkflowApi
 inline fun <reified I, reified O> parallelNode(

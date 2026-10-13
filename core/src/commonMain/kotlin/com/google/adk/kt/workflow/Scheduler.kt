@@ -339,13 +339,14 @@ internal class Scheduler(
     for (state in nodeStates.values) {
       if (state.status == NodeStatus.WAITING) interruptIds.addAll(state.interrupts)
     }
-    if (interruptIds.isNotEmpty()) {
+    // A child dispatched from this workflow's own context records its interrupts on the workflow.
+    if (interruptIds.isNotEmpty() || context.interruptIds.isNotEmpty()) {
       context.requireNodeState().addInterruptIds(interruptIds)
       return
     }
     val terminalOutputs = graph.terminalNodeNames.filter { it in nodeOutputs }
     if (terminalOutputs.size > 1) {
-      throw WorkflowConfigurationError(
+      throw WorkflowConfigurationException(
         "Workflow ${workflow.name}: multiple terminal nodes produced output" +
           " (${terminalOutputs.size}). A workflow must have at most one terminal output."
       )
@@ -356,8 +357,14 @@ internal class Scheduler(
       val side = "output of workflow '${workflow.name}'"
       context.output =
         if (schema == null) output else SchemaUtils.validateValue(output, schema, side).getOrThrow()
-      // Validation can read a Content as JSON null, which is no output.
-      if (context.hasProducedOutput) context.requireNodeState().markOutputEmitted()
+      // Validation can read a Content as JSON null, which is no output; the terminal node's raw
+      // output then no longer counts for delegating ancestors either.
+      val state = context.requireNodeState()
+      if (context.hasProducedOutput) {
+        state.markOutputEmitted()
+      } else if (output != null) {
+        state.clearDelegatedOutput(output)
+      }
     }
     emitEndOfAgent()
   }

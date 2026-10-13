@@ -52,7 +52,7 @@ class GraphValidationException(message: String) : IllegalArgumentException(messa
 
 /** Thrown when a workflow or node configuration is invalid. */
 @ExperimentalWorkflowApi
-class WorkflowConfigurationError(message: String) : IllegalArgumentException(message)
+class WorkflowConfigurationException(message: String) : IllegalArgumentException(message)
 
 /**
  * Aborts a dispatching node when a child node pauses for input. Extends [Throwable] rather than
@@ -61,8 +61,10 @@ class WorkflowConfigurationError(message: String) : IllegalArgumentException(mes
 internal class NodeInterruptedException : Throwable("Node interrupted.")
 
 /**
- * Propagates a dynamically dispatched child node's failure ([error] at [errorNodePath]) to the
- * caller.
+ * Thrown by [com.google.adk.kt.agents.Context.runNode] when the dispatched child fails: [error] is
+ * the child's failure and [errorNodePath] the path of the node that failed.
  */
-internal class DynamicNodeFailedException(val error: Throwable, val errorNodePath: String) :
+@ExperimentalWorkflowApi
+class DynamicNodeFailedException
+internal constructor(val error: Throwable, val errorNodePath: String) :
   RuntimeException("Dynamic node failed.", error)

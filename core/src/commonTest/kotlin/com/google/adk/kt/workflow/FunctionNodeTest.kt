@@ -736,17 +736,17 @@ class FunctionNodeTest {
   }
 
   @Test
-  fun parallelNode_nonPositiveMaxParallelWorkers_throwsWorkflowConfigurationError() {
+  fun parallelNode_nonPositiveMaxParallelWorkers_throwsWorkflowConfigurationException() {
     // Arrange
     val singleFn = node("single") { _, x: Int -> x }
 
     // Act
     val zeroError =
-      assertFailsWith<WorkflowConfigurationError> {
+      assertFailsWith<WorkflowConfigurationException> {
         parallelNode("bad_zero", maxParallelWorkers = 0) { _, x: Int -> x }
       }
     val negativeError =
-      assertFailsWith<WorkflowConfigurationError> {
+      assertFailsWith<WorkflowConfigurationException> {
         parallelNode(singleFn, maxParallelWorkers = -1)
       }
 
