@@ -22,6 +22,7 @@ import com.google.adk.kt.annotations.SecretAccess
 import com.google.adk.kt.serialization.adkJson
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
 import kotlinx.serialization.Serializable
 import org.junit.Test
 
@@ -103,6 +104,16 @@ class SecretTest {
     assertEquals(holder, adkJson.decodeFromString(NullableHolder.serializer(), json))
     assertEquals("{}", adkJson.encodeToString(NullableHolder.serializer(), NullableHolder(null)))
     assertEquals(NullableHolder(null), adkJson.decodeFromString(NullableHolder.serializer(), "{}"))
+  }
+
+  @Test
+  fun redacted_null_returnsNull() {
+    assertNull(null.redacted())
+  }
+
+  @Test
+  fun redacted_value_returnsPlaceholder() {
+    assertEquals("<redacted>", "sentinel-state".redacted())
   }
 
   @Serializable
