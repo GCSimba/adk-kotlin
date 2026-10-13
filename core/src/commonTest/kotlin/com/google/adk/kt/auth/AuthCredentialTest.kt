@@ -20,6 +20,7 @@ import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.annotations.ExperimentalAuthApi
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
@@ -276,6 +277,174 @@ class AuthCredentialTest {
     )
   }
 
+  @Test
+  fun toString_serviceAccount_redactsPrivateKey() {
+    assertEquals(
+      "ServiceAccount(serviceAccountCredential=Credential(type=service_account, " +
+        "projectId=project, privateKeyId=<redacted>, privateKey=<redacted>, " +
+        "clientEmail=agent@project.iam.gserviceaccount.com, " +
+        "clientId=1234, authUri=https://accounts.google.com/o/oauth2/auth, " +
+        "tokenUri=https://oauth2.googleapis.com/token, " +
+        "authProviderX509CertUrl=https://www.googleapis.com/oauth2/v1/certs, " +
+        "clientX509CertUrl=https://www.googleapis.com/robot/v1/metadata/x509/agent, " +
+        "universeDomain=googleapis.com), scopes=[scope], useDefaultCredential=true, " +
+        "useIdToken=true, audience=https://service.example)",
+      SERVICE_ACCOUNT.toString(),
+    )
+  }
+
+  @Test
+  fun toBuilder_serviceAccount_matchesCopy() {
+    assertEquals(SERVICE_ACCOUNT.copy(), SERVICE_ACCOUNT.toBuilder().build())
+  }
+
+  @Test
+  fun toBuilder_serviceAccountCredential_matchesCopy() {
+    assertEquals(SERVICE_ACCOUNT_CREDENTIAL.copy(), SERVICE_ACCOUNT_CREDENTIAL.toBuilder().build())
+  }
+
+  @Test
+  fun toBuilder_serviceAccountDefaultCredential_matchesCopy() {
+    val credential = AuthCredential.ServiceAccount.applicationDefault(listOf("scope"))
+
+    assertEquals(credential, credential.toBuilder().build())
+  }
+
+  @Test
+  fun constructor_serviceAccountKeyOnly_keepsKey() {
+    val credential =
+      AuthCredential.ServiceAccount(serviceAccountCredential = SERVICE_ACCOUNT_CREDENTIAL)
+
+    assertEquals(SERVICE_ACCOUNT_CREDENTIAL, credential.serviceAccountCredential)
+    assertFalse(credential.useDefaultCredential)
+  }
+
+  @Test
+  fun constructor_serviceAccountWithoutKeyOrDefaultCredential_throws() {
+    assertFailsWith<IllegalArgumentException> { AuthCredential.ServiceAccount() }
+  }
+
+  @Test
+  fun constructor_serviceAccountIdTokenWithoutAudience_throws() {
+    assertFailsWith<IllegalArgumentException> {
+      AuthCredential.ServiceAccount(useDefaultCredential = true, useIdToken = true)
+    }
+    assertFailsWith<IllegalArgumentException> {
+      AuthCredential.ServiceAccount(useDefaultCredential = true, useIdToken = true, audience = "")
+    }
+  }
+
+  @Test
+  fun builder_serviceAccountRequiredFieldsOnly_matchesConstructorDefaults() {
+    assertEquals(
+      AuthCredential.ServiceAccount(useDefaultCredential = true),
+      AuthCredential.ServiceAccount.builder().useDefaultCredential(true).build(),
+    )
+  }
+
+  @Test
+  fun builder_serviceAccountCredentialRequiredFieldsOnly_matchesConstructorDefaults() {
+    assertEquals(
+      AuthCredential.ServiceAccount.Credential(
+        projectId = "project",
+        privateKeyId = Secret("key-id"),
+        privateKey = Secret("key"),
+        clientEmail = "email",
+        clientId = "id",
+        authUri = "auth",
+        tokenUri = "token",
+        authProviderX509CertUrl = "provider-certs",
+        clientX509CertUrl = "client-cert",
+        universeDomain = "googleapis.com",
+      ),
+      AuthCredential.ServiceAccount.Credential.builder()
+        .projectId("project")
+        .privateKeyId("key-id")
+        .privateKey("key")
+        .clientEmail("email")
+        .clientId("id")
+        .authUri("auth")
+        .tokenUri("token")
+        .authProviderX509CertUrl("provider-certs")
+        .clientX509CertUrl("client-cert")
+        .universeDomain("googleapis.com")
+        .build(),
+    )
+  }
+
+  @Test
+  fun builder_serviceAccountUnset_throwsFromConstructorRule() {
+    assertFailsWith<IllegalArgumentException> { AuthCredential.ServiceAccount.builder().build() }
+  }
+
+  @Test
+  fun builder_serviceAccountCredentialWithoutPrivateKey_throws() {
+    assertFailsWith<IllegalStateException> {
+      AuthCredential.ServiceAccount.Credential.builder()
+        .projectId("project")
+        .privateKeyId("key-id")
+        .clientEmail("email")
+        .clientId("id")
+        .authUri("auth")
+        .tokenUri("token")
+        .authProviderX509CertUrl("provider-certs")
+        .clientX509CertUrl("client-cert")
+        .universeDomain("googleapis.com")
+        .build()
+    }
+  }
+
+  @Test
+  fun applicationDefault_scopes_usesDefaultCredential() {
+    assertEquals(
+      AuthCredential.ServiceAccount(useDefaultCredential = true, scopes = listOf("scope")),
+      AuthCredential.ServiceAccount.applicationDefault(listOf("scope")),
+    )
+  }
+
+  @Test
+  fun fromKey_key_usesKey() {
+    assertEquals(
+      AuthCredential.ServiceAccount(
+        serviceAccountCredential = SERVICE_ACCOUNT_CREDENTIAL,
+        scopes = listOf("scope"),
+      ),
+      AuthCredential.ServiceAccount.fromKey(SERVICE_ACCOUNT_CREDENTIAL, listOf("scope")),
+    )
+  }
+
+  @Test
+  fun forIdToken_noKey_usesDefaultCredential() {
+    assertEquals(
+      AuthCredential.ServiceAccount(
+        useDefaultCredential = true,
+        useIdToken = true,
+        audience = "https://service.example",
+      ),
+      AuthCredential.ServiceAccount.forIdToken("https://service.example"),
+    )
+  }
+
+  @Test
+  fun forIdToken_key_usesKey() {
+    assertEquals(
+      AuthCredential.ServiceAccount(
+        serviceAccountCredential = SERVICE_ACCOUNT_CREDENTIAL,
+        useIdToken = true,
+        audience = "https://service.example",
+      ),
+      AuthCredential.ServiceAccount.forIdToken(
+        "https://service.example",
+        SERVICE_ACCOUNT_CREDENTIAL,
+      ),
+    )
+  }
+
+  @Test
+  fun forIdToken_emptyAudience_throws() {
+    assertFailsWith<IllegalArgumentException> { AuthCredential.ServiceAccount.forIdToken("") }
+  }
+
   private companion object {
     val API_KEY = AuthCredential.ApiKey(apiKey = Secret("sentinel-api-key"))
 
@@ -314,6 +483,30 @@ class AuthCredentialTest {
         codeVerifier = Secret("sentinel-code-verifier"),
         codeChallengeMethod = "S256",
         tokenEndpointAuthMethod = AuthCredential.OAuth2.TokenEndpointAuthMethod.PRIVATE_KEY_JWT,
+      )
+
+    val SERVICE_ACCOUNT_CREDENTIAL =
+      AuthCredential.ServiceAccount.Credential(
+        type = "service_account",
+        projectId = "project",
+        privateKeyId = Secret("sentinel-private-key-id"),
+        privateKey = Secret("sentinel-private-key"),
+        clientEmail = "agent@project.iam.gserviceaccount.com",
+        clientId = "1234",
+        authUri = "https://accounts.google.com/o/oauth2/auth",
+        tokenUri = "https://oauth2.googleapis.com/token",
+        authProviderX509CertUrl = "https://www.googleapis.com/oauth2/v1/certs",
+        clientX509CertUrl = "https://www.googleapis.com/robot/v1/metadata/x509/agent",
+        universeDomain = "googleapis.com",
+      )
+
+    val SERVICE_ACCOUNT =
+      AuthCredential.ServiceAccount(
+        serviceAccountCredential = SERVICE_ACCOUNT_CREDENTIAL,
+        scopes = listOf("scope"),
+        useDefaultCredential = true,
+        useIdToken = true,
+        audience = "https://service.example",
       )
   }
 }

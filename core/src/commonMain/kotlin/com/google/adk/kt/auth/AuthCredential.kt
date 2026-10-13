@@ -19,14 +19,15 @@ package com.google.adk.kt.auth
 import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.annotations.ExperimentalAuthApi
 import com.google.adk.kt.annotations.SecretAccess
+import kotlin.jvm.JvmOverloads
 import kotlin.jvm.JvmStatic
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
 /**
- * A credential that a tool uses to call a service: an API key, an HTTP credential, or an OAuth2 or
- * OpenID Connect credential.
+ * A credential that a tool uses to call a service: an [ApiKey], an [Http] credential, an [OAuth2]
+ * or OpenID Connect credential, or a [ServiceAccount].
  *
  * Secret fields are [Secret]s, so a credential's `toString()` prints them as `<redacted>`. [OAuth2]
  * also redacts its `state`, `nonce`, `authUri` and `redirectUri`, which are plain strings.
@@ -433,6 +434,254 @@ sealed interface AuthCredential {
     }
 
     companion object {
+      @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+    }
+  }
+
+  /**
+   * A Google Cloud credential: a service account key, or Application Default Credentials.
+   *
+   * @property serviceAccountCredential The service account key; required unless
+   *   [useDefaultCredential] is `true`.
+   * @property scopes The OAuth2 scopes to request for the access token; pass at least one with a
+   *   key. With Application Default Credentials, `null` or empty means
+   *   `https://www.googleapis.com/auth/cloud-platform`. ID tokens ignore them.
+   * @property useDefaultCredential Whether to use Application Default Credentials instead of a key.
+   * @property useIdToken Whether to get an ID token instead of an access token; requires a
+   *   non-empty [audience].
+   * @property audience The audience of the ID token, usually the URL of the receiving service.
+   * @throws IllegalArgumentException if [serviceAccountCredential] is `null` and
+   *   [useDefaultCredential] is `false`, or if [useIdToken] is `true` and [audience] is `null` or
+   *   empty.
+   */
+  @ExperimentalAuthApi
+  data class ServiceAccount(
+    val serviceAccountCredential: Credential? = null,
+    val scopes: List<String>? = null,
+    val useDefaultCredential: Boolean = false,
+    val useIdToken: Boolean = false,
+    val audience: String? = null,
+  ) : AuthCredential {
+    init {
+      require(serviceAccountCredential != null || useDefaultCredential) {
+        "ServiceAccount requires serviceAccountCredential when useDefaultCredential is false."
+      }
+      require(!useIdToken || !audience.isNullOrEmpty()) {
+        "ServiceAccount requires audience when useIdToken is true."
+      }
+    }
+
+    /**
+     * Returns a [Builder] initialized with this instance's properties, primarily for Java callers.
+     * Prefer it over `copy` from Java: `copy` takes every property positionally, so its signature
+     * changes whenever a property is added.
+     */
+    @AdkJavaInteropApi
+    fun toBuilder(): Builder =
+      Builder()
+        .serviceAccountCredential(serviceAccountCredential)
+        .scopes(scopes)
+        .useDefaultCredential(useDefaultCredential)
+        .useIdToken(useIdToken)
+        .audience(audience)
+
+    /**
+     * A service account key, as in the JSON key file Google Cloud issues.
+     *
+     * @property type The key type, `service_account` in a key file.
+     * @property projectId The project the service account belongs to.
+     * @property privateKeyId The ID of the private key.
+     * @property privateKey The private key, in PEM format.
+     * @property clientEmail The service account's email address.
+     * @property clientId The service account's numeric client ID.
+     * @property authUri The OAuth2 authorization endpoint.
+     * @property tokenUri The OAuth2 token endpoint.
+     * @property authProviderX509CertUrl Where the provider's X.509 certificates are published.
+     * @property clientX509CertUrl Where the service account's X.509 certificate is published.
+     * @property universeDomain The Google Cloud universe domain, such as `googleapis.com`.
+     */
+    @ExperimentalAuthApi
+    data class Credential(
+      val type: String = "",
+      val projectId: String,
+      val privateKeyId: Secret,
+      val privateKey: Secret,
+      val clientEmail: String,
+      val clientId: String,
+      val authUri: String,
+      val tokenUri: String,
+      val authProviderX509CertUrl: String,
+      val clientX509CertUrl: String,
+      val universeDomain: String,
+    ) {
+      /**
+       * Returns a [Builder] initialized with this instance's properties, primarily for Java
+       * callers. Prefer it over `copy` from Java: `copy` takes every property positionally, so its
+       * signature changes whenever a property is added.
+       */
+      @AdkJavaInteropApi
+      @OptIn(SecretAccess::class)
+      fun toBuilder(): Builder =
+        Builder()
+          .type(type)
+          .projectId(projectId)
+          .privateKeyId(privateKeyId.reveal())
+          .privateKey(privateKey.reveal())
+          .clientEmail(clientEmail)
+          .clientId(clientId)
+          .authUri(authUri)
+          .tokenUri(tokenUri)
+          .authProviderX509CertUrl(authProviderX509CertUrl)
+          .clientX509CertUrl(clientX509CertUrl)
+          .universeDomain(universeDomain)
+
+      /**
+       * Fluent builder for [Credential], provided primarily for Java callers. Any property left
+       * unset falls back to the same default as the constructor.
+       */
+      @AdkJavaInteropApi
+      @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+      class Builder {
+        private var type: String = ""
+        private var projectId: String? = null
+        private var privateKeyId: String? = null
+        private var privateKey: String? = null
+        private var clientEmail: String? = null
+        private var clientId: String? = null
+        private var authUri: String? = null
+        private var tokenUri: String? = null
+        private var authProviderX509CertUrl: String? = null
+        private var clientX509CertUrl: String? = null
+        private var universeDomain: String? = null
+
+        fun type(type: String): Builder = apply { this.type = type }
+
+        fun projectId(projectId: String): Builder = apply { this.projectId = projectId }
+
+        fun privateKeyId(privateKeyId: String): Builder = apply { this.privateKeyId = privateKeyId }
+
+        fun privateKey(privateKey: String): Builder = apply { this.privateKey = privateKey }
+
+        fun clientEmail(clientEmail: String): Builder = apply { this.clientEmail = clientEmail }
+
+        fun clientId(clientId: String): Builder = apply { this.clientId = clientId }
+
+        fun authUri(authUri: String): Builder = apply { this.authUri = authUri }
+
+        fun tokenUri(tokenUri: String): Builder = apply { this.tokenUri = tokenUri }
+
+        fun authProviderX509CertUrl(authProviderX509CertUrl: String): Builder = apply {
+          this.authProviderX509CertUrl = authProviderX509CertUrl
+        }
+
+        fun clientX509CertUrl(clientX509CertUrl: String): Builder = apply {
+          this.clientX509CertUrl = clientX509CertUrl
+        }
+
+        fun universeDomain(universeDomain: String): Builder = apply {
+          this.universeDomain = universeDomain
+        }
+
+        fun build(): Credential =
+          Credential(
+            type = type,
+            projectId = required(projectId, "projectId"),
+            privateKeyId = Secret(required(privateKeyId, "privateKeyId")),
+            privateKey = Secret(required(privateKey, "privateKey")),
+            clientEmail = required(clientEmail, "clientEmail"),
+            clientId = required(clientId, "clientId"),
+            authUri = required(authUri, "authUri"),
+            tokenUri = required(tokenUri, "tokenUri"),
+            authProviderX509CertUrl = required(authProviderX509CertUrl, "authProviderX509CertUrl"),
+            clientX509CertUrl = required(clientX509CertUrl, "clientX509CertUrl"),
+            universeDomain = required(universeDomain, "universeDomain"),
+          )
+
+        private fun required(value: String?, name: String): String =
+          checkNotNull(value) {
+            "AuthCredential.ServiceAccount.Credential.Builder requires $name to be set."
+          }
+      }
+
+      companion object {
+        @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+      }
+    }
+
+    /**
+     * Fluent builder for [ServiceAccount], provided primarily for Java callers. Any property left
+     * unset falls back to the same default as the constructor.
+     */
+    @AdkJavaInteropApi
+    @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+    class Builder {
+      private var serviceAccountCredential: Credential? = null
+      private var scopes: List<String>? = null
+      private var useDefaultCredential: Boolean = false
+      private var useIdToken: Boolean = false
+      private var audience: String? = null
+
+      fun serviceAccountCredential(serviceAccountCredential: Credential?): Builder = apply {
+        this.serviceAccountCredential = serviceAccountCredential
+      }
+
+      fun scopes(scopes: List<String>?): Builder = apply { this.scopes = scopes }
+
+      fun useDefaultCredential(useDefaultCredential: Boolean): Builder = apply {
+        this.useDefaultCredential = useDefaultCredential
+      }
+
+      fun useIdToken(useIdToken: Boolean): Builder = apply { this.useIdToken = useIdToken }
+
+      fun audience(audience: String?): Builder = apply { this.audience = audience }
+
+      fun build(): ServiceAccount =
+        ServiceAccount(
+          serviceAccountCredential = serviceAccountCredential,
+          scopes = scopes,
+          useDefaultCredential = useDefaultCredential,
+          useIdToken = useIdToken,
+          audience = audience,
+        )
+    }
+
+    companion object {
+      /**
+       * Returns a credential that uses Application Default Credentials, requesting [scopes], or the
+       * cloud-platform scope when [scopes] is `null` or empty.
+       */
+      @JvmStatic
+      @JvmOverloads
+      fun applicationDefault(scopes: List<String>? = null): ServiceAccount =
+        ServiceAccount(useDefaultCredential = true, scopes = scopes)
+
+      /**
+       * Returns a credential that uses the service account [key], requesting [scopes]. Unlike
+       * Application Default Credentials, a key gets no default scope, so it needs at least one.
+       */
+      @JvmStatic
+      fun fromKey(key: Credential, scopes: List<String>): ServiceAccount =
+        ServiceAccount(serviceAccountCredential = key, scopes = scopes)
+
+      /**
+       * Returns a credential that gets an ID token for [audience] from Application Default
+       * Credentials.
+       *
+       * @throws IllegalArgumentException if [audience] is empty.
+       */
+      @JvmStatic
+      fun forIdToken(audience: String): ServiceAccount =
+        ServiceAccount(useDefaultCredential = true, useIdToken = true, audience = audience)
+
+      /**
+       * Returns a credential that gets an ID token for [audience] from the service account [key].
+       *
+       * @throws IllegalArgumentException if [audience] is empty.
+       */
+      @JvmStatic
+      fun forIdToken(audience: String, key: Credential): ServiceAccount =
+        ServiceAccount(serviceAccountCredential = key, useIdToken = true, audience = audience)
+
       @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
     }
   }
