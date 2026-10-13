@@ -36,8 +36,15 @@ import com.google.adk.kt.sessions.InMemorySessionService
 import com.google.adk.kt.sessions.Session
 import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.sessions.SessionService
+import com.google.adk.kt.telemetry.Span
+import com.google.adk.kt.telemetry.SpanBuilder
+import com.google.adk.kt.telemetry.Telemetry
+import com.google.adk.kt.telemetry.TelemetryAttributes
+import com.google.adk.kt.telemetry.TelemetryConfig
+import com.google.adk.kt.telemetry.Tracer
 import com.google.adk.kt.testing.DummyModel
 import com.google.adk.kt.testing.DummyTool
+import com.google.adk.kt.testing.DummyTracer
 import com.google.adk.kt.testing.TRANSFER_TO_AGENT_RESPONSE_PART
 import com.google.adk.kt.testing.modelFunctionCallResponse
 import com.google.adk.kt.testing.modelMessage
@@ -48,6 +55,7 @@ import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.tools.FunctionTool
 import com.google.adk.kt.tools.ToolContext
 import com.google.adk.kt.tools.TransferToAgentTool.Companion.TRANSFER_TO_AGENT_TOOL_NAME
+import com.google.adk.kt.types.Blob
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.FunctionResponse
@@ -83,6 +91,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -564,6 +573,145 @@ class LlmAgentTurnTest {
     agent.runLive(liveContextFor(agent)).toList()
 
     assertEquals(0, connection.sendHistoryCalls)
+  }
+
+  @Test
+  fun runLive_seedingHistory_recordsASendDataSpan() = runBlocking {
+    val tracer = DummyTracer()
+    Telemetry.setTracerForTest(tracer)
+    TelemetryConfig.captureMessageContent = false
+    try {
+      val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val agent = liveAgent(connection)
+      val context = liveContextFor(agent, session = sessionWithEarlierMessage())
+
+      agent.runLive(context).toList()
+
+      val span = tracer.recordedSpans.single { it.name == "send_data" }
+      assertEquals(
+        context.invocationId,
+        span.attributes[TelemetryAttributes.GCP_VERTEX_AGENT_INVOCATION_ID],
+      )
+      val eventId = span.attributes[TelemetryAttributes.GCP_VERTEX_AGENT_EVENT_ID]
+      assertNotNull(eventId)
+      assertNotEquals(context.invocationId, eventId)
+      // Content capture is off, so the span carries the placeholder instead of the history.
+      assertEquals("{}", span.attributes[TelemetryAttributes.GCP_VERTEX_AGENT_DATA])
+    } finally {
+      Telemetry.resetTracer()
+    }
+  }
+
+  @Test
+  fun runLive_seedingHistory_sendsTheHistoryInsideTheSendDataSpan() = runBlocking {
+    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    Telemetry.setTracerForTest(SpanLoggingTracer(connection.log))
+    try {
+      val agent = liveAgent(connection)
+
+      agent.runLive(liveContextFor(agent, session = sessionWithEarlierMessage())).toList()
+
+      assertEquals(
+        listOf("span start: send_data", "history:earlier", "span end: send_data"),
+        connection.log.filter { "send_data" in it || it.startsWith("history:") },
+      )
+    } finally {
+      Telemetry.resetTracer()
+    }
+  }
+
+  @Test
+  fun runLive_emptyHistory_recordsNoSendDataSpan() = runBlocking {
+    val tracer = DummyTracer()
+    Telemetry.setTracerForTest(tracer)
+    try {
+      val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val agent = liveAgent(connection)
+
+      agent.runLive(liveContextFor(agent)).toList()
+
+      assertTrue(tracer.recordedSpans.none { it.name == "send_data" })
+    } finally {
+      Telemetry.resetTracer()
+    }
+  }
+
+  @Test
+  fun runLive_twoRuns_recordDistinctSendDataEventIds() = runBlocking {
+    val tracer = DummyTracer()
+    Telemetry.setTracerForTest(tracer)
+    try {
+      repeat(2) {
+        val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+        val agent = liveAgent(connection)
+        agent.runLive(liveContextFor(agent, session = sessionWithEarlierMessage())).toList()
+      }
+
+      val eventIds =
+        tracer.recordedSpans
+          .filter { it.name == "send_data" }
+          .map { it.attributes[TelemetryAttributes.GCP_VERTEX_AGENT_EVENT_ID] }
+      assertEquals(2, eventIds.toSet().size)
+    } finally {
+      Telemetry.resetTracer()
+    }
+  }
+
+  @Test
+  fun runLive_sendDataSpan_summarizesInlineMediaAndLeavesOutThoughtSignatures() = runBlocking {
+    val tracer = DummyTracer()
+    Telemetry.setTracerForTest(tracer)
+    TelemetryConfig.captureMessageContent = true
+    try {
+      val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val agent = liveAgent(connection)
+      val history =
+        userMessage(
+          Part(inlineData = Blob(mimeType = "audio/pcm", data = ByteArray(64))),
+          Part(inlineData = Blob()),
+          Part(inlineData = Blob(mimeType = "", data = ByteArray(8))),
+          Part(text = "signed", thoughtSignature = ByteArray(32)),
+        )
+
+      agent.runLive(liveContextFor(agent, session = sessionWithEarlierMessage(history))).toList()
+
+      val data =
+        tracer.recordedSpans
+          .single { it.name == "send_data" }
+          .attributes[TelemetryAttributes.GCP_VERTEX_AGENT_DATA]
+          .toString()
+      assertTrue("<inline_data: audio/pcm, 64 bytes>" in data)
+      assertTrue("<inline_data: unknown, 0 bytes>" in data)
+      assertTrue("<inline_data: unknown, 8 bytes>" in data)
+      assertTrue("inlineData" !in data)
+      assertTrue("signed" in data)
+      assertTrue("thoughtSignature" !in data)
+    } finally {
+      TelemetryConfig.captureMessageContent = false
+      Telemetry.resetTracer()
+    }
+  }
+
+  @Test
+  fun runLive_callersResumptionHandle_recordsNoSendDataSpan() = runBlocking {
+    // A resumed session's history is already on the server, so nothing is seeded and no span opens.
+    val tracer = DummyTracer()
+    Telemetry.setTracerForTest(tracer)
+    try {
+      val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val agent = liveAgent(connection)
+      val runConfig = RunConfig(sessionResumption = SessionResumptionConfig(handle = "h-1"))
+
+      agent
+        .runLive(
+          liveContextFor(agent, session = sessionWithEarlierMessage(), runConfig = runConfig)
+        )
+        .toList()
+
+      assertTrue(tracer.recordedSpans.none { it.name == "send_data" })
+    } finally {
+      Telemetry.resetTracer()
+    }
   }
 
   @Test
@@ -1907,13 +2055,42 @@ class LlmAgentTurnTest {
       )
     )
 
-  private suspend fun sessionWithEarlierMessage(): Session {
+  /**
+   * Writes each span's start and end into [log], so a test can order them against the connection.
+   */
+  private class SpanLoggingTracer(private val log: MutableList<String>) : Tracer {
+    private val delegate = DummyTracer()
+
+    override fun spanBuilder(spanName: String): SpanBuilder {
+      val builder = delegate.spanBuilder(spanName)
+      return object : SpanBuilder by builder {
+        override fun startSpan(): Span {
+          log += "span start: $spanName"
+          val span = builder.startSpan()
+          return object : Span by span {
+            override fun end() {
+              log += "span end: $spanName"
+              span.end()
+            }
+          }
+        }
+      }
+    }
+
+    override suspend fun currentContext() = delegate.currentContext()
+
+    override fun contextWithSpan(span: Span) = delegate.contextWithSpan(span)
+  }
+
+  private suspend fun sessionWithEarlierMessage(
+    content: Content = userMessage("earlier")
+  ): Session {
     val sessionService = InMemorySessionService()
     val key = SessionKey("app", "user", "live-session")
     val unused =
       sessionService.appendEvent(
         sessionService.createSession(key),
-        Event(author = Role.USER, content = userMessage("earlier")),
+        Event(author = Role.USER, content = content),
       )
     return checkNotNull(sessionService.getSession(key))
   }
