@@ -17,6 +17,9 @@
 package com.google.adk.kt.retry
 
 import kotlin.time.Duration
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 
 /**
  * Decides whether to retry a failed operation, and how long to wait first.
@@ -38,4 +41,24 @@ interface RetryPolicy {
    * [Duration.INFINITE] waits until the retrying coroutine is canceled.
    */
   fun nextRetryDelay(failedAttempts: Int): Duration
+}
+
+/**
+ * Runs [operation], retrying its failures as this policy decides, and returns its result. A
+ * [kotlinx.coroutines.CancellationException] is retried like any other failure unless the caller
+ * was canceled. An extension rather than a member, since an interface member cannot be internal.
+ */
+internal suspend fun <T> RetryPolicy.retry(operation: suspend () -> T): T {
+  var failedAttempts = 0
+  while (true) {
+    try {
+      return operation()
+    } catch (e: Exception) {
+      // Rethrows if the caller was canceled, which a zero delay would not check.
+      currentCoroutineContext().ensureActive()
+      failedAttempts++
+      if (!shouldRetry(e, failedAttempts)) throw e
+      delay(nextRetryDelay(failedAttempts))
+    }
+  }
 }
