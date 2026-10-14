@@ -25,8 +25,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
 
 /**
- * A `persist` function for [OrderedEventWriter] tests. It holds the writes of blocked events, waits
- * [persistDelay], then throws an event's failure or records the write in [persisted].
+ * A `persist` function for [OrderedEventWriter] and [SessionWriteBuffer] tests. It holds the writes
+ * of blocked events, waits [persistDelay], then throws an event's failure or records the write in
+ * [persisted].
  */
 internal class FakeStore {
   @Volatile var persistDelay: Duration = Duration.ZERO

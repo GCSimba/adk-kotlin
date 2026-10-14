@@ -29,5 +29,8 @@ class SessionException(message: String, cause: Throwable? = null) :
      * [message] when [SessionService.createSession] is given a session id that is already taken.
      */
     const val SESSION_ALREADY_EXISTS: String = "Session already exists"
+
+    /** [message] when writes buffered for a session could not be persisted; [cause] says why. */
+    const val SESSION_PERSISTENCE_FAILED: String = "Session persistence failed"
   }
 }

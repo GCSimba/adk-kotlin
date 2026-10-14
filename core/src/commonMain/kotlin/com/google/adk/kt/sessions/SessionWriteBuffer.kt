@@ -1,0 +1,231 @@
+/*
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.adk.kt.sessions
+
+import com.google.adk.kt.events.Event
+import com.google.adk.kt.logging.LoggerFactory
+import com.google.adk.kt.sessions.OrderedEventWriter.WriteResult
+import com.google.adk.kt.sessions.SessionException.Companion.SESSION_PERSISTENCE_FAILED
+import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+
+/**
+ * Buffers the writes of many sessions until they are persisted, keeping an [OrderedEventWriter] per
+ * session with writes in flight, and one lock and one coroutine scope in [context]. It orders
+ * writes to shared scopes across sessions, waits for the writes a read can see, and reports failed
+ * writes to flushes and to the session's next append.
+ */
+internal class SessionWriteBuffer(
+  context: CoroutineContext,
+  private val persist: suspend (OrderedEventWriter.Write) -> Unit,
+  private val maxUnreportedFailures: Int = MAX_UNREPORTED_FAILURES,
+) {
+  // A plain Job, so an Error, the one failure a write does not catch, stops every write.
+  private val coroutineScope = CoroutineScope(context + Job(context[Job]))
+
+  // Guards everything below, including each writer; never held while waiting for a write.
+  private val lock = Mutex()
+  private var isClosed = false
+  private val writerBySession = mutableMapOf<SessionKey, OrderedEventWriter>()
+  // The next write to a shared scope waits for the last one.
+  private val lastWriteByScope = mutableMapOf<SharedStateScope, OrderedEventWriter.Write>()
+  // Each session's first unreported failure, oldest first, recorded when any of its writes fails.
+  private val failureBySession = LinkedHashMap<SessionKey, Throwable>()
+
+  /**
+   * Updates the live [session] with [update] and writes the event it returns, in one step, so each
+   * session's appends, and the changes to each shared scope, reach the store in the order they were
+   * made. Throws a [SessionException] instead, before [update] runs, if the session has a failure
+   * to report. [update] runs under the buffer's lock, so it must not call the buffer or wait for a
+   * write.
+   */
+  suspend fun append(session: Session, update: suspend () -> Event): Event = lock.withLock {
+    check(!isClosed) { "BufferedSessionService is closed." }
+    check(coroutineScope.isActive) { "BufferedSessionService has stopped." }
+    reportFailure(session.key)
+    // The store checks a write against the session version it replaces, so read it first.
+    val expectedUpdateTime = session.lastUpdateTime
+    val appended = update()
+    // Its own copy of the actions, so a later change to them cannot reach the store.
+    val snapshot = appended.copy(actions = appended.actions.snapshot())
+    val changedScopes = SharedStateScope.changedBy(session.key, snapshot.actions.stateDelta.keys)
+    // Only now, so an update that throws leaves no writer behind.
+    val writer = writerBySession.getOrPut(session.key) { newWriter(session.key) }
+    val previousSharedStateWrites = changedScopes.mapNotNull { lastWriteByScope[it] }
+    val write = writer.write(expectedUpdateTime, snapshot, after = previousSharedStateWrites)
+    for (scope in changedScopes) lastWriteByScope[scope] = write
+    appended
+  }
+
+  /** Waits for the session [key]'s writes. */
+  suspend fun awaitWritesOf(key: SessionKey) {
+    awaitWrites { listOfNotNull(writerBySession[key]?.lastWrite) }
+  }
+
+  /** Waits for the writes a read of the session [key] sees: its own, and its shared scopes'. */
+  suspend fun awaitWritesSeenBy(key: SessionKey) {
+    awaitWrites {
+      listOfNotNull(writerBySession[key]?.lastWrite) + lastWritesSeenBy(key.appName, key.userId)
+    }
+  }
+
+  /** Waits for the writes a listing of [userId]'s sessions in [appName] sees. */
+  suspend fun awaitWritesListedFor(appName: String, userId: String) {
+    awaitWrites {
+      writerBySession.values
+        .filter { it.key.appName == appName && it.key.userId == userId }
+        .mapNotNull { it.lastWrite } + lastWritesSeenBy(appName, userId)
+    }
+  }
+
+  /**
+   * Waits for the session [key]'s writes and runs [beforeReport]. Then it throws a
+   * [SessionException] if one of them failed, or the session has a failure to report.
+   */
+  suspend fun flush(key: SessionKey, beforeReport: suspend () -> Unit = {}) {
+    val waited = lock.withLock { writerBySession[key]?.lastWrite }
+    val waitedFailure = (waited?.await() as? WriteResult.Failed)?.cause
+    beforeReport()
+    lock.withLock { reportFailure(key, waitedFailure) }
+  }
+
+  /**
+   * Waits for every write and runs [beforeReport]. Then it throws a [SessionException] for the
+   * unreported failures, the first as its cause and the rest suppressed, leaving each for its
+   * session to report.
+   */
+  suspend fun flushAll(beforeReport: suspend () -> Unit = {}) {
+    awaitWrites { writerBySession.values.mapNotNull { it.lastWrite } }
+    beforeReport()
+    val causes = lock.withLock { writerBySession.keys.mapNotNull(::failureOf) }
+    if (causes.isEmpty()) return
+    val failure = SessionException(SESSION_PERSISTENCE_FAILED, causes.first())
+    causes.drop(1).forEach(failure::addSuppressed)
+    throw failure
+  }
+
+  /** Rejects later appends, flushes like [flushAll], then stops; later calls do nothing. */
+  suspend fun close(beforeReport: suspend () -> Unit = {}) {
+    lock.withLock {
+      if (isClosed) return
+      isClosed = true
+    }
+    try {
+      flushAll(beforeReport)
+    } finally {
+      withContext(NonCancellable) { coroutineScope.coroutineContext.job.cancelAndJoin() }
+    }
+  }
+
+  private suspend fun awaitWrites(select: () -> List<OrderedEventWriter.Write>) {
+    for (write in lock.withLock { select() }) write.join()
+  }
+
+  /** Needs [lock]. */
+  private fun lastWritesSeenBy(appName: String, userId: String) =
+    SharedStateScope.seenBy(appName, userId).mapNotNull { lastWriteByScope[it] }
+
+  /**
+   * Creates the session [key]'s writer, which passes itself to [beforeComplete], since a retired
+   * writer's writes still complete after the session has a new one.
+   */
+  private fun newWriter(key: SessionKey): OrderedEventWriter {
+    lateinit var writer: OrderedEventWriter
+    writer =
+      OrderedEventWriter(key, coroutineScope, persist) { write, result ->
+        beforeComplete(writer, write, result)
+      }
+    return writer
+  }
+
+  /**
+   * Runs before [write]'s waiters see [result]: forgets the write, then drops [writer] once its
+   * last write is persisted, or records its first failure so the next append reports it at once.
+   */
+  private suspend fun beforeComplete(
+    writer: OrderedEventWriter,
+    write: OrderedEventWriter.Write,
+    result: WriteResult,
+  ) {
+    lock.withLock {
+      for (scope in SharedStateScope.changedBy(write.key, write.event.actions.stateDelta.keys)) {
+        if (lastWriteByScope[scope] === write) lastWriteByScope.remove(scope)
+      }
+      // A retired writer's failure was reported or forgotten, and its writes no longer count.
+      if (writerBySession[writer.key] !== writer) return
+      when (result) {
+        WriteResult.Persisted -> if (writer.lastWrite === write) writerBySession.remove(writer.key)
+        is WriteResult.Failed ->
+          if (writer.key !in failureBySession) {
+            failureBySession[writer.key] = result.cause
+            if (failureBySession.size > maxUnreportedFailures) forgetOldestFailure()
+          }
+      }
+    }
+  }
+
+  /** Needs [lock]. */
+  private fun forgetOldestFailure() {
+    retire(failureBySession.keys.first())
+    // Once stopped, every write fails, so a warning per eviction says nothing new.
+    if (!coroutineScope.isActive) return
+    // No key: a session id can carry user data.
+    logger.warn {
+      "Forgot the oldest unreported buffered-write failure; its session will not report it."
+    }
+  }
+
+  /**
+   * Needs [lock]. Throws the session [key]'s unreported failure, retiring its writer, or else
+   * [waitedFailure]; a later call reports that failure again only if it waited for it.
+   */
+  private fun reportFailure(key: SessionKey, waitedFailure: Throwable? = null) {
+    val failure = failureOf(key)
+    if (failure != null) retire(key)
+    val cause = failure ?: waitedFailure ?: return
+    throw SessionException(SESSION_PERSISTENCE_FAILED, cause)
+  }
+
+  /**
+   * Needs [lock]. Returns the session [key]'s unreported failure; until it is reported or
+   * forgotten, the session keeps the writer that failed, so no newer writer can be retired.
+   */
+  private fun failureOf(key: SessionKey): Throwable? =
+    // A write canceled before it started, or stopped by an Error, skips beforeComplete.
+    failureBySession[key] ?: writerBySession[key]?.lastWriteFailure
+
+  /** Needs [lock]. Drops the session [key]'s failed writer; its next append starts a new one. */
+  private fun retire(key: SessionKey) {
+    writerBySession.remove(key)
+    failureBySession.remove(key)
+  }
+
+  private companion object {
+    // Bounds the memory unreported failures take, since a session may never be touched again.
+    const val MAX_UNREPORTED_FAILURES = 1024
+
+    val logger = LoggerFactory.getLogger(SessionWriteBuffer::class)
+  }
+}

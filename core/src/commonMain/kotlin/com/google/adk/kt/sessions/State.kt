@@ -179,3 +179,26 @@ internal fun splitInitialStateByScope(state: Map<String, Any>): ScopedInitialSta
   }
   return ScopedInitialState(appState, userState, sessionState)
 }
+
+/**
+ * A scope of state that several sessions share: a user's `user:` state, or an app's `app:` state.
+ */
+internal sealed interface SharedStateScope {
+  /** The `user:` state of [userId] in [appName]. */
+  data class User(val appName: String, val userId: String) : SharedStateScope
+
+  /** The `app:` state of [appName]. */
+  data class App(val appName: String) : SharedStateScope
+
+  companion object {
+    /** Returns the shared scopes that a change to [stateKeys] in the session [key] writes to. */
+    fun changedBy(key: SessionKey, stateKeys: Iterable<String>): Set<SharedStateScope> = buildSet {
+      if (stateKeys.any { it.startsWith(State.USER_PREFIX) }) add(User(key.appName, key.userId))
+      if (stateKeys.any { it.startsWith(State.APP_PREFIX) }) add(App(key.appName))
+    }
+
+    /** Returns the shared scopes that every session of [userId] in [appName] sees. */
+    fun seenBy(appName: String, userId: String): Set<SharedStateScope> =
+      setOf(User(appName, userId), App(appName))
+  }
+}
