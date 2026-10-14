@@ -20,6 +20,7 @@ package com.google.adk.kt.workflow
 
 import com.google.adk.kt.agents.Context
 import com.google.adk.kt.agents.InvocationContext
+import com.google.adk.kt.agents.ResumabilityConfig
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.apps.App
 import com.google.adk.kt.callbacks.CallbackChoice
@@ -31,8 +32,13 @@ import com.google.adk.kt.sessions.Session
 import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.sessions.SessionService
 import com.google.adk.kt.testing.modelMessage
+import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.FunctionCall
+import com.google.adk.kt.types.FunctionResponse
+import com.google.adk.kt.types.Part
+import com.google.adk.kt.types.Role
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.test.Test
 import kotlin.test.assertContains
@@ -514,5 +520,195 @@ class WorkflowRootNodeTest {
 
     // Assert
     assertEquals(1, taken.size)
+  }
+
+  @Test
+  fun runAsync_functionResponseOnRootNode_joinsCallingInvocation() {
+    // Arrange
+    val runner =
+      InMemoryRunner(app = App(appName = "node_app", rootNode = LookupCallingNode("caller")))
+    val callTurn = runBlocking { runner.runTurn(Content.fromText(Role.USER, "a")) }
+    val callInvocationId = assertNotNull(callTurn.single().invocationId)
+    val answer = mapOf("v" to 1)
+
+    // Act
+    val answerTurn = runBlocking {
+      runner.runTurn(userFunctionResponse(name = "lookup", id = "call-a", response = answer))
+    }
+    val session = runBlocking { runner.sessionService.getSession(SessionKey("node_app", "u", "s")) }
+
+    // Assert
+    assertEquals(answer, answerTurn.single().output)
+    assertEquals(callInvocationId, answerTurn.single().invocationId)
+    assertEquals(callInvocationId, session?.events?.last { it.author == Role.USER }?.invocationId)
+  }
+
+  @Test
+  fun runAsync_callerInvocationIdAndFunctionResponseOnRootNode_usesCallingInvocation() {
+    // Arrange
+    val runner =
+      InMemoryRunner(app = App(appName = "node_app", rootNode = LookupCallingNode("caller")))
+    val callInvocationId = runBlocking {
+      runner.runTurn(Content.fromText(Role.USER, "a")).single().invocationId
+    }
+
+    // Act
+    val answerTurn = runBlocking {
+      runner.runTurn(
+        userFunctionResponse(name = "lookup", id = "call-a"),
+        invocationId = "caller-supplied",
+      )
+    }
+
+    // Assert
+    assertEquals(callInvocationId, answerTurn.single().invocationId)
+  }
+
+  @Test
+  fun runAsync_functionResponseOnResumableRootNode_resumesCallingInvocation() {
+    // Arrange
+    val app =
+      App(
+        appName = "node_app",
+        rootNode = LookupCallingNode("caller"),
+        resumabilityConfig = ResumabilityConfig(isResumable = true),
+      )
+    val runner = InMemoryRunner(app = app)
+    val callInvocationId = runBlocking {
+      runner.runTurn(Content.fromText(Role.USER, "a")).single().invocationId
+    }
+    val answer = mapOf("v" to 1)
+
+    // Act
+    val answerTurn = runBlocking {
+      runner.runTurn(userFunctionResponse(name = "lookup", id = "call-a", response = answer))
+    }
+
+    // Assert
+    assertEquals(answer, answerTurn.single().output)
+    assertEquals(callInvocationId, answerTurn.single().invocationId)
+  }
+
+  @Test
+  fun runAsync_unmatchedFunctionResponseOnWorkflowRoot_failsBeforeRunning() {
+    // Arrange
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, Emitter("a", "A"))))
+    val runner = InMemoryRunner(app = App(appName = "graph_app", rootNode = workflow))
+
+    // Act
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        runBlocking { runner.runTurn(userFunctionResponse(name = "lookup", id = "unknown")) }
+      }
+    val session =
+      assertNotNull(
+        runBlocking { runner.sessionService.getSession(SessionKey("graph_app", "u", "s")) }
+      )
+
+    // Assert
+    assertContains(error.message.orEmpty(), "Function call not found")
+    assertTrue(session.events.isEmpty())
+  }
+
+  @Test
+  fun runAsync_functionResponsesForTwoInvocationsOnRootNode_throws() {
+    // Arrange
+    val runner =
+      InMemoryRunner(app = App(appName = "node_app", rootNode = LookupCallingNode("caller")))
+    val callInvocationIds = runBlocking {
+      listOf("a", "b").map { runner.runTurn(Content.fromText(Role.USER, it)).single().invocationId }
+    }
+    val answers =
+      Content(
+        Role.USER,
+        listOf(
+          Part(functionResponse = FunctionResponse(name = "lookup", id = "call-a")),
+          Part(functionResponse = FunctionResponse(name = "lookup", id = "call-b")),
+        ),
+      )
+
+    // Act
+    val error =
+      assertFailsWith<IllegalArgumentException> { runBlocking { runner.runTurn(answers) } }
+
+    // Assert
+    assertEquals(2, callInvocationIds.toSet().size)
+    assertContains(error.message.orEmpty(), "resolve to multiple invocations")
+  }
+
+  @Test
+  fun runAsync_idlessAndIdentifiedResponsesOnRootNode_joinsCallingInvocation() {
+    // Arrange
+    val runner =
+      InMemoryRunner(app = App(appName = "node_app", rootNode = LookupCallingNode("caller")))
+    val callInvocationId = runBlocking {
+      runner.runTurn(Content.fromText(Role.USER, "a")).single().invocationId
+    }
+    val answer = mapOf("v" to 1)
+    val answers =
+      Content(
+        Role.USER,
+        listOf(
+          Part(functionResponse = FunctionResponse(name = "lookup")),
+          Part(
+            functionResponse = FunctionResponse(name = "lookup", id = "call-a", response = answer)
+          ),
+        ),
+      )
+
+    // Act
+    val answerTurn = runBlocking { runner.runTurn(answers) }
+
+    // Assert
+    assertEquals(callInvocationId, answerTurn.single().invocationId)
+    assertEquals(answer, answerTurn.single().output)
+  }
+
+  @Test
+  fun runAsync_textWithFunctionResponseOnRootNode_throws() {
+    // Arrange
+    val runner =
+      InMemoryRunner(app = App(appName = "node_app", rootNode = LookupCallingNode("caller")))
+    val unused = runBlocking { runner.runTurn(Content.fromText(Role.USER, "a")) }
+    val mixed =
+      Content(
+        Role.USER,
+        listOf(
+          Part(text = "and also this"),
+          Part(functionResponse = FunctionResponse(name = "lookup", id = "call-a")),
+        ),
+      )
+
+    // Act
+    val error = assertFailsWith<IllegalArgumentException> { runBlocking { runner.runTurn(mixed) } }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "both function responses and text")
+  }
+}
+
+/** Runs one turn of session `u`/`s` and collects its events. */
+private suspend fun InMemoryRunner.runTurn(
+  message: Content,
+  invocationId: String? = null,
+): List<Event> =
+  runAsync(userId = "u", sessionId = "s", invocationId = invocationId, newMessage = message)
+    .toList()
+
+/**
+ * Answers a text turn with a long-running `lookup` call whose id is derived from the text; on
+ * resume the runner outputs the response it is answered with.
+ */
+private class LookupCallingNode(override val name: String) : Node {
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    val call =
+      FunctionCall(name = "lookup", id = "call-${(nodeInput as Content).parts.first().text}")
+    emit(
+      Event(
+        author = "",
+        content = Content(Role.MODEL, listOf(Part(functionCall = call))),
+        longRunningToolIds = setOf(call.id!!),
+      )
+    )
   }
 }

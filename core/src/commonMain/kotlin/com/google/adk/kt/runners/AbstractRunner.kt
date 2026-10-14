@@ -501,60 +501,107 @@ abstract class AbstractRunner : Runner {
     runConfig: RunConfig?,
   ): InvocationContext {
     val isResumable = resumabilityConfig.isResumable
-    if (!isResumable) {
-      if (newMessage == null) {
-        throw IllegalArgumentException("No new message provided and session is not resumable")
+    // Workflow and standalone node roots (`root !is BaseAgent`) reconstruct tool answers from
+    // session events sharing the calling `invocationId` in `NodeRunner`, so they always resolve
+    // function responses even when `isResumable` is false. `BaseAgent` roots only pause and resume
+    // invocations when `isResumable` is true.
+    val isNodeRoot = root !is BaseAgent
+    if (isNodeRoot) requireNoTextWithFunctionResponses(newMessage)
+    val resolvedInvocationId =
+      if (isResumable || isNodeRoot) {
+        // Without a caller-supplied id, a node root skips responses that carry no id.
+        val requireFirstId = !isNodeRoot || invocationId != null
+        resolveInvocationId(session, newMessage, invocationId, requireFirstId)
+      } else {
+        invocationId
       }
-      return setupContextForNewInvocation(session, invocationId, newMessage, runConfig, stateDelta)
+
+    // `isResumable` enables stateful checkpointing (`agentState` / `endOfAgent` events) and
+    // resuming without a new user message (`newMessage == null`). When `isResumable` is false, a
+    // node root still reuses `resolvedInvocationId` via `setupContextForNewInvocation` so the
+    // response event joins the calling invocation's history.
+    if (isResumable && resolvedInvocationId != null) {
+      return setupContextForResumedInvocation(
+        session,
+        newMessage,
+        resolvedInvocationId,
+        runConfig,
+        stateDelta,
+      )
     }
-    // Resumable mode: pick the existing invocation to resume if we can. If `newMessage` is a
-    // `FunctionResponse`, look up the originating function-call event in session history and
-    // resume its invocation. Otherwise fall back to the caller-supplied `invocationId`. If
-    // neither resolves, treat this as a brand-new invocation. Mirrors Python ADK
-    // `runners.py:_resolve_invocation_id`.
-    val resolvedInvocationId = resolveInvocationId(session, newMessage, invocationId)
-    if (resolvedInvocationId == null) {
-      if (newMessage == null) {
-        throw IllegalArgumentException(
-          "No new message provided and no resumable invocation to resume"
-        )
-      }
-      return setupContextForNewInvocation(session, invocationId, newMessage, runConfig, stateDelta)
+
+    requireNotNull(newMessage) {
+      if (isResumable) "No new message provided and no resumable invocation to resume"
+      else "No new message provided and session is not resumable"
     }
-    return setupContextForResumedInvocation(
+    return setupContextForNewInvocation(
       session,
-      newMessage,
       resolvedInvocationId,
+      newMessage,
       runConfig,
       stateDelta,
     )
   }
 
   /**
-   * Resolves the invocation ID for a resumable runner call.
-   *
-   * - If [newMessage] carries a `FunctionResponse`, find the matching `FunctionCall` event in the
-   *   session and return its `invocationId` (the response resumes that invocation).
-   * - Otherwise return [invocationId] (which is typically `null` for a first-time call).
-   *
-   * Mirrors Python ADK `runners.py:_resolve_invocation_id`.
+   * Throws [IllegalArgumentException] if [newMessage] mixes identified function responses and text.
+   */
+  private fun requireNoTextWithFunctionResponses(newMessage: Content?) {
+    val parts = newMessage?.parts.orEmpty()
+    val hasResponses = parts.any { !it.functionResponse?.id.isNullOrEmpty() }
+    require(!hasResponses || parts.none { it.text != null }) {
+      "Message cannot contain both function responses and text. Function responses resume an " +
+        "existing invocation while text starts a new one."
+    }
+  }
+
+  /**
+   * If [newMessage] contains identified function responses, returns the single invocation ID of the
+   * matching function calls in non-rewound [session] history (overriding [invocationId]); otherwise
+   * returns [invocationId]. Throws [IllegalArgumentException] if [requireFirstId] and the first
+   * response has no ID, any response ID is unmatched, or responses span multiple invocations.
    */
   private fun resolveInvocationId(
     session: Session,
     newMessage: Content?,
     invocationId: String?,
+    requireFirstId: Boolean,
   ): String? {
-    val functionResponse =
-      newMessage?.parts?.firstNotNullOfOrNull { it.functionResponse } ?: return invocationId
-    val targetId = functionResponse.id ?: return invocationId
-    val fcEvent =
-      session.events.asReversed().firstOrNull { event ->
-        event.functionCalls().any { it.id == targetId }
+    val functionResponses = newMessage?.parts?.mapNotNull { it.functionResponse }.orEmpty()
+    if (functionResponses.isEmpty()) return invocationId
+
+    require(!requireFirstId || !functionResponses.first().id.isNullOrEmpty()) {
+      "Function response id is required to resume an invocation."
+    }
+
+    val unmatchedIds =
+      functionResponses.mapNotNullTo(mutableSetOf()) { it.id?.takeIf(String::isNotEmpty) }
+    if (unmatchedIds.isEmpty()) return invocationId
+    val matchedInvocationIds = mutableSetOf<String?>()
+    for (event in applyRewinds(session.events).asReversed()) {
+      for (call in event.functionCalls()) {
+        if (unmatchedIds.remove(call.id)) matchedInvocationIds.add(event.invocationId)
       }
-        ?: throw IllegalArgumentException(
-          "Function call event not found for function response id: $targetId"
-        )
-    return fcEvent.invocationId
+      if (unmatchedIds.isEmpty()) break
+    }
+
+    require(unmatchedIds.isEmpty()) {
+      "Function call not found for ${unmatchedIds.size} function response id(s). Ensure each " +
+        "function response ID matches an existing function call in the session history."
+    }
+    require(matchedInvocationIds.size == 1) {
+      "Function responses resolve to multiple invocations (${matchedInvocationIds.size}). All " +
+        "function responses in a single message must belong to the same invocation."
+    }
+
+    val resolved = matchedInvocationIds.single()
+    if (invocationId != null && invocationId != resolved) {
+      logger.warn {
+        "Provided invocation id is ignored because the function response resolves to another " +
+          "invocation."
+      }
+    }
+    return resolved
   }
 
   /**

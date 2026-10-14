@@ -34,6 +34,7 @@ import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.plugins.Plugin
+import com.google.adk.kt.sessions.Session
 import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.sessions.State
 import com.google.adk.kt.summarizer.EventSummarizer
@@ -49,6 +50,8 @@ import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.types.Blob
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.FunctionCall
+import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.UsageMetadata
@@ -56,6 +59,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
@@ -81,6 +85,19 @@ class AbstractRunnerTest {
     suspend fun callFindAgentToRun(context: InvocationContext, rootAgent: BaseAgent): BaseAgent {
       return findAgentToRun(context, rootAgent)
     }
+
+    suspend fun callCreateInvocationContext(
+      session: Session,
+      invocationId: String?,
+      newMessage: Content?,
+    ): InvocationContext =
+      createInvocationContext(
+        session,
+        invocationId,
+        newMessage,
+        stateDelta = null,
+        runConfig = null,
+      )
   }
 
   @Test
@@ -770,6 +787,165 @@ class AbstractRunnerTest {
     assertFailsWith<IllegalArgumentException> { runner.callFindAgentToRun(context, rootAgent) }
       .also { assertEquals("Agent 'sub1' is not allowed to transfer to peer 'sub2'.", it.message) }
   }
+
+  @Test
+  fun createInvocationContext_firstFunctionResponseWithoutId_throws() = runBlocking {
+    // Arrange
+    val runner = TestRunner(DummyAgent("root"))
+    val session = runner.sessionWithEvents(functionCallEvent("inv-1", "call-1"))
+
+    // Act
+    val exception =
+      assertFailsWith<IllegalArgumentException> {
+        runner.callCreateInvocationContext(session, null, functionResponses(null, "call-1"))
+      }
+
+    // Assert
+    assertEquals("Function response id is required to resume an invocation.", exception.message)
+  }
+
+  @Test
+  fun createInvocationContext_parallelResponsesToOneInvocation_resolvesThatInvocation() =
+    runBlocking {
+      // Arrange
+      val runner = TestRunner(DummyAgent("root"))
+      val session = runner.sessionWithEvents(functionCallEvent("inv-1", "call-1", "call-2"))
+
+      // Act
+      val context =
+        runner.callCreateInvocationContext(session, null, functionResponses("call-1", "call-2"))
+
+      // Assert
+      assertEquals("inv-1", context.invocationId)
+    }
+
+  @Test
+  fun createInvocationContext_callerInvocationIdAndFunctionResponse_usesResponseInvocation() =
+    runBlocking {
+      // Arrange
+      val runner = TestRunner(DummyAgent("root"))
+      val session = runner.sessionWithEvents(functionCallEvent("inv-1", "call-1"))
+
+      // Act
+      val context =
+        runner.callCreateInvocationContext(session, "caller-supplied", functionResponses("call-1"))
+
+      // Assert
+      assertEquals("inv-1", context.invocationId)
+    }
+
+  @Test
+  fun createInvocationContext_responsesToDifferentInvocations_throws() = runBlocking {
+    // Arrange
+    val runner = TestRunner(DummyAgent("root"))
+    val session =
+      runner.sessionWithEvents(
+        functionCallEvent("inv-1", "call-1"),
+        functionCallEvent("inv-2", "call-2"),
+      )
+
+    // Act
+    val exception =
+      assertFailsWith<IllegalArgumentException> {
+        runner.callCreateInvocationContext(session, null, functionResponses("call-1", "call-2"))
+      }
+
+    // Assert
+    assertEquals(
+      "Function responses resolve to multiple invocations (2). All function responses in a " +
+        "single message must belong to the same invocation.",
+      exception.message,
+    )
+  }
+
+  @Test
+  fun createInvocationContext_responseIdMatchesNoCall_throws() = runBlocking {
+    // Arrange
+    val runner = TestRunner(DummyAgent("root"))
+    val session = runner.sessionWithEvents(functionCallEvent("inv-1", "call-1"))
+
+    // Act
+    val exception =
+      assertFailsWith<IllegalArgumentException> {
+        runner.callCreateInvocationContext(session, null, functionResponses("call-unknown"))
+      }
+
+    // Assert
+    assertEquals(
+      "Function call not found for 1 function response id(s). Ensure each function response ID " +
+        "matches an existing function call in the session history.",
+      exception.message,
+    )
+  }
+
+  @Test
+  fun createInvocationContext_responseToRewoundCall_throws() = runBlocking {
+    // Arrange
+    val runner = TestRunner(DummyAgent("root"))
+    val rewind =
+      Event(
+        author = Role.USER,
+        invocationId = "inv-2",
+        actions = EventActions(rewindBeforeInvocationId = "inv-1"),
+      )
+    val session = runner.sessionWithEvents(functionCallEvent("inv-1", "call-1"), rewind)
+
+    // Act
+    val exception =
+      assertFailsWith<IllegalArgumentException> {
+        runner.callCreateInvocationContext(session, null, functionResponses("call-1"))
+      }
+
+    // Assert
+    assertEquals(
+      "Function call not found for 1 function response id(s). Ensure each function response ID " +
+        "matches an existing function call in the session history.",
+      exception.message,
+    )
+  }
+
+  @Test
+  fun createInvocationContext_functionResponseOnNonResumableAgentRoot_startsFreshInvocation() =
+    runBlocking {
+      // Arrange
+      val runner = TestRunner(DummyAgent("root"), resumable = false)
+      val session = runner.sessionWithEvents(functionCallEvent("inv-1", "call-1"))
+
+      // Act
+      val context = runner.callCreateInvocationContext(session, null, functionResponses("call-1"))
+
+      // Assert
+      assertNotEquals("inv-1", context.invocationId)
+    }
+
+  /** Returns session `s` after appending [events] to it. */
+  private suspend fun TestRunner.sessionWithEvents(vararg events: Event): Session {
+    val key = SessionKey("InMemoryRunner", "user", "s")
+    val session = sessionService.createSession(key)
+    for (event in events) {
+      val unused = sessionService.appendEvent(session, event)
+    }
+    return checkNotNull(sessionService.getSession(key))
+  }
+
+  /** A model event in [invocationId] issuing one `tool` call per id in [callIds]. */
+  private fun functionCallEvent(invocationId: String, vararg callIds: String): Event =
+    Event(
+      author = "root",
+      invocationId = invocationId,
+      content =
+        Content(
+          Role.MODEL,
+          callIds.map { Part(functionCall = FunctionCall("tool", emptyMap(), it)) },
+        ),
+    )
+
+  /** A user message answering one `tool` call per id in [ids]; a null id omits it. */
+  private fun functionResponses(vararg ids: String?): Content =
+    Content(
+      Role.USER,
+      ids.map { Part(functionResponse = FunctionResponse(name = "tool", id = it)) },
+    )
 
   @Test
   fun rewindAsync_withStateAndArtifacts_restoresBoth() = runTest {
