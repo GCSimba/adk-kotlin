@@ -20,7 +20,6 @@ import com.google.adk.kt.agents.BaseAgent;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.Gemini;
 import com.google.adk.kt.plugins.agentanalytics.BigQueryAgentAnalyticsPlugin;
@@ -29,8 +28,8 @@ import com.google.adk.kt.tools.GoogleSearchTool;
 import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.Part;
 import com.google.adk.kt.types.Role;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
 
 /**
  * Java port of the plugin demo, exercising {@link BigQueryAgentAnalyticsPlugin} through Java
@@ -95,28 +94,22 @@ public final class BigQueryAnalyticsDemoAgentJava {
     App app = createApp(projectId, datasetId, tableName);
     PublisherRunner runner = PublisherRunner.inMemory(app);
 
-    // runAsync returns a Reactive Streams Publisher<Event>. Adapt it in one line to
-    // RxJava:  Flowable<Event> rx = Flowable.fromPublisher(eventStream);
-    // Reactor: Flux<Event> flux = Flux.from(eventStream);
-    // WebFlux: @GetMapping Flux<Event> stream() { return Flux.from(eventStream); }
-    //          Spring takes eventStream as is, but usually it goes through actual domain logic.
+    // RxJava users can adapt the same Publisher with Flowable.fromPublisher(eventStream).
     Publisher<Event> eventStream =
         runner.runAsync(
             "user_123",
             "session_" + System.currentTimeMillis(),
             null,
             Content.fromText(Role.USER, "What are some of the key features of the Kotlin ADK?"));
-    AtomicInteger eventCount = new AtomicInteger();
-    AsyncJavaHelpers.forEach(
-        eventStream,
-        event -> {
-          eventCount.incrementAndGet();
-          String text = firstText(event);
-          if (text != null && !text.isBlank()) {
-            System.out.println("[" + event.getAuthor() + "]: " + text);
-          }
-        });
-    System.out.println("Agent execution finished. Events collected: " + eventCount.get());
+    int eventCount = 0;
+    for (Event event : Flux.from(eventStream).toIterable()) {
+      eventCount++;
+      String text = firstText(event);
+      if (text != null && !text.isBlank()) {
+        System.out.println("[" + event.getAuthor() + "]: " + text);
+      }
+    }
+    System.out.println("Agent execution finished. Events collected: " + eventCount);
   }
 
   /** Returns the first text part of an event's content, or {@code null} if there is none. */

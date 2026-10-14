@@ -20,7 +20,6 @@ import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.Gemini;
@@ -30,10 +29,11 @@ import com.google.adk.kt.types.Role;
 import com.google.adk.kt.workflow.JoinNode;
 import com.google.adk.kt.workflow.Node;
 import com.google.adk.kt.workflow.Workflow;
-import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A port of adk-python's {@code nested_workflow} sample: for the year the user names, a nested
@@ -77,14 +77,12 @@ public final class NestedWorkflowJava {
         PublisherRunner.inMemory(
             App.builder().appName("nested_workflow").rootNode(workflow).build());
     Content message = Content.fromText(Role.USER, "1984");
-    AsyncJavaHelpers.forEach(
-        runner.runAsync("user", "session", null, message),
-        event -> {
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println("[" + event.getAuthor() + "] " + text);
-          }
-        });
+    for (Event event : Flux.from(runner.runAsync("user", "session", null, message)).toIterable()) {
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println("[" + event.getAuthor() + "] " + text);
+      }
+    }
   }
 
   private static LlmAgent findNameAgent(Model model) {
@@ -138,7 +136,7 @@ public final class NestedWorkflowJava {
         throw new IllegalArgumentException("Please provide a valid 4-digit year (e.g., 1955).");
       }
       context.updateState("year", year.group());
-      return AsyncJavaHelpers.publisherOf(List.of());
+      return Mono.empty();
     }
   }
 
@@ -157,9 +155,8 @@ public final class NestedWorkflowJava {
               + context.getState().get("bio")
               + "\n\n## Historical Event:\n\n"
               + context.getState().get("historical_event");
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              Event.builder().author("").content(Content.fromText(Role.MODEL, message)).build()));
+      return Mono.just(
+          Event.builder().author("").content(Content.fromText(Role.MODEL, message)).build());
     }
   }
 

@@ -20,7 +20,6 @@ import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.Gemini;
@@ -31,8 +30,9 @@ import com.google.adk.kt.workflow.Node;
 import com.google.adk.kt.workflow.Route;
 import com.google.adk.kt.workflow.Workflow;
 import java.util.Arrays;
-import java.util.List;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A port of the message-triage graph from the ADK docs: an agent labels a message as a bug, a
@@ -74,14 +74,12 @@ public final class MessageTriageWorkflowJava {
             App.builder().appName("routing_workflow").rootNode(workflow).build());
     Content message =
         Content.fromText(Role.USER, "The app crashes when I open my order, and my parcel is late.");
-    AsyncJavaHelpers.forEach(
-        runner.runAsync("user", "session", null, message),
-        event -> {
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println("[" + event.getAuthor() + "] " + text);
-          }
-        });
+    for (Event event : Flux.from(runner.runAsync("user", "session", null, message)).toIterable()) {
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println("[" + event.getAuthor() + "] " + text);
+      }
+    }
   }
 
   private static LlmAgent processMessageAgent(Model model) {
@@ -110,7 +108,7 @@ public final class MessageTriageWorkflowJava {
           context.getState().get("categories") instanceof String categories ? categories : "";
       context.setRoutes(
           Arrays.stream(labels.split(",", -1)).map(label -> new Route.Tag(label.trim())).toList());
-      return AsyncJavaHelpers.publisherOf(List.of());
+      return Mono.empty();
     }
   }
 
@@ -125,8 +123,8 @@ public final class MessageTriageWorkflowJava {
 
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(Event.builder().author("").content(Content.fromText(Role.MODEL, reply)).build()));
+      return Mono.just(
+          Event.builder().author("").content(Content.fromText(Role.MODEL, reply)).build());
     }
   }
 

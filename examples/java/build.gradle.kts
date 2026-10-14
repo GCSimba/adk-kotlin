@@ -37,6 +37,8 @@ dependencies {
   // compile classpath.
   implementation(libs.kotlinx.coroutines.core)
   implementation(libs.kotlinx.coroutines.reactive)
+  // Adds Reactor for reading and building publishers, plus the mono builder for suspend calls.
+  implementation(libs.kotlinx.coroutines.reactor)
   implementation(project(":google-adk-kotlin-litertlm"))
   implementation(libs.google.ai.edge.litertlm.jvm)
   // The Chat Completions Vertex demo gets its access token from the auth library directly.

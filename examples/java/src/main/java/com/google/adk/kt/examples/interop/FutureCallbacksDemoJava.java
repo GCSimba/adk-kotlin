@@ -21,7 +21,6 @@ import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.callbacks.AfterModelCallback;
 import com.google.adk.kt.callbacks.BeforeModelCallback;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherModel;
 import com.google.adk.kt.interop.Choices;
 import com.google.adk.kt.interop.FutureCallbacks;
@@ -36,6 +35,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Demonstrates wiring agent callbacks from Java via {@link FutureCallbacks} + {@link Choices}. The
@@ -56,11 +57,10 @@ public final class FutureCallbacksDemoJava {
 
     @Override
     protected Publisher<LlmResponse> generateContentJava(LlmRequest request, boolean stream) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              LlmResponse.builder()
-                  .content(Content.fromText(Role.MODEL, "The model answered your question."))
-                  .build()));
+      return Mono.just(
+          LlmResponse.builder()
+              .content(Content.fromText(Role.MODEL, "The model answered your question."))
+              .build());
     }
   }
 
@@ -105,22 +105,16 @@ public final class FutureCallbacksDemoJava {
   }
 
   private static void runTurn(PublisherRunner runner, String prompt) {
-    // runAsync returns a Reactive Streams Publisher<Event>. Adapt it in one line to
-    // RxJava:  Flowable<Event> rx = Flowable.fromPublisher(eventStream);
-    // Reactor: Flux<Event> flux = Flux.from(eventStream);
-    // WebFlux: @GetMapping Flux<Event> stream() { return Flux.from(eventStream); }
-    //          Spring takes eventStream as is, but usually it goes through actual domain logic.
+    // RxJava users can adapt the same Publisher with Flowable.fromPublisher(eventStream).
     Publisher<Event> eventStream =
         runner.runAsync(
             "demo-user", "session-" + System.nanoTime(), null, Content.fromText(Role.USER, prompt));
-    AsyncJavaHelpers.forEach(
-        eventStream,
-        event -> {
-          String text = firstText(event.getContent());
-          if (text != null && !text.isBlank()) {
-            System.out.println("[" + event.getAuthor() + "] " + text);
-          }
-        });
+    for (Event event : Flux.from(eventStream).toIterable()) {
+      String text = firstText(event.getContent());
+      if (text != null && !text.isBlank()) {
+        System.out.println("[" + event.getAuthor() + "] " + text);
+      }
+    }
   }
 
   private static String lastUserText(LlmRequest request) {

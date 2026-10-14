@@ -21,7 +21,6 @@ import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.annotations.ExperimentalContextCachingFeature;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.CacheMetadata;
 import com.google.adk.kt.models.Gemini;
@@ -31,6 +30,7 @@ import com.google.adk.kt.types.Part;
 import com.google.adk.kt.types.Role;
 import java.util.List;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
 
 /**
  * End-to-end demo of explicit context caching, using a weather assistant.
@@ -114,43 +114,38 @@ public final class ContextCachingDemoAgentJava {
       String prompt = PROMPTS.get(index);
       System.out.printf("%n===== Turn %d: \"%s\" =====%n", index + 1, prompt);
 
-      TurnSummary summary = new TurnSummary();
-      // runAsync returns a Reactive Streams Publisher<Event>. Adapt it in one line to
-      // RxJava:  Flowable<Event> rx = Flowable.fromPublisher(eventStream);
-      // Reactor: Flux<Event> flux = Flux.from(eventStream);
-      // WebFlux: @GetMapping Flux<Event> stream() { return Flux.from(eventStream); }
-      //          Spring takes eventStream as is, but usually it goes through actual domain logic.
+      CacheMetadata cache = null;
+      Integer cachedTokens = null;
+      // RxJava users can adapt the same Publisher with Flowable.fromPublisher(eventStream).
       Publisher<Event> eventStream =
           runner.runAsync(userId, sessionId, null, Content.fromText(Role.USER, prompt));
-      AsyncJavaHelpers.forEach(
-          eventStream,
-          event -> {
-            String text = textOf(event.getContent() == null ? null : event.getContent().getParts());
-            if (!event.getPartial() && !text.isBlank()) {
-              System.out.println("assistant > " + text);
-            }
-            if (event.getCacheMetadata() != null) {
-              summary.cache = event.getCacheMetadata();
-            }
-            if (event.getUsageMetadata() != null
-                && event.getUsageMetadata().getCachedContentTokenCount() != null) {
-              summary.cachedTokens = event.getUsageMetadata().getCachedContentTokenCount();
-            }
-          });
-
-      if (summary.cache != null) {
-        System.out.printf(
-            "  cache: %s | cachedContents=%d invocationsUsed=%d%n",
-            cacheStatus(summary.cache, previousActiveCacheName),
-            summary.cache.getContentsCount(),
-            summary.cache.getInvocationsUsed() == null ? 0 : summary.cache.getInvocationsUsed());
-        if (summary.cache.isActive()) {
-          previousActiveCacheName = summary.cache.getCacheName();
+      for (Event event : Flux.from(eventStream).toIterable()) {
+        String text = textOf(event.getContent() == null ? null : event.getContent().getParts());
+        if (!event.getPartial() && !text.isBlank()) {
+          System.out.println("assistant > " + text);
+        }
+        if (event.getCacheMetadata() != null) {
+          cache = event.getCacheMetadata();
+        }
+        if (event.getUsageMetadata() != null
+            && event.getUsageMetadata().getCachedContentTokenCount() != null) {
+          cachedTokens = event.getUsageMetadata().getCachedContentTokenCount();
         }
       }
-      if (summary.cachedTokens != null) {
+
+      if (cache != null) {
+        System.out.printf(
+            "  cache: %s | cachedContents=%d invocationsUsed=%d%n",
+            cacheStatus(cache, previousActiveCacheName),
+            cache.getContentsCount(),
+            cache.getInvocationsUsed() == null ? 0 : cache.getInvocationsUsed());
+        if (cache.isActive()) {
+          previousActiveCacheName = cache.getCacheName();
+        }
+      }
+      if (cachedTokens != null) {
         System.out.println(
-            "  cachedContentTokenCount (prompt tokens served from cache): " + summary.cachedTokens);
+            "  cachedContentTokenCount (prompt tokens served from cache): " + cachedTokens);
       }
 
       // Force a single TTL expiry mid-conversation so the next turn re-creates the cache.
@@ -171,12 +166,6 @@ public final class ContextCachingDemoAgentJava {
             + " the");
     System.out.println(
         "settled history is folded in. Exact turn-by-turn timing depends on model" + " latency.");
-  }
-
-  /** Cache details observed during a single turn. */
-  private static final class TurnSummary {
-    CacheMetadata cache;
-    Integer cachedTokens;
   }
 
   private static String textOf(List<Part> parts) {

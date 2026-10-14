@@ -19,7 +19,6 @@ package com.google.adk.kt.examples.interop;
 import com.google.adk.kt.agents.BaseAgent;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BaseFutureSessionService;
 import com.google.adk.kt.interop.BasePublisherModel;
 import com.google.adk.kt.interop.PublisherRunner;
@@ -41,6 +40,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Demonstrates implementing a {@link com.google.adk.kt.sessions.SessionService} from Java via
@@ -128,11 +129,10 @@ public final class FutureSessionServiceDemoJava {
 
     @Override
     protected Publisher<LlmResponse> generateContentJava(LlmRequest request, boolean stream) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              LlmResponse.builder()
-                  .content(Content.fromText(Role.MODEL, "Hello from the agent."))
-                  .build()));
+      return Mono.just(
+          LlmResponse.builder()
+              .content(Content.fromText(Role.MODEL, "Hello from the agent."))
+              .build());
     }
   }
 
@@ -149,21 +149,15 @@ public final class FutureSessionServiceDemoJava {
         PublisherRunner.of(
             InMemoryRunner.builder().agent(agent).appName(appName).sessionService(service).build());
 
-    // runAsync returns a Reactive Streams Publisher<Event>. Adapt it in one line to
-    // RxJava:  Flowable<Event> rx = Flowable.fromPublisher(eventStream);
-    // Reactor: Flux<Event> flux = Flux.from(eventStream);
-    // WebFlux: @GetMapping Flux<Event> stream() { return Flux.from(eventStream); }
-    //          Spring takes eventStream as is, but usually it goes through actual domain logic.
+    // RxJava users can adapt the same Publisher with Flowable.fromPublisher(eventStream).
     Publisher<Event> eventStream =
         runner.runAsync(userId, sessionId, null, Content.fromText(Role.USER, "Hello!"));
-    AsyncJavaHelpers.forEach(
-        eventStream,
-        event -> {
-          String text = firstText(event.getContent());
-          if (text != null && !text.isBlank()) {
-            System.out.println("[" + event.getAuthor() + "] " + text);
-          }
-        });
+    for (Event event : Flux.from(eventStream).toIterable()) {
+      String text = firstText(event.getContent());
+      if (text != null && !text.isBlank()) {
+        System.out.println("[" + event.getAuthor() + "] " + text);
+      }
+    }
   }
 
   private static String firstText(Content content) {

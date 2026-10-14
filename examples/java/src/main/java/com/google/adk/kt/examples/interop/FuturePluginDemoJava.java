@@ -20,7 +20,6 @@ import com.google.adk.kt.agents.InvocationContext;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BaseFuturePlugin;
 import com.google.adk.kt.interop.BasePublisherModel;
 import com.google.adk.kt.interop.PublisherRunner;
@@ -30,10 +29,11 @@ import com.google.adk.kt.runners.InMemoryRunner;
 import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.Part;
 import com.google.adk.kt.types.Role;
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Demonstrates implementing a {@link com.google.adk.kt.plugins.Plugin} from Java via {@link
@@ -80,11 +80,10 @@ public final class FuturePluginDemoJava {
 
     @Override
     protected Publisher<LlmResponse> generateContentJava(LlmRequest request, boolean stream) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              LlmResponse.builder()
-                  .content(Content.fromText(Role.MODEL, "Hello from the model."))
-                  .build()));
+      return Mono.just(
+          LlmResponse.builder()
+              .content(Content.fromText(Role.MODEL, "Hello from the model."))
+              .build());
     }
   }
 
@@ -103,21 +102,15 @@ public final class FuturePluginDemoJava {
 
     PublisherRunner runner = PublisherRunner.of(InMemoryRunner.builder().app(app).build());
 
-    // runAsync returns a Reactive Streams Publisher<Event>. Adapt it in one line to
-    // RxJava:  Flowable<Event> rx = Flowable.fromPublisher(eventStream);
-    // Reactor: Flux<Event> flux = Flux.from(eventStream);
-    // WebFlux: @GetMapping Flux<Event> stream() { return Flux.from(eventStream); }
-    //          Spring takes eventStream as is, but usually it goes through actual domain logic.
+    // RxJava users can adapt the same Publisher with Flowable.fromPublisher(eventStream).
     Publisher<Event> eventStream =
         runner.runAsync("demo-user", "demo-session", null, Content.fromText(Role.USER, "Hi!"));
-    AsyncJavaHelpers.forEach(
-        eventStream,
-        event -> {
-          String text = firstText(event.getContent());
-          if (text != null && !text.isBlank()) {
-            System.out.println("[" + event.getAuthor() + "] " + text);
-          }
-        });
+    for (Event event : Flux.from(eventStream).toIterable()) {
+      String text = firstText(event.getContent());
+      if (text != null && !text.isBlank()) {
+        System.out.println("[" + event.getAuthor() + "] " + text);
+      }
+    }
   }
 
   private static String firstText(Content content) {

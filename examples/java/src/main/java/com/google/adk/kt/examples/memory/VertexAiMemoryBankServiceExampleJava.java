@@ -20,7 +20,7 @@ import com.google.adk.kt.agents.BaseAgent;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.callbacks.AfterAgentCallback;
 import com.google.adk.kt.callbacks.BeforeModelCallback;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
+import com.google.adk.kt.events.Event;
 import com.google.adk.kt.interop.Choices;
 import com.google.adk.kt.interop.FutureCallbacks;
 import com.google.adk.kt.interop.PublisherRunner;
@@ -37,6 +37,10 @@ import com.google.adk.kt.types.Role;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import kotlinx.coroutines.Dispatchers;
+import kotlinx.coroutines.reactor.MonoKt;
+import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
 
 /**
  * Java port of the standard-ADK example of using {@link VertexAiMemoryBankService} with an agent.
@@ -46,9 +50,8 @@ import java.util.concurrent.CompletableFuture;
  * turn, and an after-agent callback calls {@code CallbackContext.addSessionToMemory} to write the
  * conversation back for recall in future sessions.
  *
- * <p>The suspending {@code addSessionToMemory} is called from Java through {@link
- * AsyncJavaHelpers#await}, run inside the callback's returned future so the engine thread is not
- * blocked.
+ * <p>{@code createSession} and {@code addSessionToMemory} are Kotlin suspend functions, so the
+ * kotlinx-coroutines-reactor {@code mono} builder calls them.
  *
  * <p>Authentication uses Application Default Credentials ({@code gcloud auth application-default
  * login}).
@@ -111,28 +114,30 @@ public final class VertexAiMemoryBankServiceExampleJava {
             .memoryService(memoryService)
             .build();
     Session created =
-        AsyncJavaHelpers.await(
-            c ->
-                inMemoryRunner
-                    .getSessionService()
-                    .createSession(new SessionKey(APP_NAME, USER_ID, null), null, c));
+        MonoKt.<Session>mono(
+                Dispatchers.getDefault(),
+                (scope, continuation) ->
+                    inMemoryRunner
+                        .getSessionService()
+                        .createSession(new SessionKey(APP_NAME, USER_ID, null), null, continuation))
+            .block();
     String sessionId = Objects.requireNonNull(created.getKey().getId());
     PublisherRunner runner = PublisherRunner.of(inMemoryRunner);
 
     String message =
         args.length > 0 && args[0].equalsIgnoreCase("short") ? RECALL_MESSAGE : SEED_MESSAGE;
     System.out.println("user > " + message);
-    AsyncJavaHelpers.forEach(
-        runner.runAsync(USER_ID, sessionId, null, Content.fromText(Role.USER, message)),
-        event -> {
-          if (event.getPartial()) {
-            return;
-          }
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println(event.getAuthor() + " > " + text);
-          }
-        });
+    Publisher<Event> events =
+        runner.runAsync(USER_ID, sessionId, null, Content.fromText(Role.USER, message));
+    for (Event event : Flux.from(events).toIterable()) {
+      if (event.getPartial()) {
+        continue;
+      }
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println(event.getAuthor() + " > " + text);
+      }
+    }
 
     System.out.println(
         "\n"
@@ -156,15 +161,15 @@ public final class VertexAiMemoryBankServiceExampleJava {
         });
   }
 
-  /** Writes the finished turn back to memory; the suspend call runs inside the returned future. */
+  /** Writes the finished turn back to memory; the returned future completes once it is written. */
   private static AfterAgentCallback storeSessionToMemory() {
     return FutureCallbacks.afterAgent(
         context ->
-            CompletableFuture.supplyAsync(
-                () -> {
-                  var unused = AsyncJavaHelpers.await(c -> context.addSessionToMemory(c));
-                  return Choices.<Content>proceed();
-                }));
+            MonoKt.mono(
+                    Dispatchers.getDefault(),
+                    (scope, continuation) -> context.addSessionToMemory(continuation))
+                .thenReturn(Choices.<Content>proceed())
+                .toFuture());
   }
 
   private static String requireEnv(String name) {

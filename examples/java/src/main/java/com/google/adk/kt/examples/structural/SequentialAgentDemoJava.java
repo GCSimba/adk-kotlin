@@ -21,12 +21,12 @@ import com.google.adk.kt.agents.InvocationContext;
 import com.google.adk.kt.agents.SequentialAgent;
 import com.google.adk.kt.events.Event;
 import com.google.adk.kt.events.EventActions;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherAgent;
 import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.Part;
 import java.util.List;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Mono;
 
 /** A fun, nerdy demo for SequentialAgent simulating a pre-flight sequence. */
 public final class SequentialAgentDemoJava {
@@ -41,16 +41,14 @@ public final class SequentialAgentDemoJava {
 
     @Override
     public Publisher<Event> runAsyncImplJava(InvocationContext context) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              Event.builder()
-                  .invocationId(context.getInvocationId())
-                  .author(getName())
-                  .content(
-                      new Content(
-                          /* role= */ null, List.of(Part.builder().text(storyText).build())))
-                  .actions(EventActions.builder().build())
-                  .build()));
+      return Mono.just(
+          Event.builder()
+              .invocationId(context.getInvocationId())
+              .author(getName())
+              .content(
+                  new Content(/* role= */ null, List.of(Part.builder().text(storyText).build())))
+              .actions(EventActions.builder().build())
+              .build());
     }
   }
 

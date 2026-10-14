@@ -19,16 +19,16 @@ package com.google.adk.kt.examples.workflow;
 import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.Role;
 import com.google.adk.kt.workflow.Node;
 import com.google.adk.kt.workflow.Workflow;
-import java.util.List;
 import java.util.Locale;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A port of adk-python's {@code multi_triggers} workflow sample: three nodes transform the user's
@@ -63,14 +63,12 @@ public final class MultiTriggersWorkflowJava {
         PublisherRunner.inMemory(
             App.builder().appName("multi_triggers").rootNode(create()).build());
     Content message = Content.fromText(Role.USER, "Hello, workflows!");
-    AsyncJavaHelpers.forEach(
-        runner.runAsync("user", "session", null, message),
-        event -> {
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println(text);
-          }
-        });
+    for (Event event : Flux.from(runner.runAsync("user", "session", null, message)).toIterable()) {
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println(text);
+      }
+    }
   }
 
   private static final class MakeUppercase extends BasePublisherNode {
@@ -80,8 +78,7 @@ public final class MultiTriggersWorkflowJava {
 
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(((Content) nodeInput).text().toUpperCase(Locale.ROOT)));
+      return Mono.just(((Content) nodeInput).text().toUpperCase(Locale.ROOT));
     }
   }
 
@@ -92,7 +89,7 @@ public final class MultiTriggersWorkflowJava {
 
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
-      return AsyncJavaHelpers.publisherOf(List.of(((Content) nodeInput).text().length()));
+      return Mono.just(((Content) nodeInput).text().length());
     }
   }
 
@@ -104,7 +101,7 @@ public final class MultiTriggersWorkflowJava {
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
       String text = ((Content) nodeInput).text();
-      return AsyncJavaHelpers.publisherOf(List.of(new StringBuilder(text).reverse().toString()));
+      return Mono.just(new StringBuilder(text).reverse().toString());
     }
   }
 
@@ -117,8 +114,8 @@ public final class MultiTriggersWorkflowJava {
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
       String text = "Triggered for input: " + nodeInput;
-      return AsyncJavaHelpers.publisherOf(
-          List.of(Event.builder().author("").content(Content.fromText(Role.MODEL, text)).build()));
+      return Mono.just(
+          Event.builder().author("").content(Content.fromText(Role.MODEL, text)).build());
     }
   }
 

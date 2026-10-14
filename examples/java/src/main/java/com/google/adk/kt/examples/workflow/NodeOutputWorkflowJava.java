@@ -20,7 +20,6 @@ import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.Gemini;
@@ -31,9 +30,10 @@ import com.google.adk.kt.types.Schema;
 import com.google.adk.kt.types.Type;
 import com.google.adk.kt.workflow.Node;
 import com.google.adk.kt.workflow.Workflow;
-import java.util.List;
 import java.util.Map;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A port of adk-python's {@code node_output} workflow sample: a node's published value becomes its
@@ -73,17 +73,15 @@ public final class NodeOutputWorkflowJava {
     PublisherRunner runner =
         PublisherRunner.inMemory(App.builder().appName("node_output").rootNode(workflow).build());
     Content message = Content.fromText(Role.USER, "cyberpunk future");
-    AsyncJavaHelpers.forEach(
-        runner.runAsync("user", "session", null, message),
-        event -> {
-          String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println("[" + path + "] " + text);
-          } else if (event.getOutput() != null) {
-            System.out.println("[" + path + "] " + event.getOutput());
-          }
-        });
+    for (Event event : Flux.from(runner.runAsync("user", "session", null, message)).toIterable()) {
+      String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println("[" + path + "] " + text);
+      } else if (event.getOutput() != null) {
+        System.out.println("[" + path + "] " + event.getOutput());
+      }
+    }
   }
 
   private static LlmAgent topicAgent(Model model) {
@@ -129,8 +127,7 @@ public final class NodeOutputWorkflowJava {
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
       // START hands the first node the user's message as Content.
-      return AsyncJavaHelpers.publisherOf(
-          List.of("Processed input: " + ((Content) nodeInput).text()));
+      return Mono.just("Processed input: " + ((Content) nodeInput).text());
     }
   }
 
@@ -143,7 +140,7 @@ public final class NodeOutputWorkflowJava {
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
       Event event = Event.builder().output("Event wrapped output: " + nodeInput).build();
-      return AsyncJavaHelpers.publisherOf(List.of(event));
+      return Mono.just(event);
     }
   }
 
@@ -165,7 +162,7 @@ public final class NodeOutputWorkflowJava {
           Category: %s\
           """
               .formatted(topic.get("title"), topic.get("description"), topic.get("category"));
-      return AsyncJavaHelpers.publisherOf(List.of(result));
+      return Mono.just(result);
     }
   }
 

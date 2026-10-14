@@ -22,7 +22,6 @@ import com.google.adk.kt.annotations.Param;
 import com.google.adk.kt.annotations.Tool;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherModel;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.interop.ReflectiveTools;
@@ -33,10 +32,11 @@ import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.FunctionCall;
 import com.google.adk.kt.types.Part;
 import com.google.adk.kt.types.Role;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Demonstrates {@link ReflectiveTools}: a Java caller annotates a plain method with {@code @Tool} /
@@ -91,7 +91,7 @@ public final class ReflectiveToolsDemoJava {
                 .content(Content.fromText(Role.MODEL, "It's sunny and 68F in San Francisco."))
                 .build();
       }
-      return AsyncJavaHelpers.publisherOf(List.of(response));
+      return Mono.just(response);
     }
   }
 
@@ -116,14 +116,13 @@ public final class ReflectiveToolsDemoJava {
         PublisherRunner.inMemory(App.builder().appName("weather_app").rootAgent(agent).build());
 
     System.out.println("User > What's the weather in San Francisco?");
-    List<Event> events = new ArrayList<>();
-    AsyncJavaHelpers.forEach(
+    Publisher<Event> eventStream =
         runner.runAsync(
             "user-1",
             "session-1",
             null,
-            Content.fromText(Role.USER, "What's the weather in San Francisco?")),
-        events::add);
+            Content.fromText(Role.USER, "What's the weather in San Francisco?"));
+    List<Event> events = Flux.from(eventStream).collectList().block();
 
     for (Event event : events) {
       if (!event.functionCalls().isEmpty()) {

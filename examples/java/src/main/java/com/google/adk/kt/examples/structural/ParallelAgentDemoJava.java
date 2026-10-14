@@ -20,12 +20,12 @@ import com.google.adk.kt.agents.BaseAgent;
 import com.google.adk.kt.agents.InvocationContext;
 import com.google.adk.kt.agents.ParallelAgent;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherAgent;
 import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.Part;
 import java.util.List;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Mono;
 
 /**
  * A fun, quirky, family-friendly demo for ParallelAgent showcasing simultaneous actions by a team
@@ -43,15 +43,13 @@ public final class ParallelAgentDemoJava {
 
     @Override
     public Publisher<Event> runAsyncImplJava(InvocationContext context) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              Event.builder()
-                  .invocationId(context.getInvocationId())
-                  .author(getName())
-                  .content(
-                      new Content(
-                          /* role= */ null, List.of(Part.builder().text(actionReport).build())))
-                  .build()));
+      return Mono.just(
+          Event.builder()
+              .invocationId(context.getInvocationId())
+              .author(getName())
+              .content(
+                  new Content(/* role= */ null, List.of(Part.builder().text(actionReport).build())))
+              .build());
     }
   }
 

@@ -21,7 +21,7 @@ import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.annotations.Param;
 import com.google.adk.kt.annotations.Tool;
 import com.google.adk.kt.apps.App;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
+import com.google.adk.kt.events.Event;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.interop.ReflectiveTools;
@@ -44,6 +44,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * An order-processing workflow with fraud review, built with the workflow DSL. Nested fraud and
@@ -236,17 +238,15 @@ public final class OrderProcessingWorkflowJava {
       String orderId = order.substring("order_id=".length(), order.indexOf(' '));
       System.out.println("\n=== Order " + orderId);
       Content message = Content.fromText(Role.USER, order);
-      AsyncJavaHelpers.forEach(
-          runner.runAsync("user", orderId, null, message),
-          event -> {
-            String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
-            String text = event.contentText(" ");
-            if (!text.isBlank()) {
-              System.out.println("[" + path + "] " + text);
-            } else if (event.getOutput() != null) {
-              System.out.println("[" + path + "] " + event.getOutput());
-            }
-          });
+      for (Event event : Flux.from(runner.runAsync("user", orderId, null, message)).toIterable()) {
+        String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
+        String text = event.contentText(" ");
+        if (!text.isBlank()) {
+          System.out.println("[" + path + "] " + text);
+        } else if (event.getOutput() != null) {
+          System.out.println("[" + path + "] " + event.getOutput());
+        }
+      }
     }
   }
 
@@ -399,13 +399,12 @@ public final class OrderProcessingWorkflowJava {
             field.getKey(), value.matches("-?\\d+") ? Integer.valueOf(value) : value);
       }
       // Every branch of the fan-out gets this output; only the tool reads it, as its arguments.
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              Map.of(
-                  "customerId",
-                  fields.get("customer_id"),
-                  "orderTotalUsd",
-                  Integer.parseInt(fields.get("total_usd")))));
+      return Mono.just(
+          Map.of(
+              "customerId",
+              fields.get("customer_id"),
+              "orderTotalUsd",
+              Integer.parseInt(fields.get("total_usd"))));
     }
   }
 
@@ -423,7 +422,7 @@ public final class OrderProcessingWorkflowJava {
       if (decision instanceof String route) {
         context.setRoutes(List.of(new Route.Tag(route)));
       }
-      return AsyncJavaHelpers.publisherOf(List.of());
+      return Mono.empty();
     }
   }
 
@@ -458,7 +457,7 @@ public final class OrderProcessingWorkflowJava {
       if (route != null) {
         context.setRoutes(List.of(new Route.Tag(route)));
       }
-      return AsyncJavaHelpers.publisherOf(List.of());
+      return Mono.empty();
     }
   }
 
@@ -475,7 +474,7 @@ public final class OrderProcessingWorkflowJava {
 
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
-      return AsyncJavaHelpers.publisherOf(List.of(act.apply(context)));
+      return Mono.just(act.apply(context));
     }
   }
 

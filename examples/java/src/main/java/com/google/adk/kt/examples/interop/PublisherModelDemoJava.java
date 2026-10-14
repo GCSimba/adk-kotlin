@@ -19,7 +19,6 @@ package com.google.adk.kt.examples.interop;
 import com.google.adk.kt.agents.BaseAgent;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherModel;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.LlmRequest;
@@ -30,6 +29,8 @@ import com.google.adk.kt.types.Part;
 import com.google.adk.kt.types.Role;
 import java.util.List;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Demonstrates implementing a {@link com.google.adk.kt.models.Model} from Java via {@link
@@ -51,7 +52,7 @@ public final class PublisherModelDemoJava {
           LlmResponse.builder()
               .content(Content.fromText(Role.MODEL, "Echo: " + lastUserText(request)))
               .build();
-      return AsyncJavaHelpers.publisherOf(List.of(response));
+      return Mono.just(response);
     }
   }
 
@@ -66,22 +67,16 @@ public final class PublisherModelDemoJava {
         PublisherRunner.of(
             InMemoryRunner.builder().agent(agent).appName("PublisherModelDemo").build());
 
-    // runAsync returns a Reactive Streams Publisher<Event>. Adapt it in one line to
-    // RxJava:  Flowable<Event> rx = Flowable.fromPublisher(eventStream);
-    // Reactor: Flux<Event> flux = Flux.from(eventStream);
-    // WebFlux: @GetMapping Flux<Event> stream() { return Flux.from(eventStream); }
-    //          Spring takes eventStream as is, but usually it goes through actual domain logic.
+    // RxJava users can adapt the same Publisher with Flowable.fromPublisher(eventStream).
     Publisher<Event> eventStream =
         runner.runAsync(
             "demo-user", "demo-session", null, Content.fromText(Role.USER, "Hello, model!"));
-    AsyncJavaHelpers.forEach(
-        eventStream,
-        event -> {
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println("[" + event.getAuthor() + "] " + text);
-          }
-        });
+    for (Event event : Flux.from(eventStream).toIterable()) {
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println("[" + event.getAuthor() + "] " + text);
+      }
+    }
   }
 
   /** Returns the text of the last user turn in [request], or an empty string. */

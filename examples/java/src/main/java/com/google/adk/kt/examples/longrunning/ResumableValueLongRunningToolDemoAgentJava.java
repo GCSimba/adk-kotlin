@@ -31,7 +31,6 @@ import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
 import com.google.adk.kt.examples.longrunning.LongRunningToolDemoSupportJava.ChangeDestinationTool;
 import com.google.adk.kt.examples.longrunning.LongRunningToolDemoSupportJava.ScriptedNavModel;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.runners.InMemoryRunner;
 import com.google.adk.kt.sessions.Session;
@@ -39,8 +38,10 @@ import com.google.adk.kt.sessions.SessionKey;
 import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.FunctionCall;
 import com.google.adk.kt.types.Role;
-import java.util.ArrayList;
 import java.util.List;
+import kotlinx.coroutines.Dispatchers;
+import kotlinx.coroutines.reactor.MonoKt;
+import reactor.core.publisher.Flux;
 
 /**
  * Runnable demo of a long-running tool that returns a <b>value</b> in a <b>resumable</b> app
@@ -79,14 +80,16 @@ public final class ResumableValueLongRunningToolDemoAgentJava {
     System.out.println("User > Change my destination to " + REQUESTED_DESTINATION + ".");
 
     // Collected, not just streamed: the demo inspects these events afterward (paused call + id).
-    List<Event> turn1 = new ArrayList<>();
-    AsyncJavaHelpers.forEach(
-        runner.runAsync(
-            DEMO_USER_ID,
-            DEMO_SESSION_ID,
-            null,
-            Content.fromText(Role.USER, "Change my destination to " + REQUESTED_DESTINATION + ".")),
-        turn1::add);
+    List<Event> turn1 =
+        Flux.from(
+                runner.runAsync(
+                    DEMO_USER_ID,
+                    DEMO_SESSION_ID,
+                    null,
+                    Content.fromText(
+                        Role.USER, "Change my destination to " + REQUESTED_DESTINATION + ".")))
+            .collectList()
+            .block();
     printEvents(
         "turn 1 (value answers the call; the model summarizes, invocation stays live)", turn1);
     System.out.println(
@@ -115,18 +118,26 @@ public final class ResumableValueLongRunningToolDemoAgentJava {
         "[app] device applied the destination; delivering the real result to invocation "
             + invocationId
             + ".");
-    List<Event> turn2 = new ArrayList<>();
-    AsyncJavaHelpers.forEach(
-        runner.runAsync(DEMO_USER_ID, DEMO_SESSION_ID, invocationId, deviceResult(resumableCall)),
-        turn2::add);
+    List<Event> turn2 =
+        Flux.from(
+                runner.runAsync(
+                    DEMO_USER_ID, DEMO_SESSION_ID, invocationId, deviceResult(resumableCall)))
+            .collectList()
+            .block();
     printEvents("turn 2 (resumed by invocationId with the device result)", turn2);
 
+    // getSession is a Kotlin suspend function; kotlinx-coroutines-reactor's mono builder calls it.
     Session session =
-        AsyncJavaHelpers.await(
-            c ->
-                inMemoryRunner
-                    .getSessionService()
-                    .getSession(new SessionKey(APP_NAME, DEMO_USER_ID, DEMO_SESSION_ID), null, c));
+        MonoKt.<Session>mono(
+                Dispatchers.getDefault(),
+                (scope, continuation) ->
+                    inMemoryRunner
+                        .getSessionService()
+                        .getSession(
+                            new SessionKey(APP_NAME, DEMO_USER_ID, DEMO_SESSION_ID),
+                            null,
+                            continuation))
+            .block();
     System.out.println(
         "Stored session now has "
             + (session == null ? 0 : session.getEvents().size())

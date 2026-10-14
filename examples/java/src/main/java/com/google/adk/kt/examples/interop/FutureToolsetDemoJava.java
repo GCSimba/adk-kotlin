@@ -20,7 +20,6 @@ import com.google.adk.kt.agents.BaseAgent;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.agents.ReadonlyContext;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BaseFutureTool;
 import com.google.adk.kt.interop.BaseFutureToolset;
 import com.google.adk.kt.interop.BasePublisherModel;
@@ -38,6 +37,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Demonstrates implementing a {@link com.google.adk.kt.tools.Toolset} from Java via {@link
@@ -93,8 +94,8 @@ public final class FutureToolsetDemoJava {
 
     @Override
     protected Publisher<LlmResponse> generateContentJava(LlmRequest request, boolean stream) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(LlmResponse.builder().content(Content.fromText(Role.MODEL, "Done.")).build()));
+      return Mono.just(
+          LlmResponse.builder().content(Content.fromText(Role.MODEL, "Done.")).build());
     }
   }
 
@@ -111,21 +112,15 @@ public final class FutureToolsetDemoJava {
         PublisherRunner.of(
             InMemoryRunner.builder().agent(agent).appName("FutureToolsetDemo").build());
 
-    // runAsync returns a Reactive Streams Publisher<Event>. Adapt it in one line to
-    // RxJava:  Flowable<Event> rx = Flowable.fromPublisher(eventStream);
-    // Reactor: Flux<Event> flux = Flux.from(eventStream);
-    // WebFlux: @GetMapping Flux<Event> stream() { return Flux.from(eventStream); }
-    //          Spring takes eventStream as is, but usually it goes through actual domain logic.
+    // RxJava users can adapt the same Publisher with Flowable.fromPublisher(eventStream).
     Publisher<Event> eventStream =
         runner.runAsync("demo-user", "demo-session", null, Content.fromText(Role.USER, "Hi!"));
-    AsyncJavaHelpers.forEach(
-        eventStream,
-        event -> {
-          String text = firstText(event.getContent());
-          if (text != null && !text.isBlank()) {
-            System.out.println("[" + event.getAuthor() + "] " + text);
-          }
-        });
+    for (Event event : Flux.from(eventStream).toIterable()) {
+      String text = firstText(event.getContent());
+      if (text != null && !text.isBlank()) {
+        System.out.println("[" + event.getAuthor() + "] " + text);
+      }
+    }
   }
 
   private static String firstText(Content content) {

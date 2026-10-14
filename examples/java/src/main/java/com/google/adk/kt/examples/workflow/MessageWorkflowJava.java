@@ -19,7 +19,6 @@ package com.google.adk.kt.examples.workflow;
 import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.types.Blob;
@@ -31,6 +30,8 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A port of adk-python's {@code message} workflow sample: nodes send the user a text message, a
@@ -59,14 +60,12 @@ public final class MessageWorkflowJava {
     PublisherRunner runner =
         PublisherRunner.inMemory(App.builder().appName("message").rootNode(create()).build());
     Content message = Content.fromText(Role.USER, "go");
-    AsyncJavaHelpers.forEach(
-        runner.runAsync("user", "session", null, message),
-        event -> {
-          String text = event.contentText(" ");
-          if (!event.getPartial() && !text.isBlank()) {
-            System.out.println(text);
-          }
-        });
+    for (Event event : Flux.from(runner.runAsync("user", "session", null, message)).toIterable()) {
+      String text = event.contentText(" ");
+      if (!event.getPartial() && !text.isBlank()) {
+        System.out.println(text);
+      }
+    }
   }
 
   /** A 16x16 solid red PNG. */
@@ -91,8 +90,7 @@ public final class MessageWorkflowJava {
 
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(message(text("#1 This is a simple string message."))));
+      return Mono.just(message(text("#1 This is a simple string message.")));
     }
   }
 
@@ -104,11 +102,10 @@ public final class MessageWorkflowJava {
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
       Blob image = new Blob("image/png", null, Base64.getDecoder().decode(RED_SQUARE_PNG));
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              message(
-                  text("#2 Here is a multi-modal message with an inline image (red square):"),
-                  Part.builder().inlineData(image).build())));
+      return Mono.just(
+          message(
+              text("#2 Here is a multi-modal message with an inline image (red square):"),
+              Part.builder().inlineData(image).build()));
     }
   }
 
@@ -120,12 +117,11 @@ public final class MessageWorkflowJava {
 
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              message(text("#3 Multiple messages")),
-              message(text("Processing step 1...")),
-              message(text("Processing step 2...")),
-              message(text("Done processing."))));
+      return Flux.just(
+          message(text("#3 Multiple messages")),
+          message(text("Processing step 1...")),
+          message(text("Processing step 2...")),
+          message(text("Done processing.")));
     }
   }
 
@@ -158,7 +154,7 @@ public final class MessageWorkflowJava {
         events.add(message(text(chunk)).toBuilder().partial(true).build());
       }
       events.add(message(text(sentence)));
-      return AsyncJavaHelpers.publisherOf(events);
+      return Flux.fromIterable(events);
     }
   }
 

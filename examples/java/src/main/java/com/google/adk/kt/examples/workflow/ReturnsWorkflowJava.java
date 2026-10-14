@@ -20,7 +20,7 @@ import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.annotations.Param;
 import com.google.adk.kt.annotations.Tool;
 import com.google.adk.kt.apps.App;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
+import com.google.adk.kt.events.Event;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.interop.ReflectiveTools;
@@ -34,6 +34,8 @@ import com.google.adk.kt.workflow.Workflow;
 import java.util.List;
 import java.util.Map;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A returns desk built with the workflow DSL, whose steps include the {@code @Tool} methods of
@@ -71,14 +73,12 @@ public final class ReturnsWorkflowJava {
     for (String orderId : List.of("A-1001", "A-1002", "A-1003")) {
       // The first step is a tool, so the request is a JSON object of its arguments.
       Content request = Content.fromText(Role.USER, "{\"orderId\": \"" + orderId + "\"}");
-      AsyncJavaHelpers.forEach(
-          runner.runAsync("user", orderId, null, request),
-          event -> {
-            if (event.getOutput() != null) {
-              String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
-              System.out.println("[" + path + "] " + event.getOutput());
-            }
-          });
+      for (Event event : Flux.from(runner.runAsync("user", orderId, null, request)).toIterable()) {
+        if (event.getOutput() != null) {
+          String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
+          System.out.println("[" + path + "] " + event.getOutput());
+        }
+      }
     }
   }
 
@@ -119,7 +119,7 @@ public final class ReturnsWorkflowJava {
       // Tools built from @Tool methods wrap their return value under "result".
       Map<?, ?> order = (Map<?, ?>) ((Map<?, ?>) nodeInput).get(BaseTool.RESULT_KEY);
       context.setRoutes(List.of(new Route.Tag((String) order.get("status"))));
-      return AsyncJavaHelpers.publisherOf(List.of(Map.of("orderId", order.get("orderId"))));
+      return Mono.just(Map.of("orderId", order.get("orderId")));
     }
   }
 
@@ -132,7 +132,7 @@ public final class ReturnsWorkflowJava {
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
       Object orderId = ((Map<?, ?>) nodeInput).get("orderId");
-      return AsyncJavaHelpers.publisherOf(List.of("Order " + orderId + " can't be returned."));
+      return Mono.just("Order " + orderId + " can't be returned.");
     }
   }
 

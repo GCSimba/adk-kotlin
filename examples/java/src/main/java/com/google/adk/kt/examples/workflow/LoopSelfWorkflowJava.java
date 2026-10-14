@@ -19,7 +19,6 @@ package com.google.adk.kt.examples.workflow;
 import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.types.Content;
@@ -30,6 +29,8 @@ import com.google.adk.kt.workflow.Workflow;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A port of adk-python's {@code loop_self} workflow sample: the user picks a number from 0 to 10,
@@ -56,14 +57,12 @@ public final class LoopSelfWorkflowJava {
     PublisherRunner runner =
         PublisherRunner.inMemory(App.builder().appName("loop_self").rootNode(create()).build());
     Content message = Content.fromText(Role.USER, "3");
-    AsyncJavaHelpers.forEach(
-        runner.runAsync("user", "session", null, message),
-        event -> {
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println(text);
-          }
-        });
+    for (Event event : Flux.from(runner.runAsync("user", "session", null, message)).toIterable()) {
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println(text);
+      }
+    }
   }
 
   /** Stores the user's number in state, and fails the run if it is out of range. */
@@ -81,7 +80,7 @@ public final class LoopSelfWorkflowJava {
         throw new IllegalArgumentException("Please provide a number between 0 and 10.");
       }
       context.updateState("target_number", number);
-      return AsyncJavaHelpers.publisherOf(List.of());
+      return Mono.empty();
     }
   }
 
@@ -102,10 +101,10 @@ public final class LoopSelfWorkflowJava {
       if (guess == ((Number) context.getState().get("target_number")).intValue()) {
         Event correct =
             Event.builder().author("").content(Content.fromText(Role.MODEL, "Correct!")).build();
-        return AsyncJavaHelpers.publisherOf(List.of(guessing, correct));
+        return Flux.just(guessing, correct);
       }
       context.setRoutes(List.of(new Route.Tag("guessed_wrong")));
-      return AsyncJavaHelpers.publisherOf(List.of(guessing));
+      return Mono.just(guessing);
     }
   }
 

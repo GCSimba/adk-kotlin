@@ -20,7 +20,6 @@ import com.google.adk.kt.agents.BaseAgent;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.callbacks.AfterAgentCallback;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BaseFutureMemoryService;
 import com.google.adk.kt.interop.BasePublisherModel;
 import com.google.adk.kt.interop.Choices;
@@ -43,7 +42,11 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+import kotlinx.coroutines.Dispatchers;
+import kotlinx.coroutines.reactor.MonoKt;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Demonstrates implementing a {@link com.google.adk.kt.memory.MemoryService} from Java via {@link
@@ -104,23 +107,26 @@ public final class FutureMemoryServiceDemoJava {
 
     @Override
     protected Publisher<LlmResponse> generateContentJava(LlmRequest request, boolean stream) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              LlmResponse.builder()
-                  .content(Content.fromText(Role.MODEL, "Hiking is great exercise!"))
-                  .build()));
+      return Mono.just(
+          LlmResponse.builder()
+              .content(Content.fromText(Role.MODEL, "Hiking is great exercise!"))
+              .build());
     }
   }
 
-  /** Writes the finished session back to the invocation's (custom) memory service. */
+  /**
+   * Writes the finished session back to the invocation's (custom) memory service. {@code
+   * addSessionToMemory} is a Kotlin suspend function, so the kotlinx-coroutines-reactor {@code
+   * mono} builder calls it.
+   */
   private static AfterAgentCallback storeSessionToMemory() {
     return FutureCallbacks.afterAgent(
         context ->
-            CompletableFuture.supplyAsync(
-                () -> {
-                  var unused = AsyncJavaHelpers.await(c -> context.addSessionToMemory(c));
-                  return Choices.proceed();
-                }));
+            MonoKt.mono(
+                    Dispatchers.getDefault(),
+                    (scope, continuation) -> context.addSessionToMemory(continuation))
+                .thenReturn(Choices.<Content>proceed())
+                .toFuture());
   }
 
   public static void main(String[] args) {
@@ -140,25 +146,19 @@ public final class FutureMemoryServiceDemoJava {
         PublisherRunner.of(
             InMemoryRunner.builder().agent(agent).appName(appName).memoryService(service).build());
 
-    // runAsync returns a Reactive Streams Publisher<Event>. Adapt it in one line to
-    // RxJava:  Flowable<Event> rx = Flowable.fromPublisher(eventStream);
-    // Reactor: Flux<Event> flux = Flux.from(eventStream);
-    // WebFlux: @GetMapping Flux<Event> stream() { return Flux.from(eventStream); }
-    //          Spring takes eventStream as is, but usually it goes through actual domain logic.
+    // RxJava users can adapt the same Publisher with Flowable.fromPublisher(eventStream).
     Publisher<Event> eventStream =
         runner.runAsync(
             userId,
             "demo-session",
             null,
             Content.fromText(Role.USER, "I love hiking in the mountains."));
-    AsyncJavaHelpers.forEach(
-        eventStream,
-        event -> {
-          String text = textOf(event.getContent());
-          if (!text.isBlank()) {
-            System.out.println("[" + event.getAuthor() + "] " + text);
-          }
-        });
+    for (Event event : Flux.from(eventStream).toIterable()) {
+      String text = textOf(event.getContent());
+      if (!text.isBlank()) {
+        System.out.println("[" + event.getAuthor() + "] " + text);
+      }
+    }
   }
 
   private static String textOf(Content content) {

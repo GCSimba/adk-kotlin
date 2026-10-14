@@ -25,7 +25,6 @@ import static com.google.adk.kt.examples.longrunning.LongRunningToolDemoSupportJ
 import com.google.adk.kt.agents.BaseAgent;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BaseFutureTool;
 import com.google.adk.kt.interop.BasePublisherModel;
 import com.google.adk.kt.interop.PublisherRunner;
@@ -43,7 +42,6 @@ import com.google.adk.kt.types.Part;
 import com.google.adk.kt.types.Role;
 import com.google.adk.kt.types.Schema;
 import com.google.adk.kt.types.Type;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -51,7 +49,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import kotlin.Unit;
+import kotlinx.coroutines.Dispatchers;
+import kotlinx.coroutines.reactor.MonoKt;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Runnable demo of a single long-running tool that decides <em>per call</em> whether to answer now
@@ -94,14 +96,15 @@ public final class DynamicLongRunningToolDemoAgentJava {
     // Scenario A: a cached favorite -- the tool returns a value and the agent answers in one turn.
     System.out.println();
     System.out.println("User > Navigate to " + REQUESTED_DESTINATION + ".");
-    List<Event> turnA = new ArrayList<>();
-    AsyncJavaHelpers.forEach(
-        runner.runAsync(
-            DEMO_USER_ID,
-            DEMO_SESSION_ID,
-            null,
-            Content.fromText(Role.USER, "Navigate to " + REQUESTED_DESTINATION + ".")),
-        turnA::add);
+    List<Event> turnA =
+        Flux.from(
+                runner.runAsync(
+                    DEMO_USER_ID,
+                    DEMO_SESSION_ID,
+                    null,
+                    Content.fromText(Role.USER, "Navigate to " + REQUESTED_DESTINATION + ".")))
+            .collectList()
+            .block();
     printEvents("scenario A (cached favorite -> value returned, no pause)", turnA);
     FunctionCall unresolvedA = unresolvedLongRunningCall(turnA);
     System.out.println(
@@ -114,14 +117,15 @@ public final class DynamicLongRunningToolDemoAgentJava {
     String unknownDestination = "742 Maple Street";
     System.out.println();
     System.out.println("User > Navigate to " + unknownDestination + ".");
-    List<Event> turnB = new ArrayList<>();
-    AsyncJavaHelpers.forEach(
-        runner.runAsync(
-            DEMO_USER_ID,
-            DEMO_SESSION_ID,
-            null,
-            Content.fromText(Role.USER, "Navigate to " + unknownDestination + ".")),
-        turnB::add);
+    List<Event> turnB =
+        Flux.from(
+                runner.runAsync(
+                    DEMO_USER_ID,
+                    DEMO_SESSION_ID,
+                    null,
+                    Content.fromText(Role.USER, "Navigate to " + unknownDestination + ".")))
+            .collectList()
+            .block();
     printEvents("scenario B (unknown place -> Unit returned, turn defers)", turnB);
 
     FunctionCall pending = unresolvedLongRunningCall(turnB);
@@ -139,18 +143,25 @@ public final class DynamicLongRunningToolDemoAgentJava {
 
     System.out.println(
         "[app] device geocoded the address and confirmed; returning the result to the agent.");
-    List<Event> turnC = new ArrayList<>();
-    AsyncJavaHelpers.forEach(
-        runner.runAsync(DEMO_USER_ID, DEMO_SESSION_ID, null, deviceGeocodeResult(pending)),
-        turnC::add);
+    List<Event> turnC =
+        Flux.from(
+                runner.runAsync(DEMO_USER_ID, DEMO_SESSION_ID, null, deviceGeocodeResult(pending)))
+            .collectList()
+            .block();
     printEvents("scenario B resume (device result delivered)", turnC);
 
+    // getSession is a Kotlin suspend function; kotlinx-coroutines-reactor's mono builder calls it.
     Session session =
-        AsyncJavaHelpers.await(
-            c ->
-                inMemoryRunner
-                    .getSessionService()
-                    .getSession(new SessionKey(APP_NAME, DEMO_USER_ID, DEMO_SESSION_ID), null, c));
+        MonoKt.<Session>mono(
+                Dispatchers.getDefault(),
+                (scope, continuation) ->
+                    inMemoryRunner
+                        .getSessionService()
+                        .getSession(
+                            new SessionKey(APP_NAME, DEMO_USER_ID, DEMO_SESSION_ID),
+                            null,
+                            continuation))
+            .block();
     System.out.println();
     System.out.println(
         "Stored session now has "
@@ -276,7 +287,7 @@ public final class DynamicLongRunningToolDemoAgentJava {
                                 .build())))
                 .build();
       }
-      return AsyncJavaHelpers.publisherOf(List.of(response));
+      return Mono.just(response);
     }
   }
 

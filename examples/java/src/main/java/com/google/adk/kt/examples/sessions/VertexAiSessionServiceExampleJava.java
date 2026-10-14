@@ -21,7 +21,6 @@ import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.annotations.Param;
 import com.google.adk.kt.annotations.Tool;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.interop.ReflectiveTools;
 import com.google.adk.kt.models.Gemini;
@@ -37,7 +36,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
+import kotlinx.coroutines.Dispatchers;
+import kotlinx.coroutines.reactor.MonoKt;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
 
 /**
  * Runs a tool-using agent whose session is persisted in the managed Vertex AI Session Service.
@@ -49,7 +51,8 @@ import org.reactivestreams.Publisher;
  * through the managed session service.
  *
  * <p>The Vertex service assigns the session id, so the session is created up front and its id is
- * reused for the run.
+ * reused for the run. {@code createSession} is a Kotlin suspend function, so the
+ * kotlinx-coroutines-reactor {@code mono} builder calls it.
  *
  * <p>Authentication uses Application Default Credentials ({@code gcloud auth application-default
  * login}).
@@ -131,32 +134,30 @@ public final class VertexAiSessionServiceExampleJava {
     // Session management is a SessionService concern, not the runner's. The Vertex service assigns
     // the session id, so create the session first and reuse its id.
     Session created =
-        AsyncJavaHelpers.await(
-            c -> sessionService.createSession(new SessionKey(appName, userId, null), null, c));
+        MonoKt.<Session>mono(
+                Dispatchers.getDefault(),
+                (scope, continuation) ->
+                    sessionService.createSession(
+                        new SessionKey(appName, userId, null), null, continuation))
+            .block();
     String sessionId = Objects.requireNonNull(created.getKey().getId());
 
-    // runAsync returns a Reactive Streams Publisher<Event>. Adapt it in one line to
-    // RxJava:  Flowable<Event> rx = Flowable.fromPublisher(eventStream);
-    // Reactor: Flux<Event> flux = Flux.from(eventStream);
-    // WebFlux: @GetMapping Flux<Event> stream() { return Flux.from(eventStream); }
-    //          Spring takes eventStream as is, but usually it goes through actual domain logic.
+    // RxJava users can adapt the same Publisher with Flowable.fromPublisher(eventStream).
     Publisher<Event> eventStream =
         runner.runAsync(
             userId,
             sessionId,
             null,
             Content.fromText(Role.USER, "What's the weather in San Francisco?"));
-    AsyncJavaHelpers.forEach(
-        eventStream,
-        event -> {
-          if (event.getPartial()) {
-            return;
-          }
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println(event.getAuthor() + " > " + text);
-          }
-        });
+    for (Event event : Flux.from(eventStream).toIterable()) {
+      if (event.getPartial()) {
+        continue;
+      }
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println(event.getAuthor() + " > " + text);
+      }
+    }
 
     System.exit(0);
   }

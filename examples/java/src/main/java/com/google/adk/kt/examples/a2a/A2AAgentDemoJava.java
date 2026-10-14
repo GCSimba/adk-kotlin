@@ -19,8 +19,9 @@ package com.google.adk.kt.examples.a2a;
 import com.google.adk.kt.a2a.jvm.A2AAgentConfig;
 import com.google.adk.kt.a2a.jvm.A2AAgentKt;
 import com.google.adk.kt.agents.BaseAgent;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import java.util.Objects;
+import kotlinx.coroutines.Dispatchers;
+import kotlinx.coroutines.reactor.MonoKt;
 
 /**
  * Example agent demonstrating how to use {@code A2AAgent} to communicate with a remote
@@ -47,8 +48,13 @@ public final class A2AAgentDemoJava {
         Objects.requireNonNullElse(System.getenv("A2A_AGENT_URL"), "http://localhost:8080/a2a");
     String agentName = Objects.requireNonNullElse(System.getenv("A2A_AGENT_NAME"), "remote-agent");
     // Streaming follows the run's RunConfig.streamingMode (defaults to NONE -> `message/send`).
-    return AsyncJavaHelpers.await(
-        c -> A2AAgentKt.A2AAgent(agentName, agentUrl, A2AAgentConfig.builder().build(), c));
+    // Unconfined runs the lambda on this thread; a worker would deadlock on the static initializer.
+    return MonoKt.<BaseAgent>mono(
+            Dispatchers.getUnconfined(),
+            (scope, continuation) ->
+                A2AAgentKt.A2AAgent(
+                    agentName, agentUrl, A2AAgentConfig.builder().build(), continuation))
+        .block();
   }
 
   private A2AAgentDemoJava() {}

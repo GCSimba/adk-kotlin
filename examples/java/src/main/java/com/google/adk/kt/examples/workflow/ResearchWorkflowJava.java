@@ -19,7 +19,7 @@ package com.google.adk.kt.examples.workflow;
 import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.apps.App;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
+import com.google.adk.kt.events.Event;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.Gemini;
@@ -38,6 +38,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A research workflow built with the workflow DSL. A planner fans out to two researchers that
@@ -89,18 +91,16 @@ public final class ResearchWorkflowJava {
         PublisherRunner.inMemory(App.builder().appName("research").rootNode(workflow).build());
     Content question =
         Content.fromText(Role.USER, "Should a small team adopt Kotlin Multiplatform?");
-    AsyncJavaHelpers.forEach(
-        runner.runAsync("user", "session", null, question),
-        event -> {
-          String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println("[" + path + "] " + text);
-          }
-          if (Objects.equals(path, "research@1/publisher@1")) {
-            System.out.println("\nBrief: " + event.getOutput());
-          }
-        });
+    for (Event event : Flux.from(runner.runAsync("user", "session", null, question)).toIterable()) {
+      String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println("[" + path + "] " + text);
+      }
+      if (Objects.equals(path, "research@1/publisher@1")) {
+        System.out.println("\nBrief: " + event.getOutput());
+      }
+    }
   }
 
   private static LlmAgent plannerAgent(Model model) {
@@ -224,7 +224,7 @@ public final class ResearchWorkflowJava {
         }
       }
       context.setRoutes(List.of(new Route.Tag(route)));
-      return AsyncJavaHelpers.publisherOf(List.of());
+      return Mono.empty();
     }
   }
 
@@ -239,7 +239,7 @@ public final class ResearchWorkflowJava {
       Object brief = context.getState().get("brief");
       // Consumes the brief, so a later question never publishes this one's answer.
       context.updateState("brief", State.getREMOVED());
-      return AsyncJavaHelpers.publisherOf(brief == null ? List.of() : List.of(brief));
+      return Mono.justOrEmpty(brief);
     }
   }
 

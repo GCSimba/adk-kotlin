@@ -22,26 +22,28 @@ import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.annotations.Param;
 import com.google.adk.kt.annotations.Tool;
 import com.google.adk.kt.artifacts.ArtifactService;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.ReflectiveTools;
 import com.google.adk.kt.models.Gemini;
 import com.google.adk.kt.sessions.SessionKey;
 import com.google.adk.kt.tools.BaseTool;
 import com.google.adk.kt.tools.ToolContext;
 import com.google.adk.kt.types.Part;
+import kotlinx.coroutines.Dispatchers;
+import kotlinx.coroutines.reactor.MonoKt;
 
 /**
  * Example agent demonstrating the Artifact Service: an agent that generates a report, persists it
  * with a tool, and reads it back to verify.
  *
  * <p>The report is saved to and loaded from the {@link ArtifactService} configured on the runner
- * ({@code InMemoryArtifactService} by default; wire a persistent backend for durability). The tools
- * call the suspending artifact API from Java through {@link AsyncJavaHelpers#await}, run inside
- * each tool's returned future.
+ * ({@code InMemoryArtifactService} by default; wire a persistent backend for durability). The
+ * artifact API's methods are Kotlin suspend functions, so the tools call them through the
+ * kotlinx-coroutines-reactor {@code mono} builder and block on the result.
  *
  * <p>The tools are built from annotated methods by {@link ReflectiveTools} (used here because this
  * example is compiled with javac, not the Kotlin compiler; prefer the KSP {@code @Tool} path when
- * available). {@link ReflectiveTools} injects the {@link ToolContext} parameter automatically.
+ * available). {@link ReflectiveTools} injects the {@link ToolContext} parameter automatically. It
+ * runs each tool on a pool thread, so blocking does not stall the engine.
  */
 public final class ReportGeneratorAgentJava {
 
@@ -71,11 +73,12 @@ public final class ReportGeneratorAgentJava {
         return "Failed: ArtifactService not configured in InvocationContext.";
       }
       SessionKey key = artifactKey(context.getInvocationContext());
-      var unused =
-          AsyncJavaHelpers.await(
-              c ->
+      MonoKt.mono(
+              Dispatchers.getDefault(),
+              (scope, continuation) ->
                   artifactService.saveArtifact(
-                      key, filename, Part.builder().text(content).build(), c));
+                      key, filename, Part.builder().text(content).build(), continuation))
+          .block();
       System.out.println(">>> [SYSTEM] Report saved to artifact: " + filename);
       return "Report saved successfully.";
     }
@@ -93,7 +96,11 @@ public final class ReportGeneratorAgentJava {
       }
       SessionKey key = artifactKey(context.getInvocationContext());
       Part artifact =
-          AsyncJavaHelpers.await(c -> artifactService.loadArtifact(key, filename, null, c));
+          MonoKt.<Part>mono(
+                  Dispatchers.getDefault(),
+                  (scope, continuation) ->
+                      artifactService.loadArtifact(key, filename, null, continuation))
+              .block();
       if (artifact == null) {
         System.out.println(">>> [SYSTEM] Failed to read report: " + filename + " (not found)");
         return "Report not found.";

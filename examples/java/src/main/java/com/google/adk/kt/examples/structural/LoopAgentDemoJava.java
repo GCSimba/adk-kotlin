@@ -21,13 +21,13 @@ import com.google.adk.kt.agents.InvocationContext;
 import com.google.adk.kt.agents.LoopAgent;
 import com.google.adk.kt.events.Event;
 import com.google.adk.kt.events.EventActions;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherAgent;
 import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.Part;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Mono;
 
 /** A fun, nerdy demo for LoopAgent simulating an RPG loot grinder. */
 public final class LoopAgentDemoJava {
@@ -46,20 +46,17 @@ public final class LoopAgentDemoJava {
       String loot = loots.get(roll);
       boolean isLegendary = loot.equals("Legendary Sword of Gemini");
 
-      return AsyncJavaHelpers.publisherOf(
-          List.of(
-              Event.builder()
-                  .invocationId(context.getInvocationId())
-                  .author(getName())
-                  .content(
-                      new Content(
-                          /* role= */ null,
-                          List.of(
-                              Part.builder()
-                                  .text("Defeated a Goblin! Found loot: " + loot)
-                                  .build())))
-                  .actions(EventActions.builder().escalate(isLegendary).build())
-                  .build()));
+      return Mono.just(
+          Event.builder()
+              .invocationId(context.getInvocationId())
+              .author(getName())
+              .content(
+                  new Content(
+                      /* role= */ null,
+                      List.of(
+                          Part.builder().text("Defeated a Goblin! Found loot: " + loot).build())))
+              .actions(EventActions.builder().escalate(isLegendary).build())
+              .build());
     }
   }
 

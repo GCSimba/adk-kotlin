@@ -19,7 +19,6 @@ package com.google.adk.kt.examples.workflow;
 import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.types.Content;
@@ -27,9 +26,10 @@ import com.google.adk.kt.types.Role;
 import com.google.adk.kt.workflow.NodeConfig;
 import com.google.adk.kt.workflow.RetryConfig;
 import com.google.adk.kt.workflow.Workflow;
-import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A port of adk-python's {@code retry} workflow sample: a weather lookup fails at random, and its
@@ -53,17 +53,16 @@ public final class RetryWorkflowJava {
         PublisherRunner.inMemory(App.builder().appName("retry").rootNode(create()).build());
     Content message = Content.fromText(Role.USER, "go");
     try {
-      AsyncJavaHelpers.forEach(
-          runner.runAsync("user", "session", null, message),
-          event -> {
-            String text = event.contentText(" ");
-            if (!text.isBlank()) {
-              System.out.println(text);
-            }
-            if (event.getErrorCode() != null) {
-              System.out.println(event.getErrorCode() + ": " + event.getErrorMessage());
-            }
-          });
+      Publisher<Event> events = runner.runAsync("user", "session", null, message);
+      for (Event event : Flux.from(events).toIterable()) {
+        String text = event.contentText(" ");
+        if (!text.isBlank()) {
+          System.out.println(text);
+        }
+        if (event.getErrorCode() != null) {
+          System.out.println(event.getErrorCode() + ": " + event.getErrorMessage());
+        }
+      }
     } catch (HttpException e) {
       // When the last attempt fails too, the run fails with that attempt's error.
       System.out.println("Every attempt failed.");
@@ -91,7 +90,7 @@ public final class RetryWorkflowJava {
                   Content.fromText(
                       Role.MODEL, "Getting weather... attempt " + context.getAttemptCount()))
               .build();
-      return AsyncJavaHelpers.publisherOf(List.of(attempt, "sunny"));
+      return Flux.just(attempt, "sunny");
     }
   }
 
@@ -107,7 +106,7 @@ public final class RetryWorkflowJava {
           Event.builder()
               .content(Content.fromText(Role.MODEL, "The weather is " + nodeInput))
               .build();
-      return AsyncJavaHelpers.publisherOf(List.of(report));
+      return Mono.just(report);
     }
   }
 

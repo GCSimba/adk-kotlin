@@ -17,7 +17,6 @@
 package com.google.adk.kt.examples.longrunning;
 
 import com.google.adk.kt.events.Event;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BaseFutureTool;
 import com.google.adk.kt.interop.BasePublisherModel;
 import com.google.adk.kt.models.LlmRequest;
@@ -37,6 +36,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import kotlin.Unit;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Mono;
 
 /**
  * Shared building blocks for the long-running tool demos ({@link LongRunningToolDemoAgentJava} and
@@ -155,7 +155,7 @@ final class LongRunningToolDemoSupportJava {
                 .content(Content.fromText(Role.MODEL, "Your destination has been updated."))
                 .build();
       }
-      return AsyncJavaHelpers.publisherOf(List.of(response));
+      return Mono.just(response);
     }
   }
 

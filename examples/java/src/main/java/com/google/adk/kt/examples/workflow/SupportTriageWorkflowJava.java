@@ -21,7 +21,7 @@ import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.annotations.Param;
 import com.google.adk.kt.annotations.Tool;
 import com.google.adk.kt.apps.App;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
+import com.google.adk.kt.events.Event;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.interop.ReflectiveTools;
@@ -38,6 +38,8 @@ import com.google.adk.kt.workflow.Workflow;
 import java.util.List;
 import java.util.Map;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A support-triage workflow built with the workflow DSL. A classifier labels the request, a routing
@@ -91,15 +93,14 @@ public final class SupportTriageWorkflowJava {
         Content.fromText(Role.USER, "I was charged twice for my subscription this month.");
     // The support app knows who is signed in, so it passes the account ID as session state.
     Map<String, Object> account = Map.of("account_id", "ACC-1042");
-    AsyncJavaHelpers.forEach(
-        runner.runAsync("user", "session", null, request, account),
-        event -> {
-          String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
-          String text = event.contentText(" ");
-          if (!text.isBlank()) {
-            System.out.println("[" + path + "] " + text);
-          }
-        });
+    Publisher<Event> events = runner.runAsync("user", "session", null, request, account);
+    for (Event event : Flux.from(events).toIterable()) {
+      String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
+      String text = event.contentText(" ");
+      if (!text.isBlank()) {
+        System.out.println("[" + path + "] " + text);
+      }
+    }
   }
 
   private static LlmAgent classifierAgent(Model model) {
@@ -226,7 +227,7 @@ public final class SupportTriageWorkflowJava {
       if (category instanceof String name) {
         context.setRoutes(List.of(new Route.Tag(name)));
       }
-      return AsyncJavaHelpers.publisherOf(List.of());
+      return Mono.empty();
     }
   }
 

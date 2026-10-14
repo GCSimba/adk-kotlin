@@ -20,17 +20,17 @@ import com.google.adk.kt.agents.Context;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
 import com.google.adk.kt.events.EventActions;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherNode;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.Role;
 import com.google.adk.kt.workflow.Workflow;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * A port of adk-python's {@code state} workflow sample: nodes write session state through the
@@ -59,17 +59,15 @@ public final class StateWorkflowJava {
     PublisherRunner runner =
         PublisherRunner.inMemory(App.builder().appName("state_sample").rootNode(create()).build());
     Content message = Content.fromText(Role.USER, "Hello ADK!");
-    AsyncJavaHelpers.forEach(
-        runner.runAsync("user", "session", null, message),
-        event -> {
-          String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
-          if (!event.getActions().getStateDelta().isEmpty()) {
-            System.out.println("[" + path + "] state: " + event.getActions().getStateDelta());
-          }
-          if (event.getOutput() != null) {
-            System.out.println("[" + path + "] output: " + event.getOutput());
-          }
-        });
+    for (Event event : Flux.from(runner.runAsync("user", "session", null, message)).toIterable()) {
+      String path = event.getNodeInfo() == null ? null : event.getNodeInfo().getPath();
+      if (!event.getActions().getStateDelta().isEmpty()) {
+        System.out.println("[" + path + "] state: " + event.getActions().getStateDelta());
+      }
+      if (event.getOutput() != null) {
+        System.out.println("[" + path + "] output: " + event.getOutput());
+      }
+    }
   }
 
   /** Stores the user's text in state through the context, and outputs it. */
@@ -83,7 +81,7 @@ public final class StateWorkflowJava {
       // START hands the first node the user's message as Content.
       String text = ((Content) nodeInput).text();
       context.updateState("original_text", text);
-      return AsyncJavaHelpers.publisherOf(List.of(text));
+      return Mono.just(text);
     }
   }
 
@@ -100,7 +98,7 @@ public final class StateWorkflowJava {
       stateDelta.put("uppercased_text", ((String) nodeInput).toUpperCase(Locale.ROOT));
       Event event =
           Event.builder().actions(EventActions.builder().stateDelta(stateDelta).build()).build();
-      return AsyncJavaHelpers.publisherOf(List.of(event));
+      return Mono.just(event);
     }
   }
 
@@ -116,7 +114,7 @@ public final class StateWorkflowJava {
       String result =
           state.get("uppercased_text") + " (Original was: " + state.get("original_text") + ")";
       context.updateState("appended_text", result);
-      return AsyncJavaHelpers.publisherOf(List.of(result));
+      return Mono.just(result);
     }
   }
 
@@ -128,8 +126,7 @@ public final class StateWorkflowJava {
 
     @Override
     protected Publisher<Object> runNodeJava(Context context, Object nodeInput) {
-      return AsyncJavaHelpers.publisherOf(
-          List.of("Final Result: " + context.getState().get("appended_text") + "!"));
+      return Mono.just("Final Result: " + context.getState().get("appended_text") + "!");
     }
   }
 

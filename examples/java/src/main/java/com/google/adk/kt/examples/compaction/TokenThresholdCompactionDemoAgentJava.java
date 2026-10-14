@@ -20,7 +20,6 @@ import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
 import com.google.adk.kt.events.EventCompaction;
-import com.google.adk.kt.interop.AsyncJavaHelpers;
 import com.google.adk.kt.interop.BasePublisherModel;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.Gemini;
@@ -36,7 +35,11 @@ import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.Role;
 import java.util.List;
 import java.util.Scanner;
+import kotlinx.coroutines.Dispatchers;
+import kotlinx.coroutines.reactor.MonoKt;
+import kotlinx.coroutines.reactor.ReactorFlowKt;
 import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
 
 /**
  * Interactive end-to-end demo of token-threshold (tail-retention) context compaction.
@@ -86,7 +89,8 @@ public final class TokenThresholdCompactionDemoAgentJava {
                 + ": "
                 + (text.isEmpty() ? "<non-text>" : text));
       }
-      return AsyncJavaHelpers.asPublisher(delegate.generateContent(request, stream));
+      // The Kotlin delegate returns a Flow; kotlinx-coroutines-reactor's asFlux adapts it.
+      return ReactorFlowKt.asFlux(delegate.generateContent(request, stream));
     }
   }
 
@@ -131,25 +135,29 @@ public final class TokenThresholdCompactionDemoAgentJava {
             || trimmed.equalsIgnoreCase("quit")) {
           break;
         }
-        AsyncJavaHelpers.forEach(
-            runner.runAsync(USER_ID, SESSION_ID, null, Content.fromText(Role.USER, input)),
-            event -> {
-              String text = event.contentText(" ");
-              if (!text.isBlank()) {
-                System.out.println("\nassistant > " + text);
-              }
-            });
+        Publisher<Event> events =
+            runner.runAsync(USER_ID, SESSION_ID, null, Content.fromText(Role.USER, input));
+        for (Event event : Flux.from(events).toIterable()) {
+          String text = event.contentText(" ");
+          if (!text.isBlank()) {
+            System.out.println("\nassistant > " + text);
+          }
+        }
       }
     }
 
     System.out.println(
         "\n========== SESSION EVENTS (raw events are kept; summaries are appended) ==========");
+    // getSession is a Kotlin suspend function; kotlinx-coroutines-reactor's mono builder calls it.
     Session session =
-        AsyncJavaHelpers.await(
-            c ->
-                inMemoryRunner
-                    .getSessionService()
-                    .getSession(new SessionKey(APP_NAME, USER_ID, SESSION_ID), null, c));
+        MonoKt.<Session>mono(
+                Dispatchers.getDefault(),
+                (scope, continuation) ->
+                    inMemoryRunner
+                        .getSessionService()
+                        .getSession(
+                            new SessionKey(APP_NAME, USER_ID, SESSION_ID), null, continuation))
+            .block();
     if (session == null) {
       return;
     }
