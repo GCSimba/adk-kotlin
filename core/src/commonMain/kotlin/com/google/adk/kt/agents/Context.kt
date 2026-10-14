@@ -532,7 +532,8 @@ open class Context(
    *   fails [node]'s input schema. A [node][com.google.adk.kt.workflow.node] child's input check
    *   throws
    *   [NodeInputValidationException][com.google.adk.kt.workflow.NodeInputValidationException]
-   *   instead.
+   *   instead. A [parallelNode][com.google.adk.kt.workflow.parallelNode] checks each item instead,
+   *   and a rejected item fails it.
    * @throws DynamicNodeFailedException if [node] fails; its `error` is the child's failure.
    */
   @CanIgnoreReturnValue

@@ -183,6 +183,17 @@ private class AsksOnSecondItem(override val name: String) : Node {
   }
 }
 
+/** Asks for input on each item in [asking] and echoes any other item, counting runs per item. */
+private class AsksOnItems(override val name: String, private val asking: Set<Long>) : Node {
+  val runsByItem = mutableMapOf<Any?, Int>()
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runsByItem[nodeInput] = (runsByItem[nodeInput] ?: 0) + 1
+    if (nodeInput in asking) emit(RequestInput(interruptId = "ask_$nodeInput", message = "?"))
+    else emit("done-$nodeInput")
+  }
+}
+
 /** Dispatches [child] concurrently once per input item and emits the results in input order. */
 private class DispatchEachConcurrently(override val name: String, private val child: Node) : Node {
   override val rerunOnResume: Boolean = true
@@ -415,9 +426,19 @@ private fun sessionAwaitingAnswer(schema: Schema): WorkflowSession {
   return WorkflowSession(workflow).also { it.advance(userMessage("go")) }
 }
 
-/** What `reply` received in a turn run by [sessionAwaitingAnswer]. */
+/** What the workflow's `reply` node received in this turn. */
 private fun List<Event>.replyInput(): Any? =
   (single { it.nodeInfo?.path == "wf@1/reply@1" }.output as Map<*, *>)["received"]
+
+/** A workflow feeding items 1, 2 and 3 through [fanOut] into `reply`. */
+private fun fanOutWorkflow(fanOut: Node): Workflow {
+  val items = Emitter("items", listOf(1L, 2L, 3L))
+  val reply = CaptureInput("reply")
+  return Workflow(
+    name = "wf",
+    edges = listOf(Edge(Start, items), Edge(items, fanOut), Edge(fanOut, reply)),
+  )
+}
 
 /** An object schema with an integer `count`. */
 private val COUNT_SCHEMA =
@@ -883,6 +904,58 @@ class WorkflowHitlTest {
     assertEquals(mapOf<Any?, Int>(1L to 1, 2L to 1, 3L to 1), worker.runsByItem)
     val replyEvent = events.single { it.nodeInfo?.path == "wf@1/reply@1" }
     assertEquals(mapOf("received" to listOf("done-1", "two", "done-3")), replyEvent.output)
+  }
+
+  @Test
+  fun resume_parallelNodeItemAsked_replaysFinishedItemsAndCompletesTheList() {
+    // Arrange: item 2 asks for input while items 1 and 3 finish.
+    val worker = AsksOnItems("worker", asking = setOf(2L))
+    val session = WorkflowSession(fanOutWorkflow(parallelNode(worker)))
+    session.advance(userMessage("go"))
+    val runsBeforeAnswer = worker.runsByItem.toMap()
+
+    // Act
+    val events = session.turn(answer("ask_2", mapOf("result" to "two")))
+
+    // Assert: items 1 and 3 finished in the first turn and replay, and the answer stands in for
+    // item 2's output.
+    assertEquals(mapOf<Any?, Int>(1L to 1, 2L to 1, 3L to 1), runsBeforeAnswer)
+    assertEquals(mapOf<Any?, Int>(1L to 1, 2L to 1, 3L to 1), worker.runsByItem)
+    assertEquals(listOf("done-1", "two", "done-3"), events.replyInput())
+  }
+
+  @Test
+  fun resume_parallelNodeUnderCap_runsQueuedItemsAfterTheAnswer() {
+    // Arrange: with one slot, item 1 asks before items 2 and 3 start.
+    val worker = AsksOnItems("worker", asking = setOf(1L))
+    val session = WorkflowSession(fanOutWorkflow(parallelNode(worker, maxParallelWorkers = 1)))
+    session.advance(userMessage("go"))
+    val runsBeforeAnswer = worker.runsByItem.toMap()
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("result" to "one")))
+
+    // Assert: the queued items ran only once the answer arrived.
+    assertEquals(mapOf<Any?, Int>(1L to 1), runsBeforeAnswer)
+    assertEquals(mapOf<Any?, Int>(1L to 1, 2L to 1, 3L to 1), worker.runsByItem)
+    assertEquals(listOf("one", "done-2", "done-3"), events.replyInput())
+  }
+
+  @Test
+  fun resume_parallelNodeTwoItemsAnsweredOnSeparateTurns_completesTheList() {
+    // Arrange: items 1 and 3 ask for input in the same turn.
+    val worker = AsksOnItems("worker", asking = setOf(1L, 3L))
+    val session = WorkflowSession(fanOutWorkflow(parallelNode(worker)))
+    session.advance(userMessage("go"))
+
+    // Act
+    val firstAnswerEvents = session.turn(answer("ask_1", mapOf("result" to "one")))
+    val secondAnswerEvents = session.turn(answer("ask_3", mapOf("result" to "three")))
+
+    // Assert: the node keeps waiting until both answers are in, and no item body runs twice.
+    assertTrue(firstAnswerEvents.none { it.nodeInfo?.path == "wf@1/reply@1" })
+    assertEquals(listOf("one", "done-2", "three"), secondAnswerEvents.replyInput())
+    assertEquals(mapOf<Any?, Int>(1L to 1, 2L to 1, 3L to 1), worker.runsByItem)
   }
 
   @Test

@@ -616,7 +616,7 @@ class FunctionNodeTest {
 
   @OptIn(ExperimentalAtomicApi::class)
   @Test
-  fun parallelNode_itemInterrupt_interruptsTheNodeAndCancelsTheItemsStillRunning() {
+  fun parallelNode_itemInterrupt_interruptsTheNodeAndLetsRunningItemsFinish() {
     // Arrange
     val finishedSiblings = AtomicInt(0)
     val worker =
@@ -638,7 +638,7 @@ class FunctionNodeTest {
     // Assert
     assertEquals(setOf("ask"), ctx.interruptIds)
     assertNull(ctx.output)
-    assertEquals(0, finishedSiblings.load())
+    assertEquals(2, finishedSiblings.load())
   }
 
   @Test
@@ -751,8 +751,8 @@ class FunctionNodeTest {
       }
 
     // Assert
-    assertContains(zeroError.message.orEmpty(), "maxParallelWorkers must be at least 1")
-    assertContains(negativeError.message.orEmpty(), "maxParallelWorkers must be at least 1")
+    assertEquals("maxParallelWorkers must be at least 1.", zeroError.message)
+    assertEquals("maxParallelWorkers must be at least 1.", negativeError.message)
   }
 
   // -- Node name validation --

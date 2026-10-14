@@ -30,13 +30,9 @@ import com.google.adk.kt.types.Schema
 import kotlin.reflect.KClass
 import kotlin.reflect.KType
 import kotlin.reflect.typeOf
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.sync.Semaphore
 
 /**
  * A workflow [Node] backed by a suspending function that may emit progress [Event]s and returns an
@@ -118,19 +114,15 @@ private constructor(
 
   init {
     validateNodeName(name)
-    if (maxParallelWorkers != null) {
-      require(itemNode != null) { "maxParallelWorkers requires an item node." }
-      if (maxParallelWorkers < 1) {
-        throw WorkflowConfigurationException("maxParallelWorkers must be at least 1.")
-      }
+    require(maxParallelWorkers == null || itemNode != null) {
+      "maxParallelWorkers requires an item node."
     }
+    checkMaxParallelWorkers(maxParallelWorkers)
   }
 
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
     if (itemNode != null) {
-      emit(
-        runParallelItems(context, itemNode, parallelItems(nodeInput, itemNode), maxParallelWorkers)
-      )
+      emit(ParallelWorker(itemNode, maxParallelWorkers).mapOverItems(context, nodeInput))
       return@flow
     }
     // A no-op after validateInput, and it covers a direct call.
@@ -180,75 +172,6 @@ private constructor(
 /** Types a node handles by their meaning rather than as data. */
 private val FRAMEWORK_TYPES: Set<KClass<*>> = setOf(Content::class, Event::class)
 
-/**
- * Converts [nodeInput] into the list of items a parallel node runs [itemNode] on: unwraps [Content]
- * if needed, then returns a [List] as-is or wraps a single value in a one-element list.
- */
-private fun parallelItems(nodeInput: Any?, itemNode: FunctionNode<*, *>): List<Any?> {
-  val unwrapped = if (nodeInput is Content) unwrapContent(nodeInput, itemNode) else nodeInput
-  return if (unwrapped is List<*>) unwrapped else listOf(unwrapped)
-}
-
-/**
- * Extracts the payload from [content] when a parallel node receives [Content] (for example, from
- * [Start] or an LLM agent) instead of a [List]. Returns [content] unchanged when [itemNode] expects
- * [Content] directly or [content] has non-text parts. Otherwise tries to parse the text as JSON so
- * a JSON array can fan out as a [List], keeping the raw text when it is not valid JSON or when
- * [itemNode] expects a `String` rather than a non-array JSON scalar or object.
- */
-private fun unwrapContent(content: Content, itemNode: FunctionNode<*, *>): Any? {
-  val itemClass = itemNode.inputType.classifier
-  if (itemClass == Content::class) return content
-  if (content.parts.isEmpty() || content.parts.any { it.text == null }) return content
-
-  val text = content.text()
-  val json =
-    SchemaUtils.readJson(text).getOrElse {
-      return text
-    }
-  if (json is List<*>) return json
-  if (itemClass == String::class) return text
-  return json
-}
-
-/**
- * Runs [itemNode] on each item of [items] as a child of [parent], at most [maxParallelWorkers] at a
- * time and starting them in index order, and returns the outputs in input order. As in adk-python's
- * parallel worker, the first item to fail or interrupt fails or interrupts the whole node and
- * cancels the items still running.
- */
-// An item reads parent and itemNode and writes only the parent's interrupt ids, which are atomic.
-@Suppress("UnsafeCoroutineCrossing")
-private suspend fun runParallelItems(
-  parent: Context,
-  itemNode: FunctionNode<*, *>,
-  items: List<Any?>,
-  maxParallelWorkers: Int?,
-): List<Any?> {
-  if (items.isEmpty()) return emptyList()
-  val permits = Semaphore(maxParallelWorkers ?: items.size)
-  return coroutineScope {
-    items
-      .mapIndexed { index, item ->
-        // Taking the permit before launching starts items lazily and in index order.
-        permits.acquire()
-        async {
-          val output =
-            parent.runNodeUnchecked(
-              itemNode,
-              item,
-              runId = (index + 1).toString(),
-              useSubBranch = true,
-            )
-          // A failed or cancelled item keeps its permit, so no queued item starts after it.
-          permits.release()
-          output
-        }
-      }
-      .awaitAll()
-  }
-}
-
 /** Infers a port's schema, except for framework types. */
 private fun inferredPortSchema(codec: ValueCodec<*>): Schema? =
   if (codec.kType.classifier in FRAMEWORK_TYPES) null else codec.schema
@@ -295,7 +218,8 @@ inline fun <reified I, reified O> node(
 
 /**
  * Creates a [FunctionNode] that runs [block] concurrently on each item of a list input and returns
- * the results as a [List] of [O] in input order. A non-list input runs as one item.
+ * the results as a [List] of [O] in input order. A text-only [Content] input, unless [I] is
+ * [Content], is read as JSON so a JSON list fans out. Any other non-list input runs as one item.
  *
  * [config], the schemas and [rerunOnResume] apply to each item's run; the fan-out node shares
  * [waitForOutput] and [stateSchema], has no retry or timeout, and always reruns on resume.
