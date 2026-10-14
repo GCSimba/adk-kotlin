@@ -39,6 +39,7 @@ import io.ktor.server.application.ApplicationStopping
 import io.ktor.server.application.createApplicationPlugin
 import io.ktor.server.application.hooks.ResponseSent
 import io.ktor.server.application.install
+import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
@@ -77,8 +78,7 @@ private val logger = LoggerFactory.getLogger(AdkApiServer::class.java)
  */
 open class AdkApiServer(protected val config: AdkServerConfig) {
   private val lifecycleLock = Any()
-  // A stop callback, not the engine: embeddedServer returns a different type in Ktor 2 and 3.
-  private var stopServer: (() -> Unit)? = null
+  private var server: EmbeddedServer<*, *>? = null
 
   /**
    * Installs this server's endpoint surface.
@@ -104,11 +104,9 @@ open class AdkApiServer(protected val config: AdkServerConfig) {
     // Released before the blocking call below, so stop() can still take it.
     val engine =
       synchronized(lifecycleLock) {
-        if (stopServer != null) return
-        val server =
-          embeddedServer(Netty, port = config.port, host = config.host) { configure(this) }
-        stopServer = { server.stop(STOP_GRACE_MILLIS, STOP_TIMEOUT_MILLIS) }
-        server
+        if (server != null) return
+        embeddedServer(Netty, port = config.port, host = config.host) { configure(this) }
+          .also { server = it }
       }
     logger.info("{} starting on {}:{}", this::class.simpleName, config.host, config.port)
     engine.start(wait = wait)
@@ -120,8 +118,8 @@ open class AdkApiServer(protected val config: AdkServerConfig) {
    */
   fun stop() {
     synchronized(lifecycleLock) {
-      stopServer?.invoke()
-      stopServer = null
+      server?.stop(STOP_GRACE_MILLIS, STOP_TIMEOUT_MILLIS)
+      server = null
     }
     logger.info("{} stopped", this::class.simpleName)
   }
@@ -133,7 +131,7 @@ private val REQUEST_LOGGED_KEY = AttributeKey<Unit>("AdkRequestLogged")
  * Logs one line per call to [log], at WARN for a 5xx status and INFO otherwise. A 501 counts as
  * INFO, since the development endpoints answer it on purpose for features they do not implement.
  *
- * Replaces Ktor's CallLogging, whose package differs between Ktor 2 and 3.
+ * Replaces Ktor's CallLogging, which logs every call at one configured level.
  */
 internal fun requestLoggingPlugin(log: (Level, String) -> Unit) =
   createApplicationPlugin("AdkRequestLogging") {

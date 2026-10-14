@@ -57,7 +57,6 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
-import io.ktor.server.application.call
 import io.ktor.server.response.respond
 import io.ktor.server.routing.get
 import io.ktor.server.routing.routing
@@ -292,6 +291,23 @@ class ApiServerTest {
     val body = response.bodyAsText()
     assertThat(body).contains("data: ")
     assertThat(body).contains("\"path\":\"greeter@1/greet@1\"")
+  }
+
+  @Test
+  fun runSseRoute_endsEachFrameWithLf() = testApplication {
+    // Arrange
+    application { adkApiModule(testConfig(appLoader = greeterLoader())) }
+
+    // Act
+    val body = client.post("/run_sse") { runBody("greeter") }.bodyAsText()
+
+    // Assert: LF framing, as ADK Python and Java write it; a client may split frames on "\n\n".
+    assertThat(body).doesNotContain("\r")
+    val frames = body.split("\n\n").filter { it.isNotEmpty() }
+    assertThat(frames).isNotEmpty()
+    for (frame in frames) {
+      assertThat(frame).startsWith("data: {")
+    }
   }
 
   @Test

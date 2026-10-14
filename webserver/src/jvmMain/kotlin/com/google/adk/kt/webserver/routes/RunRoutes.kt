@@ -89,7 +89,7 @@ internal fun Route.runRoutes(
 
     val sessionId = request.sessionId ?: UUID.randomUUID().toString()
 
-    // respondBytesWriter, not respondTextWriter, which writes through a blocking Writer.
+    // LF frames like ADK Python (Ktor's SSE writes CRLF), via non-blocking respondBytesWriter.
     call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
       runner
         .runAsync(

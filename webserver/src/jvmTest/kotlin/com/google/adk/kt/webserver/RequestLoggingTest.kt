@@ -19,7 +19,6 @@ package com.google.adk.kt.webserver
 import com.google.common.truth.Truth.assertThat
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
-import io.ktor.server.application.call
 import io.ktor.server.application.createApplicationPlugin
 import io.ktor.server.application.hooks.ResponseBodyReadyForSend
 import io.ktor.server.application.install
