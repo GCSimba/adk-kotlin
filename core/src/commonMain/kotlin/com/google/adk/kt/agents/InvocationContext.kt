@@ -923,6 +923,12 @@ data class ContextFrameworkData(
    * holding it, because the collector can deadlock: append, release, then emit.
    */
   internal val sessionAppendLock = Mutex()
+
+  /**
+   * Paths of workflow nodes cancelled mid-run in this turn. Their events show progress rather than
+   * a result, so a retry runs them again.
+   */
+  internal val cancelledNodePaths: MutableMap<String, Unit> = concurrentMutableMapOf()
 }
 
 /**

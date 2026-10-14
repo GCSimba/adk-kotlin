@@ -43,10 +43,13 @@ internal class Scheduler(
   private val triggerQueue = TriggerQueue()
   private val interruptIds = mutableSetOf<String>()
 
-  /** Reconstructed states of this workflow's nodes from earlier turns, keyed by `name@runId`. */
+  /**
+   * Reconstructed states of this workflow's nodes from earlier turns or earlier attempts of this
+   * workflow, keyed by `name@runId`.
+   */
   private val recovered: Map<String, RecoveredNode> =
     ResumeScan.scan(
-      context.requireNodeState().history,
+      ResumeScan.invocationEvents(context.invocationContext),
       context.nodePath,
       context.invocationContext.invocationId,
     )
@@ -174,8 +177,14 @@ internal class Scheduler(
       val node = graph.node(nodeName)
       val useAsOutput = nodeName in graph.terminalNodeNames
 
-      val recoveredNode = recovered[BranchPath.segment(nodeName, runId)]
-      val interception = ResumeScan.intercept(node, recoveredNode)
+      val childKey = BranchPath.segment(nodeName, runId)
+      val recoveredNode = recovered[childKey]
+      val interception =
+        ResumeScan.intercept(
+          node,
+          recoveredNode,
+          cancelledMidRun = context.isCancelledMidRun(childKey),
+        )
       if (recoveredNode != null && !interception.shouldRun) {
         val completesTransfer =
           interception.transferToAgent != null &&
@@ -257,7 +266,7 @@ internal class Scheduler(
         Event(
           author = workflow.name,
           invocationId = context.invocationContext.invocationId,
-          branch = context.invocationContext.branch,
+          branch = childContext.invocationContext.branch,
           output = childContext.output,
           nodeInfo = NodeInfo(path = childContext.nodePath),
         )

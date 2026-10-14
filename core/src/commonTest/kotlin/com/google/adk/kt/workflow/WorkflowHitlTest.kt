@@ -44,6 +44,8 @@ import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.Schema
 import com.google.adk.kt.types.Type
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -53,15 +55,21 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 
 /** Asks the user for input, which suspends the graph. */
 private class Ask(override val name: String, private val request: RequestInput) : Node {
@@ -106,7 +114,11 @@ private class DispatchAsk(override val name: String, private val child: Node) : 
 }
 
 /** Emits a fixed value and counts the times it actually ran, so a replay is observable. */
-private class RunCountingEmitter(override val name: String, private val value: Any?) : Node {
+private class RunCountingEmitter(
+  override val name: String,
+  private val value: Any?,
+  override val rerunOnResume: Boolean = false,
+) : Node {
   var runs = 0
     private set
 
@@ -326,6 +338,241 @@ private class DispatchWithInput(
   }
 }
 
+/** Runs [child] under a numeric run ID through the internal API, then fails its first attempt. */
+private class DispatchNumberedThenFailOnce(override val name: String, private val child: Node) :
+  Node {
+  override val rerunOnResume: Boolean = true
+  override val config: NodeConfig =
+    NodeConfig(
+      retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+    )
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    context.runNodeUnchecked(child, runId = "1")
+    if (context.attemptCount == 1) throw NodeExecutionException("RuntimeError", "first attempt")
+    emit("done")
+  }
+}
+
+/** Runs [child] under run ID `s` with a short timeout while a second call waits on that run. */
+private class AbandonsASharedRun(override val name: String, private val child: Node) : Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    val outcomes = coroutineScope {
+      val first = async {
+        withTimeoutOrNull(100.milliseconds) { context.runNode(child, runId = "s") } ?: "timed out"
+      }
+      val second = async {
+        withTimeoutOrNull(5.seconds) { context.runNode(child, runId = "s") } ?: "hung"
+      }
+      listOf(first.await(), second.await())
+    }
+    emit(outcomes)
+  }
+}
+
+/** Emits a progress event and stalls on its first run, counting runs; later runs emit an output. */
+private class ReportsProgressThenStallsOnFirstRun(override val name: String) : Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    if (runs == 1) {
+      emit(Event(content = Content(role = Role.MODEL, parts = listOf(Part(text = "working")))))
+      awaitCancellation()
+    }
+    emit("$name done")
+  }
+}
+
+/** Emits a progress event and fails on its first run, counting runs; later runs emit [value]. */
+private class ReportsProgressThenFailsFirstRun(override val name: String, private val value: Any?) :
+  Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    if (runs == 1) {
+      emit(Event(content = Content(role = Role.MODEL, parts = listOf(Part(text = "working")))))
+      yield()
+      throw NodeExecutionException("RuntimeError", "first run fails")
+    }
+    if (value != null) emit(value)
+  }
+}
+
+/** Emits a progress event, then swallows the cancellation of its first run; later runs emit. */
+private class ReportsProgressThenSwallowsCancellationOnFirstRun(override val name: String) : Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    if (runs == 1) {
+      emit(Event(content = Content(role = Role.MODEL, parts = listOf(Part(text = "working")))))
+      try {
+        awaitCancellation()
+      } catch (e: Exception) {}
+      return@flow
+    }
+    emit("$name done")
+  }
+}
+
+/** Emits a progress event and stalls on its first run; later runs finish without output. */
+private class StallsOnceThenFinishesWithoutOutput(override val name: String) : Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    if (runs == 1) {
+      emit(Event(content = Content(role = Role.MODEL, parts = listOf(Part(text = "working")))))
+      awaitCancellation()
+    }
+  }
+}
+
+/** Fails on its first two runs, the second after a delay, and finishes without output after. */
+private class FailsTwiceSecondAfterADelay(override val name: String) : Node {
+  private var runs = 0
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    yield()
+    if (runs == 2) delay(100.milliseconds)
+    if (runs <= 2) throw NodeExecutionException("RuntimeError", "run $runs fails")
+  }
+}
+
+/** Calls [child] twice under run ID `s`, with both calls under one short timeout. */
+private class CancelsBothCallsOfASharedRun(override val name: String, private val child: Node) :
+  Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    val outputs =
+      withTimeoutOrNull(100.milliseconds) {
+        coroutineScope { List(2) { async { context.runNode(child, runId = "s") } }.awaitAll() }
+      }
+    emit(outputs ?: "timed out")
+  }
+}
+
+/** Suspends once and fails on its first run; later runs finish without output. */
+private class YieldsThenFailsFirstRun(override val name: String) : Node {
+  private var runs = 0
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    yield()
+    if (runs == 1) throw NodeExecutionException("RuntimeError", "first run fails")
+  }
+}
+
+/** Runs a named and an anonymous child, then fails on its first attempt only; retries once. */
+private class DispatchThenFailOnce(
+  override val name: String,
+  private val named: Node,
+  private val anonymous: Node,
+) : Node {
+  override val rerunOnResume: Boolean = true
+  override val config: NodeConfig =
+    NodeConfig(
+      retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+    )
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    val a = context.runNode(named, runId = "n")
+    val b = context.runNode(anonymous)
+    if (context.attemptCount == 1) throw NodeExecutionException("RuntimeError", "first attempt")
+    emit(listOf(a, b))
+  }
+}
+
+/** Dispatches [child] as `n`, then fails the first time it ever runs, so only a retry succeeds. */
+private class DispatchThenFailFirstRun(override val name: String, private val child: Node) : Node {
+  private var runs = 0
+
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    val result = context.runNode(child, runId = "n")
+    if (runs == 1) throw NodeExecutionException("RuntimeError", "first run fails")
+    emit(result)
+  }
+}
+
+/** Waits until cancelled on its first run and emits on any later one, counting its runs. */
+private class StallsOnFirstRun(override val name: String) : Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    if (runs == 1) awaitCancellation()
+    emit("$name done")
+  }
+}
+
+/** Swallows the cancellation of its first run and returns without output, counting its runs. */
+private class SwallowsCancellationOnFirstRun(override val name: String) : Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    if (runs == 1) {
+      try {
+        awaitCancellation()
+      } catch (e: Exception) {}
+      return@flow
+    }
+    emit("$name done")
+  }
+}
+
+/** Suspends once and then fails, counting its runs, so a concurrent caller waits on a failure. */
+private class YieldsThenFails(override val name: String) : Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    yield()
+    throw NodeExecutionException("RuntimeError", "failed")
+  }
+}
+
+/** Dispatches [child] twice at once under run ID `f` and emits whether each call failed. */
+private class DispatchSameRunIdConcurrentlyCatching(
+  override val name: String,
+  private val child: Node,
+) : Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    val failed = coroutineScope {
+      List(2) {
+          async {
+            try {
+              context.runNode(child, runId = "f")
+              false
+            } catch (e: DynamicNodeFailedException) {
+              true
+            }
+          }
+        }
+        .awaitAll()
+    }
+    emit(failed)
+  }
+}
+
 /** Fails the first time it ever runs and succeeds after, so a retry of its workflow recovers. */
 private class FailsFirstRun(override val name: String) : Node {
   private var runs = 0
@@ -334,6 +581,257 @@ private class FailsFirstRun(override val name: String) : Node {
     runs += 1
     if (runs == 1) throw NodeExecutionException("RuntimeError", "first run fails")
     emit("recovered")
+  }
+}
+
+/** Asks for input under a fresh interrupt ID on each run, counting its runs. */
+private class AsksUnderFreshId(override val name: String) : Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    emit(RequestInput(message = "?"))
+  }
+}
+
+/** Asks for input on every run, under an interrupt id naming the run id. */
+private class AsksEveryRun(override val name: String) : Node {
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    emit(RequestInput(interruptId = "${name}_${context.runId}", message = "?"))
+  }
+}
+
+/** Routes along its `yes` edge on its first run only, so a loop through it goes round once. */
+private class LoopsBackOnce(override val name: String) : Node {
+  private var runs = 0
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    if (runs == 1) context.routes = listOf(yes())
+  }
+}
+
+/** Dispatches [child] twice without naming either run, and emits both results. */
+private class DispatchTwice(override val name: String, private val child: Node) : Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    emit(listOf(context.runNode(child), context.runNode(child)))
+  }
+}
+
+/** Suspends once, then asks for input under [interruptId], counting its runs. */
+private class YieldsThenAsks(
+  override val name: String,
+  private val interruptId: String,
+  override val waitForOutput: Boolean = false,
+) : Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    yield()
+    emit(RequestInput(interruptId = interruptId, message = "?"))
+  }
+}
+
+/** Dispatches [child] twice in sequence under run ID `a`, catching the first call's interrupt. */
+private class RedispatchAfterInterrupt(override val name: String, private val child: Node) : Node {
+  override val rerunOnResume: Boolean = true
+
+  @Suppress("SwallowedException") // The second call must raise the same interrupt again.
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    try {
+      context.runNode(child, runId = "a")
+    } catch (t: Throwable) {}
+    emit(context.runNode(child, runId = "a"))
+  }
+}
+
+/** Suspends once before emitting [value], counting its runs, so a concurrent caller overlaps it. */
+private class YieldsThenEmits(override val name: String, private val value: Any?) : Node {
+  var runs = 0
+    private set
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    yield()
+    emit(value)
+  }
+}
+
+/** Dispatches [child] twice at once under the same explicit [runId] and emits both results. */
+private class DispatchSameRunIdConcurrently(
+  override val name: String,
+  private val child: Node,
+  private val runId: String,
+) : Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    val results = coroutineScope {
+      List(2) { async { context.runNode(child, runId = runId) } }.awaitAll()
+    }
+    emit(results)
+  }
+}
+
+/** Dispatches [child] twice at once under one run ID, delegating its output on the second call. */
+private class DispatchThenDelegateConcurrently(override val name: String, private val child: Node) :
+  Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    coroutineScope {
+      val first = async { context.runNode(child, runId = "f") }
+      val second = async { context.runNode(child, runId = "f", useAsOutput = true) }
+      awaitAll(first, second)
+    }
+  }
+}
+
+/** Calls [child] under run ID `f`, catches its failure, then calls it again under the same ID. */
+private class RetriesAFailedChild(override val name: String, private val child: Node) : Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    try {
+      context.runNode(child, runId = "f")
+    } catch (e: DynamicNodeFailedException) {}
+    emit(context.runNode(child, runId = "f"))
+  }
+}
+
+/** Waits for output, producing none on its first run and [value] on later runs. */
+private class EmitsFromItsSecondRun(override val name: String, private val value: Any?) : Node {
+  var runs = 0
+    private set
+
+  override val waitForOutput: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    if (runs > 1) emit(value)
+  }
+}
+
+/** Calls [child] twice in sequence under run ID `w` and emits both results. */
+private class CallsTwice(override val name: String, private val child: Node) : Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    emit(listOf(context.runNode(child, runId = "w"), context.runNode(child, runId = "w")))
+  }
+}
+
+/** Dispatches [child] under run ID `s`, with a short timeout and one retry. */
+private class DispatchWithTimeout(override val name: String, private val child: Node) : Node {
+  override val rerunOnResume: Boolean = true
+  override val config: NodeConfig =
+    NodeConfig(
+      retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0),
+      timeout = 1.seconds,
+    )
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    emit(context.runNode(child, runId = "s"))
+  }
+}
+
+/** Emits [value], counting its runs atomically so runs on different threads all count. */
+@OptIn(ExperimentalAtomicApi::class)
+private class AtomicCountingEmitter(override val name: String, private val value: Any?) : Node {
+  val runs = AtomicInt(0)
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    val unused = runs.addAndFetch(1)
+    emit(value)
+  }
+}
+
+/** Dispatches [child] from [calls] threads at once under the same explicit [runId]. */
+private class DispatchSameRunIdInParallel(
+  override val name: String,
+  private val child: Node,
+  private val runId: String,
+  private val calls: Int,
+) : Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    val results = coroutineScope {
+      List(calls) { async(Dispatchers.Default) { context.runNode(child, runId = runId) } }
+        .awaitAll()
+    }
+    emit(results)
+  }
+}
+
+/** Dispatches [child] twice under the same explicit [runId] in one activation. */
+private class DispatchSameRunIdTwice(
+  override val name: String,
+  private val child: Node,
+  private val runId: String,
+) : Node {
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    val first = context.runNode(child, runId = runId)
+    val second = context.runNode(child, runId = runId)
+    emit(listOf(first, second))
+  }
+}
+
+/**
+ * Delegates its output to [child] (`useAsOutput = true`) and fails on its first attempt after
+ * [child] emits, then succeeds on its retry attempt.
+ */
+private class DelegateThenFailOnce(override val name: String, private val child: Node) : Node {
+  var runs = 0
+    private set
+
+  override val rerunOnResume: Boolean = true
+  override val config: NodeConfig =
+    NodeConfig(
+      retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+    )
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    context.runNode(child, runId = "c", useAsOutput = true)
+    if (context.attemptCount == 1) throw NodeExecutionException("RuntimeError", "first attempt")
+  }
+}
+
+/**
+ * Emits a premature output and fails on its first attempt, then succeeds on its retry attempt by
+ * writing only a state key (no output, route, or transfer).
+ */
+private class EmitThenFailOnceThenWriteState(override val name: String, private val key: String) :
+  Node {
+  var runs = 0
+    private set
+
+  override val config: NodeConfig =
+    NodeConfig(
+      retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+    )
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    if (context.attemptCount == 1) {
+      emit(
+        Event(
+          author = "",
+          output = "stale_from_attempt_1",
+          actions = EventActions(route = listOf(no()), transferToAgent = "stale_agent"),
+        )
+      )
+      throw NodeExecutionException("RuntimeError", "first attempt")
+    }
+    context.updateState(key, "ok")
   }
 }
 
@@ -959,8 +1457,8 @@ class WorkflowHitlTest {
   }
 
   @Test
-  fun retry_workflowRetriedWithinATurn_rerunsItsChildren() {
-    // Arrange: `flaky` fails once, which retries the sub-workflow.
+  fun retry_workflowRetriedWithinATurn_replaysChildrenThatFinishedBeforeTheFailure() {
+    // Arrange: `first` finishes, then `flaky` fails once, which retries the sub-workflow.
     val first = RunCountingEmitter("first", "first_out")
     val sub =
       Workflow(
@@ -968,7 +1466,7 @@ class WorkflowHitlTest {
         edges = listOf(Edge(Start, first), Edge(first, FailsFirstRun("flaky"))),
         config =
           NodeConfig(
-            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = 10.milliseconds, jitter = 0.0)
+            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
           ),
       )
     val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, sub)))
@@ -976,9 +1474,727 @@ class WorkflowHitlTest {
     // Act
     val events = WorkflowSession(workflow).turn(userMessage("go"))
 
-    // Assert: the retry reads the history the turn started with, so it reruns `first`.
-    assertEquals(2, first.runs)
+    // Assert: the retry replays `first` from the session and reruns only the node that failed.
+    assertEquals(1, first.runs)
     assertTrue(events.any { it.output == "recovered" }, "expected the retried workflow to finish")
+  }
+
+  @Test
+  fun retry_workflowRetriedWithinATurn_replaysADynamicChildOfTheFailedNode() {
+    // Arrange: `d` dispatches `child` and fails once; `d` has no retry of its own, so `sub`
+    // retries.
+    val child = RunCountingEmitter("child", "child_out")
+    val sub =
+      Workflow(
+        name = "sub",
+        edges = listOf(Edge(Start, DispatchThenFailFirstRun("d", child))),
+        config =
+          NodeConfig(
+            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+          ),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, sub)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the rerun of `d` finds `child`'s output in the session and replays it.
+    assertEquals(1, child.runs)
+    assertTrue(events.any { it.nodeInfo?.path == "wf@1/sub@1/d@1" && it.output == "child_out" })
+  }
+
+  @Test
+  fun retry_nodeThatAskedBeforeANestedRetry_keepsItsFirstRequest() {
+    // Arrange: `ask` asks, then `flaky` fails, which retries `sub`.
+    val ask = AsksUnderFreshId("ask")
+    val sub =
+      Workflow(
+        name = "sub",
+        edges = listOf(Edge(Start, ask), Edge(Start, FailsFirstRun("flaky"))),
+        config =
+          NodeConfig(
+            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+          ),
+      )
+    val session = WorkflowSession(Workflow(name = "wf", edges = listOf(Edge(Start, sub))))
+
+    // Act
+    val events = session.turn(userMessage("go"))
+
+    // Assert: the retry replays `ask` as waiting, so the turn carries a single request.
+    val requests = events.filter { e ->
+      e.functionCalls().any { it.name == RequestInput.FUNCTION_CALL_NAME }
+    }
+    assertEquals(1, ask.runs)
+    assertEquals(1, requests.size)
+  }
+
+  @Test
+  fun retry_siblingCancelledMidRun_rerunsWhileAFinishedOneReplays() {
+    // Arrange: `done` finishes, `stalled` is still running when `flaky` fails and cancels it.
+    val done = RunCountingEmitter("done", "done_out")
+    val stalled = StallsOnFirstRun("stalled")
+    val flaky = FailsFirstRun("flaky")
+    val join = JoinNode("j")
+    val sub =
+      Workflow(
+        name = "sub",
+        edges =
+          listOf(
+            Edge(Start, done),
+            Edge(Start, stalled),
+            Edge(Start, flaky),
+            Edge(done, join),
+            Edge(stalled, join),
+            Edge(flaky, join),
+          ),
+        config =
+          NodeConfig(
+            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+          ),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, sub)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: only the finished sibling replays; the cancelled one left nothing and runs again.
+    assertEquals(1, done.runs)
+    assertEquals(2, stalled.runs)
+    val joined = events.single { it.nodeInfo?.path == "wf@1/sub@1/j@1" }.output
+    assertEquals(
+      mapOf("done" to "done_out", "stalled" to "stalled done", "flaky" to "recovered"),
+      joined,
+    )
+  }
+
+  @Test
+  fun retry_retriedNode_replaysItsNamedChildAndRerunsAnAnonymousOne() {
+    // Arrange: the dispatcher's first attempt runs both children, then fails.
+    val named = RunCountingEmitter("named", "named_out")
+    val anonymous = RunCountingEmitter("anonymous", "anonymous_out")
+    val dispatcher = DispatchThenFailOnce("dispatch", named, anonymous)
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the named child keeps its path and replays; the anonymous one gets a fresh id and
+    // runs again.
+    assertEquals(1, named.runs)
+    assertEquals(2, anonymous.runs)
+    assertTrue(events.any { it.nodeInfo?.path == "wf@1/dispatch@1/anonymous@2" })
+    val dispatchOutput = events.single {
+      it.nodeInfo?.path == "wf@1/dispatch@1" && it.output != null
+    }
+    assertEquals(listOf("named_out", "anonymous_out"), dispatchOutput.output)
+  }
+
+  @Test
+  fun retry_retriedNode_replaysANamedChildThatFinishedWithoutOutput() {
+    // Arrange: the dispatcher's first attempt runs both children, then fails; `named` emits
+    // nothing.
+    val named = RunCountingEmitter("named", null)
+    val anonymous = RunCountingEmitter("anonymous", "anonymous_out")
+    val dispatcher = DispatchThenFailOnce("dispatch", named, anonymous)
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+
+    // Act
+    WorkflowSession(workflow).advance(userMessage("go"))
+
+    // Assert
+    assertEquals(1, named.runs)
+  }
+
+  @Test
+  fun runNode_sameExplicitRunIdAfterAnInterrupt_replaysTheWaitingChild() {
+    // Arrange: the first call's interrupt is caught, and the node calls the same child again.
+    val ask = YieldsThenAsks("ask", "ask_1")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, RedispatchAfterInterrupt("caller", ask))))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the second call replays the waiting child instead of asking again.
+    assertEquals(1, ask.runs)
+    val requests = events.filter { e ->
+      e.functionCalls().any { it.name == RequestInput.FUNCTION_CALL_NAME }
+    }
+    assertEquals(1, requests.size)
+  }
+
+  @Test
+  fun runNode_sameExplicitRunIdAfterAnInterruptOnAWaitForOutputChild_replaysTheWaitingChild() {
+    // Arrange: `ask` waits for output, so only its interrupt keeps its run for the second call.
+    val ask = YieldsThenAsks("ask", "ask_1", waitForOutput = true)
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, RedispatchAfterInterrupt("caller", ask))))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the second call replays the waiting child instead of asking again.
+    assertEquals(1, ask.runs)
+    val requests = events.filter { e ->
+      e.functionCalls().any { it.name == RequestInput.FUNCTION_CALL_NAME }
+    }
+    assertEquals(1, requests.size)
+  }
+
+  @Test
+  fun retry_retriedNode_replaysAChildUnderANumericRunIdThatLeftNoOutput() {
+    // Arrange: `item` emits nothing, so the session events cannot show that it finished.
+    val item = RunCountingEmitter("item", null)
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, DispatchNumberedThenFailOnce("caller", item))),
+      )
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the retry replays `item` from the first attempt instead of running it again.
+    assertEquals(1, item.runs)
+    assertEquals(
+      "done",
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun runNode_firstCallOfASharedRunCancelled_waitingCallRunsTheChild() {
+    // Arrange: the first call times out while `stalled` runs; the second call waits on that run.
+    val stalled = StallsOnFirstRun("stalled")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, AbandonsASharedRun("caller", stalled))))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the waiting call is still active, so it runs `stalled` itself.
+    assertEquals(2, stalled.runs)
+    assertEquals(
+      listOf("timed out", "stalled done"),
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun runNode_firstCallOfASharedRunSwallowedItsCancellation_waitingCallRunsTheChild() {
+    // Arrange: `swallower` returns without output when the first call times out.
+    val swallower = SwallowsCancellationOnFirstRun("swallower")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, AbandonsASharedRun("caller", swallower))))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the cut-short run is not shared, so the waiting call runs `swallower` itself.
+    assertEquals(2, swallower.runs)
+    assertEquals(
+      listOf("timed out", "swallower done"),
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun retry_nodeThatFailedAfterAProgressEvent_runsAgain() {
+    // Arrange: `flaky` reports progress before it fails, which retries `sub`.
+    val flaky = ReportsProgressThenFailsFirstRun("flaky", "flaky done")
+    val sub =
+      Workflow(
+        name = "sub",
+        edges = listOf(Edge(Start, flaky)),
+        config =
+          NodeConfig(
+            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+          ),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, sub)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: its error event marks the attempt unfinished, so the retry runs `flaky` again.
+    assertEquals(2, flaky.runs)
+    assertEquals(
+      "flaky done",
+      events.single { it.nodeInfo?.path == "wf@1/sub@1/flaky@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun retry_parallelSiblingsThatReportedProgress_bothRunAgain() {
+    // Arrange: `progress` reports progress and stalls; `flaky` reports progress, then fails.
+    val progress = ReportsProgressThenStallsOnFirstRun("progress")
+    val flaky = ReportsProgressThenFailsFirstRun("flaky", value = null)
+    val sub =
+      Workflow(
+        name = "sub",
+        edges = listOf(Edge(Start, progress), Edge(Start, flaky)),
+        config =
+          NodeConfig(
+            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+          ),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, sub)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: neither attempt finished, so the retry runs both again.
+    assertEquals(2, progress.runs)
+    assertEquals(2, flaky.runs)
+    assertEquals(
+      "progress done",
+      events.single { it.nodeInfo?.path == "wf@1/sub@1/progress@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun retry_siblingThatSwallowedTheCancellationAfterAProgressEvent_runsAgain() {
+    // Arrange: `progress` reports progress, then catches the cancellation `flaky`'s failure causes.
+    val progress = ReportsProgressThenSwallowsCancellationOnFirstRun("progress")
+    val sub =
+      Workflow(
+        name = "sub",
+        edges = listOf(Edge(Start, progress), Edge(Start, YieldsThenFailsFirstRun("flaky"))),
+        config =
+          NodeConfig(
+            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+          ),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, sub)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: returning after the cancellation does not count as finishing.
+    assertEquals(2, progress.runs)
+    assertEquals(
+      "progress done",
+      events.single { it.nodeInfo?.path == "wf@1/sub@1/progress@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun retry_nodeCancelledThenFinishedOnALaterAttempt_replaysOnTheNextRetry() {
+    // Arrange: `flaky` fails twice; `quiet` is cancelled on attempt 1 and finishes on attempt 2.
+    val quiet = StallsOnceThenFinishesWithoutOutput("quiet")
+    val sub =
+      Workflow(
+        name = "sub",
+        edges = listOf(Edge(Start, quiet), Edge(Start, FailsTwiceSecondAfterADelay("flaky"))),
+        config =
+          NodeConfig(
+            retryConfig = RetryConfig(maxAttempts = 3, initialDelay = Duration.ZERO, jitter = 0.0)
+          ),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, sub)))
+
+    // Act
+    WorkflowSession(workflow).advance(userMessage("go"))
+
+    // Assert: attempt 2 finished `quiet`, so attempt 3 replays it instead of running it again.
+    assertEquals(2, quiet.runs)
+  }
+
+  @Test
+  fun runNode_waitingCallCancelledWithTheFirst_doesNotRunTheChild() {
+    // Arrange: one timeout cancels both calls while `stalled` runs.
+    val stalled = StallsOnFirstRun("stalled")
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, CancelsBothCallsOfASharedRun("caller", stalled))),
+      )
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the cancelled waiting call stops instead of starting `stalled` again.
+    assertEquals(1, stalled.runs)
+    assertEquals(
+      "timed out",
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun retry_siblingCancelledAfterAProgressEvent_runsAgain() {
+    // Arrange: `progress` reports progress and stalls; `flaky` fails once, which retries `sub`.
+    val progress = ReportsProgressThenStallsOnFirstRun("progress")
+    val flaky = YieldsThenFailsFirstRun("flaky")
+    val sub =
+      Workflow(
+        name = "sub",
+        edges = listOf(Edge(Start, progress), Edge(Start, flaky)),
+        config =
+          NodeConfig(
+            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+          ),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, sub)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the cancelled run left no result, so the retry runs `progress` again.
+    assertEquals(2, progress.runs)
+    assertEquals(
+      "progress done",
+      events.single { it.nodeInfo?.path == "wf@1/sub@1/progress@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun retry_retriedNode_replaysASubWorkflowChildThatFinishedWithoutOutput() {
+    // Arrange: `sync` ends with a state-only node; `silent` inside it leaves no event.
+    val silent = RunCountingEmitter("silent", null)
+    val sync =
+      Workflow(
+        name = "sync",
+        edges = listOf(Edge(Start, silent), Edge(silent, WritesStateOnly("writer"))),
+      )
+    val dispatcher = DispatchThenFailOnce("dispatch", sync, RunCountingEmitter("other", "x"))
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+
+    // Act
+    WorkflowSession(workflow).advance(userMessage("go"))
+
+    // Assert: the retry replays `sync` whole, so `silent` does not run again.
+    assertEquals(1, silent.runs)
+  }
+
+  @Test
+  fun runNode_sameExplicitRunIdConcurrently_runsTheChildOnceForBoth() {
+    // Arrange: both calls start before `fetch` finishes.
+    val fetch = YieldsThenEmits("fetch", "fetched")
+    val caller = DispatchSameRunIdConcurrently("caller", fetch, runId = "f")
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, caller)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the second call waits for the first and gets the same result.
+    assertEquals(1, fetch.runs)
+    val output = events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output
+    assertEquals(listOf("fetched", "fetched"), output)
+  }
+
+  @Test
+  fun retry_parallelNodeRetriedByItsWorkflow_replaysFinishedItemsAndRerunsTheFailedOne() {
+    // Arrange: items run one at a time; item 2 fails once, which fails `items` and retries `sub`.
+    val runs = mutableMapOf<Int, Int>()
+    val items =
+      parallelNode<Int, Int>("items", maxParallelWorkers = 1) { _, item ->
+        runs[item] = (runs[item] ?: 0) + 1
+        if (item == 2 && runs[item] == 1) throw NodeExecutionException("RuntimeError", "first run")
+        item * 10
+      }
+    val input = Emitter("input", listOf(1, 2, 3))
+    val sub =
+      Workflow(
+        name = "sub",
+        edges = listOf(Edge(Start, input), Edge(input, items)),
+        config =
+          NodeConfig(
+            retryConfig = RetryConfig(maxAttempts = 2, initialDelay = Duration.ZERO, jitter = 0.0)
+          ),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, sub)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: item 1 replays, item 2 runs again, and item 3 runs for the first time.
+    assertEquals(mapOf(1 to 1, 2 to 2, 3 to 1), runs)
+    assertEquals(
+      listOf(10, 20, 30),
+      events.single { it.nodeInfo?.path == "wf@1/sub@1/items@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun runNode_concurrentCallDelegatingASharedChild_emitsTheOutputForTheCaller() {
+    // Arrange: the first call runs `fetch` without delegating; the second delegates to it.
+    val fetch = YieldsThenEmits("fetch", "fetched")
+    val caller = DispatchThenDelegateConcurrently("caller", fetch)
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, caller)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: no event carried the output for `caller`, so `caller` emits it itself.
+    assertEquals(1, fetch.runs)
+    assertEquals(
+      "fetched",
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun runNode_sameExplicitRunIdAfterAFailure_runsTheChildAgain() {
+    // Arrange: `flaky` fails on its first run, and the caller catches that and calls it again.
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, RetriesAFailedChild("caller", FailsFirstRun("flaky")))),
+      )
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: a failed child is not cached, so the second call runs it and gets its output.
+    assertEquals(
+      "recovered",
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun runNode_sameExplicitRunIdAfterAWaitForOutputChildLeftNoOutput_runsTheChildAgain() {
+    // Arrange: `wait` produces nothing on its first run.
+    val wait = EmitsFromItsSecondRun("wait", "ready")
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, CallsTwice("caller", wait))))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the run that left no output is not cached, so the second call runs `wait` again.
+    assertEquals(2, wait.runs)
+    assertEquals(
+      listOf(null, "ready"),
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun retry_childSwallowedTheAttemptCancellation_runsTheChildAgain() {
+    // Arrange: `swallower` catches the timeout's cancellation and returns without output.
+    val swallower = SwallowsCancellationOnFirstRun("swallower")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, DispatchWithTimeout("caller", swallower))))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the run ended by the timeout is not cached, so the retry runs `swallower` again.
+    assertEquals(2, swallower.runs)
+    assertEquals(
+      "swallower done",
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun runNode_sameExplicitRunIdConcurrentlyOnAFailingChild_failsBothCalls() {
+    // Arrange: both calls start before `broken` fails.
+    val broken = YieldsThenFails("broken")
+    val caller = DispatchSameRunIdConcurrentlyCatching("caller", broken)
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, caller)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the waiting call gets the shared failure instead of an empty success.
+    assertEquals(1, broken.runs)
+    assertEquals(
+      listOf(true, true),
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun retry_attemptTimedOutWhileItsChildRan_runsTheChildAgain() {
+    // Arrange: `stalled` never finishes its first run, so the caller's first attempt times out.
+    val stalled = StallsOnFirstRun("stalled")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, DispatchWithTimeout("caller", stalled))))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the cancelled run is not cached, so the retry runs `stalled` again.
+    assertEquals(2, stalled.runs)
+    assertEquals(
+      "stalled done",
+      events.single { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null }.output,
+    )
+  }
+
+  @Test
+  fun runNode_sameExplicitRunIdConcurrentlyOnAnAskingChild_asksOnce() {
+    // Arrange: both calls start before `ask` raises its request.
+    val ask = YieldsThenAsks("ask", "ask_1")
+    val caller = DispatchSameRunIdConcurrently("caller", ask, runId = "f")
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, caller)))
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: the waiting call shares the interrupt instead of asking again.
+    assertEquals(1, ask.runs)
+    val requests = events.filter { e ->
+      e.functionCalls().any { it.name == RequestInput.FUNCTION_CALL_NAME }
+    }
+    assertEquals(1, requests.size)
+  }
+
+  @Test
+  @OptIn(ExperimentalAtomicApi::class)
+  fun runNode_sameExplicitRunIdFromManyThreads_runsTheChildOnce() {
+    repeat(50) {
+      // Arrange: eight threads race to run `fetch`, which finishes without suspending.
+      val fetch = AtomicCountingEmitter("fetch", "fetched")
+      val caller = DispatchSameRunIdInParallel("caller", fetch, runId = "f", calls = 8)
+      val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, caller)))
+
+      // Act
+      WorkflowSession(workflow).advance(userMessage("go"))
+
+      // Assert: the calls that lose the race share the first run instead of rerunning `fetch`.
+      assertEquals(1, fetch.runs.load())
+    }
+  }
+
+  @Test
+  fun runNode_sameExplicitRunIdTwiceInOneActivation_replaysFirstResult() {
+    // Arrange: the dispatcher calls `runNode(child, runId = "stable-id")` twice in one activation,
+    // both for a value-emitting child and for a `rerunOnResume` child that emits no output.
+    val child = RunCountingEmitter("child", "child_out")
+    val noOutput = RunCountingEmitter("no_out", null, rerunOnResume = true)
+    val dispatcher = DispatchSameRunIdTwice("dispatch", child, runId = "stable-id")
+    val noOutDispatcher = DispatchSameRunIdTwice("dispatch_no_out", noOutput, runId = "stable-id")
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, noOutDispatcher)),
+      )
+
+    // Act
+    val events = WorkflowSession(workflow).turn(userMessage("go"))
+
+    // Assert: each second call replays the completed child instead of running it a second time.
+    assertEquals(1, child.runs)
+    assertEquals(1, noOutput.runs)
+    val dispatchOutput = events.single {
+      it.nodeInfo?.path == "wf@1/dispatch@1" && it.output != null
+    }
+    assertEquals(listOf("child_out", "child_out"), dispatchOutput.output)
+  }
+
+  @Test
+  fun retry_nodesThatSucceedOnAttemptTwo_replayCleanlyOnResume() {
+    // Arrange: on turn 1, `caller` delegates to `child@c` and fails on attempt 1 after `child@c`
+    // emits, then succeeds on attempt 2 by replaying `child@c`; `writer` emits a premature output
+    // and fails on attempt 1, then succeeds on attempt 2 by writing only state; `ask` suspends.
+    val child = RunCountingEmitter("child", "delegated_out")
+    val caller = DelegateThenFailOnce("caller", child)
+    val writer = EmitThenFailOnceThenWriteState("writer", "k")
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "need input"))
+    val join = JoinNode("j")
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges =
+          listOf(
+            Edge(Start, caller),
+            Edge(Start, writer),
+            Edge(Start, ask),
+            Edge(caller, join),
+            Edge(writer, join),
+            Edge(ask, join),
+          ),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("v" to 1L)))
+
+    // Assert: neither node reruns on turn 2, `caller` emits its replayed output once, and
+    // `writer`'s attempt-1 output was dropped when that attempt failed.
+    assertEquals(1, child.runs)
+    assertEquals(2, caller.runs)
+    assertEquals(1, events.count { it.nodeInfo?.path == "wf@1/caller@1" && it.output != null })
+    assertEquals(2, writer.runs)
+    val joinEvent = events.single { it.nodeInfo?.path == "wf@1/j@1" }
+    assertEquals(
+      mapOf("caller" to "delegated_out", "writer" to null, "ask" to mapOf("v" to 1L)),
+      joinEvent.output,
+    )
+  }
+
+  @Test
+  fun resume_fannedOutNodeReplayed_preservesItsSubBranchOnReemittedEvent() {
+    // Arrange: START fans out to `done` and `ask`, so `done` runs on sub-branch `done@1`.
+    val done = RunCountingEmitter("done", "done_out")
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "need input"))
+    val join = JoinNode("j")
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, done), Edge(Start, ask), Edge(done, join), Edge(ask, join)),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("v" to 1L)))
+
+    // Assert: the re-emitted event for `done` keeps its `done@1` sub-branch.
+    assertEquals(1, done.runs)
+    val reemitted = events.single { it.nodeInfo?.path == "wf@1/done@1" }
+    assertEquals("done@1", reemitted.branch)
+  }
+
+  @Test
+  fun runId_nodeReenteredAfterResume_takesTheNextRunId() {
+    // Arrange: `ask` suspends the first turn; once it is answered, `again` loops back to it.
+    val ask = AsksEveryRun("ask")
+    val again = LoopsBackOnce("again")
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, ask), Edge(ask, again), Edge(again, ask, listOf(yes()))),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("v" to 1L)))
+
+    // Assert: the resumed run keeps @1 and the re-entry asks afresh as @2. A re-entry reusing @1
+    // would replay the answered run instead, surfacing ask@1 twice.
+    assertEquals(mapOf("v" to 1L), events.single { it.nodeInfo?.path == "wf@1/ask@1" }.output)
+    val request = events.single { e ->
+      e.functionCalls().any { it.name == RequestInput.FUNCTION_CALL_NAME }
+    }
+    assertEquals("wf@1/ask@2", request.nodeInfo?.path)
+    assertEquals("ask_2", request.functionCalls().single().id)
+  }
+
+  @Test
+  fun runId_childDispatchedAgainAfterResume_takesTheNextRunId() {
+    // Arrange: the first of two anonymous dispatches of `ask` suspends the first turn.
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, DispatchTwice("d", AsksEveryRun("ask")))))
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("v" to 1L)))
+
+    // Assert: the second dispatch asks afresh as @2, which it reaches only once the resumed @1
+    // completed with its answer. A replayed dynamic child emits no event, so @1 shows only here.
+    val request = events.single { e ->
+      e.functionCalls().any { it.name == RequestInput.FUNCTION_CALL_NAME }
+    }
+    assertEquals("wf@1/d@1/ask@2", request.nodeInfo?.path)
+    assertEquals("ask_2", request.functionCalls().single().id)
   }
 
   @Test
@@ -1024,7 +2240,7 @@ class WorkflowHitlTest {
     // Act
     val events = session.turn(answer("ask_1", mapOf("v" to 1L)))
 
-    // Assert: the request cleared attempt 1's error, so the answer completes `ask` unrun.
+    // Assert: the interrupt cleared attempt 1's error, so the answer completes `ask` unrun.
     assertEquals(2, ask.runs)
     assertEquals(mapOf("v" to 1L), events.replyInput())
   }
@@ -1181,7 +2397,7 @@ class WorkflowHitlTest {
   }
 
   @Test
-  fun retry_rootWorkflowRetriedWithinATurn_rerunsItsChildren() {
+  fun retry_rootWorkflowRetriedWithinATurn_replaysChildrenThatFinishedBeforeTheFailure() {
     // Arrange: the root workflow retries once `flaky` fails, after `first` finished.
     val first = RunCountingEmitter("first", "first_out")
     val workflow =
@@ -1197,8 +2413,8 @@ class WorkflowHitlTest {
     // Act
     val events = WorkflowSession(workflow).turn(userMessage("go"))
 
-    // Assert: like a nested workflow, the root reads the history its turn started with.
-    assertEquals(2, first.runs)
+    // Assert: like a nested workflow, the retry replays `first` from the session.
+    assertEquals(1, first.runs)
     assertTrue(events.any { it.output == "recovered" }, "expected the retried workflow to finish")
   }
 

@@ -19,6 +19,7 @@
 package com.google.adk.kt.workflow
 
 import com.google.adk.kt.agents.ChildRunIds
+import com.google.adk.kt.agents.ChildRuns
 import com.google.adk.kt.agents.Context
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
@@ -81,8 +82,9 @@ private constructor(
   )
 
   private val childRunIds = ChildRunIds()
+  private val childRuns = ChildRuns()
 
-  // A root takes one snapshot of its invocation's events, so every attempt reads the same history.
+  // A root reads its invocation's events once, for its own answers and replay.
   private val rootHistory: List<Event>? =
     if (parent == null) ResumeScan.invocationEvents(invocationContext) else null
 
@@ -156,9 +158,9 @@ private constructor(
       attemptCount = attempt,
       resumeInputs = resolvedResumeInputs,
       useAsOutput = useAsOutput,
-      // A retried workflow re-runs its whole graph, so its nodes number from 1 again.
+      // A retried workflow restarts node numbering, so finished nodes replay under their paths.
       childRunIds = if (node is Workflow) ChildRunIds() else childRunIds,
-      history = rootHistory,
+      childRuns = if (node is Workflow) ChildRuns() else childRuns,
     )
 
   /**
@@ -192,6 +194,7 @@ private constructor(
       private set
 
     suspend fun run(nodeInput: Any?, validateInput: Boolean): Context {
+      val cancelledNodePaths = context.invocationContext.frameworkData.cancelledNodePaths
       try {
         runAttempt(nodeInput, validateInput)
         flushPending()
@@ -206,10 +209,14 @@ private constructor(
       } catch (e: CancellationException) {
         // This node's own timeout already surfaced as a NodeTimeoutException, so a cancellation
         // reaching here is an outer scope tearing the node down and must not be retried.
+        cancelledNodePaths[nodeState.nodePath] = Unit
         throw e
       } catch (e: Exception) {
         fail(e)
       }
+      // A node that swallowed the cancellation is cut short too; a clean finish clears the record.
+      if (currentCoroutineContext().isActive) cancelledNodePaths -= nodeState.nodePath
+      else cancelledNodePaths[nodeState.nodePath] = Unit
       return context
     }
 

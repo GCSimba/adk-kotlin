@@ -32,7 +32,10 @@ import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.Schema
 import kotlinx.serialization.json.decodeFromJsonElement
 
-/** Reconstructed execution state of a node from earlier turns in the same invocation. */
+/**
+ * Reconstructed execution state of a node from earlier in this invocation (in an earlier turn or an
+ * earlier attempt).
+ */
 internal class RecoveredNode {
   var output: Any? = null
   var errorCode: String? = null
@@ -71,10 +74,10 @@ internal data class Interception(
 /**
  * Reconstructs workflow execution state from session events and decides how each node resumes.
  *
- * On a resumed turn, [scan] and [answersFor] fold the invocation's event log into [RecoveredNode]
- * snapshots (outputs, routes, transfers, errors, and interrupt answers). When the scheduler or
- * [Context.runNode] reaches a node, [intercept] decides whether to run it again or replay its prior
- * result via [replayContext].
+ * On a resumed turn or retry attempt, [scan] and [answersFor] fold the invocation's event log into
+ * [RecoveredNode] snapshots (outputs, routes, transfers, errors, and interrupt answers). When the
+ * scheduler or [Context.runNode] reaches a node, [intercept] decides whether to run it again or
+ * replay its prior result via [replayContext].
  */
 internal object ResumeScan {
 
@@ -229,10 +232,17 @@ internal object ResumeScan {
       }
       event.actions.route?.let { node.route = it }
       event.actions.transferToAgent?.let { node.transferToAgent = it }
-      // A result, or a later non-error event, clears an earlier attempt's error.
+      // A result or later non-error event clears an error; an error drops the attempt's result.
       val hasResult =
         eventOutput != null || event.actions.route != null || event.actions.transferToAgent != null
-      node.errorCode = if (hasResult) null else event.errorCode
+      if (hasResult || event.errorCode == null) {
+        node.errorCode = null
+      } else {
+        node.output = null
+        node.route = null
+        node.transferToAgent = null
+        node.errorCode = event.errorCode
+      }
     }
 
     /**
@@ -257,10 +267,16 @@ internal object ResumeScan {
 
   /**
    * Determines whether [node] should run or replay from [recovered]. With no recorded output or
-   * route, a [Node.rerunOnResume] node reruns unless it already finished since its last answer, and
-   * otherwise a [dynamic] node reruns while a static one does not.
+   * route, a node [cancelledMidRun] in this turn reruns, a [Node.rerunOnResume] node reruns unless
+   * it already finished since its last answer, and otherwise a [dynamic] node reruns while a static
+   * one does not.
    */
-  fun intercept(node: Node, recovered: RecoveredNode?, dynamic: Boolean = false): Interception {
+  fun intercept(
+    node: Node,
+    recovered: RecoveredNode?,
+    dynamic: Boolean = false,
+    cancelledMidRun: Boolean = false,
+  ): Interception {
     if (recovered == null) return Interception(shouldRun = true)
     if (node is Workflow) {
       return Interception(shouldRun = true, resumeInputs = recovered.resolvedResponses)
@@ -297,6 +313,9 @@ internal object ResumeScan {
         transferToAgent = transfer,
       )
     }
+
+    // A node cancelled mid-run in this turn left progress events but no result.
+    if (cancelledMidRun) return Interception(shouldRun = true, resumeInputs = resolved)
 
     if (recovered.interruptIds.isNotEmpty() && !node.rerunOnResume) {
       val answerOutput = if (resolved.size == 1) resolved.values.single() else resolved.toMap()
@@ -344,10 +363,7 @@ internal object ResumeScan {
         useAsOutput = useAsOutput,
       )
     val state = context.requireNodeState()
-    interception.output?.let {
-      context.output = it
-      state.markOutputEmitted()
-    }
+    interception.output?.let { context.output = it }
     interception.route?.let {
       context.routes = it
       state.routesEmitted = true

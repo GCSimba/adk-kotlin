@@ -48,6 +48,15 @@ import com.google.adk.kt.workflow.validateRunId
 import com.google.errorprone.annotations.CanIgnoreReturnValue
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Execution context passed to agent callbacks, model callbacks, tools, and workflow nodes during an
@@ -94,8 +103,7 @@ open class Context(
    * @param actions Deltas this node accumulates, flushed onto the next event it emits.
    * @param useAsOutput Whether this node's output also serves as its parent's output.
    * @param childRunIds Per-name run-ID counters for this node's children.
-   * @param history Session events a root node reads its earlier progress from; children share their
-   *   parent's.
+   * @param childRuns Runs of this node's children, shared by concurrent calls and later attempts.
    */
   @ExperimentalWorkflowApi
   internal constructor(
@@ -110,7 +118,7 @@ open class Context(
     useAsOutput: Boolean = false,
     nodePath: String? = null,
     childRunIds: ChildRunIds = ChildRunIds(),
-    history: List<Event>? = null,
+    childRuns: ChildRuns = ChildRuns(),
   ) : this(invocationContext, actions) {
     this.parent = parent
     this.runId = runId
@@ -134,7 +142,7 @@ open class Context(
         outputParent = if (useAsOutput) parentState else null,
         outputForAncestors = outputForAncestors,
         childRunIds = childRunIds,
-        history = parentState?.history ?: history ?: ResumeScan.invocationEvents(invocationContext),
+        childRuns = childRuns,
       )
   }
 
@@ -511,8 +519,9 @@ open class Context(
    * @param node Child node to execute.
    * @param nodeInput Input passed to [node], or `null` if none.
    * @param runId Explicit run ID for [node]: at least one non-digit, and no `'/'`, `'@'`, or `'.'`.
-   *   A child that finished in an earlier turn under the same ID returns its recorded output
-   *   without running again. When `null` or empty, the child gets the next number for its name,
+   *   A child that already recorded an output under the same ID, in this activation, an earlier
+   *   attempt, or an earlier turn, returns it without running again; one that finished without an
+   *   output may run again. When `null` or empty, the child gets the next number for its name,
    *   which follows call order, so concurrent children need explicit IDs.
    * @param useAsOutput When `true`, delegates this node's output to [node]: this node must not
    *   produce an output of its own afterwards, even if [node] finishes without one. The claim is
@@ -626,6 +635,12 @@ open class Context(
     ) {
       throw NodeInterruptedException()
     }
+    // A delegate's output not recorded for this attempt, such as a replay, is emitted here.
+    val output = childState.output
+    val recordedForThisAttempt = childState.hasEmittedOutput && childState.outputParent === ns
+    if (delegatesOutput && output != null && !recordedForThisAttempt) {
+      ns.adoptReplayedOutput(output)
+    }
     return childState.output
   }
 
@@ -654,8 +669,55 @@ open class Context(
       }
     // Input validation runs in the caller so a rejected input fails this node.
     val input = node.validateInput(nodeInput)
-    val recovered = recoveredChildren[BranchPath.segment(node.name, id)]
-    val interception = ResumeScan.intercept(node, recovered, dynamic = true)
+    val childKey = BranchPath.segment(node.name, id)
+    // One run per child: concurrent calls and later attempts of this node share its outcome.
+    val run = CompletableDeferred<Context>()
+    while (true) {
+      val shared = ns.childRuns.claim(childKey, run) ?: break
+      try {
+        return shared.await()
+      } catch (e: CancellationException) {
+        // The run's first caller was cancelled; a caller that is still active runs the child.
+        currentCoroutineContext().ensureActive()
+      }
+    }
+    try {
+      val childContext =
+        runChild(node, input, id, childKey, useAsOutput, useSubBranch, overrideBranch)
+      if (!currentCoroutineContext().isActive) {
+        // The child swallowed this node's cancellation and did not finish, so waiters run it.
+        ns.childRuns.release(childKey, run)
+        run.cancel()
+        return childContext
+      }
+      if (!childContext.keepsItsRun()) ns.childRuns.release(childKey, run)
+      run.complete(childContext)
+      return childContext
+    } catch (e: Throwable) {
+      ns.childRuns.release(childKey, run)
+      run.completeExceptionally(e)
+      throw e
+    }
+  }
+
+  @ExperimentalWorkflowApi
+  private suspend fun runChild(
+    node: Node,
+    input: Any?,
+    id: String,
+    childKey: String,
+    useAsOutput: Boolean,
+    useSubBranch: Boolean,
+    overrideBranch: String?,
+  ): Context {
+    val recovered = recoveredChildren[childKey]
+    val interception =
+      ResumeScan.intercept(
+        node,
+        recovered,
+        dynamic = true,
+        cancelledMidRun = isCancelledMidRun(childKey),
+      )
     if (!interception.shouldRun) {
       return ResumeScan.replayContext(this, node, id, useAsOutput, interception)
     }
@@ -671,10 +733,38 @@ open class Context(
       .run(input, validateInput = false)
   }
 
-  /** Recovered states of this activation's children from earlier turns, keyed by `name@runId`. */
+  /**
+   * Whether this finished child's run stays shared: a failed child runs again, and so does a
+   * [Node.waitForOutput] child that left no output, route, transfer or interrupt.
+   */
+  @ExperimentalWorkflowApi
+  private fun Context.keepsItsRun(): Boolean {
+    val state = requireNodeState()
+    if (state.failure != null) return false
+    return state.interruptIds.isNotEmpty() ||
+      state.hasProducedOutput ||
+      routes != null ||
+      actions.transferToAgent != null ||
+      !state.node.waitForOutput
+  }
+
+  /** Whether this activation's child [childKey] (`name@runId`) was cancelled mid-run this turn. */
+  @ExperimentalWorkflowApi
+  internal fun isCancelledMidRun(childKey: String): Boolean =
+    BranchPath.childNodePath(nodePath, childKey) in
+      invocationContext.frameworkData.cancelledNodePaths
+
+  /**
+   * Reconstructed states of this activation's children from earlier turns or earlier attempts of
+   * this node, keyed by `name@runId`.
+   */
   private val recoveredChildren by lazy {
-    val ns = requireNodeState()
-    ResumeScan.scan(ns.history, ns.nodePath, invocationContext.invocationId)
+    val path = requireNodeState().nodePath
+    ResumeScan.scan(
+      ResumeScan.invocationEvents(invocationContext),
+      path,
+      invocationContext.invocationId,
+    )
   }
 
   private var nodeState: NodeExecutionState? = null
@@ -689,19 +779,18 @@ open class Context(
 }
 
 /** Mutable execution state for a single node activation. */
-@OptIn(ExperimentalAtomicApi::class)
+@OptIn(ExperimentalAtomicApi::class, ExperimentalWorkflowApi::class)
 internal class NodeExecutionState(
   val node: Node,
   val eventSink: EventSink,
   val nodePath: String,
   var eventAuthor: String,
   /** Parent state that delegated its output to this activation when `useAsOutput` is `true`. */
-  private val outputParent: NodeExecutionState? = null,
+  val outputParent: NodeExecutionState? = null,
   /** Ancestor node paths this activation's output also satisfies, nearest ancestor first. */
   val outputForAncestors: List<String> = emptyList(),
   private val childRunIds: ChildRunIds = ChildRunIds(),
-  /** Session events at the start of this run, used to reconstruct progress from earlier turns. */
-  val history: List<Event> = emptyList(),
+  val childRuns: ChildRuns = ChildRuns(),
 ) {
   /** Node paths this activation's output satisfies: [nodePath] followed by [outputForAncestors]. */
   val outputFor: List<String> = listOf(nodePath) + outputForAncestors
@@ -793,6 +882,16 @@ internal class NodeExecutionState(
     }
   }
 
+  /**
+   * Takes [value] from a replayed `useAsOutput` child as this activation's output, not yet emitted,
+   * so [NodeRunner] emits it for this attempt.
+   */
+  fun adoptReplayedOutput(value: Any) {
+    check(outputStateRef.compareAndSet(OutputState.Delegated, OutputState.Produced(value))) {
+      "Node '${node.name}' adopted a replayed output without a pending delegation."
+    }
+  }
+
   /** Selects the outgoing routes for this activation. */
   fun selectRoutes(routes: List<Route>?) {
     selectedRoutes = routes
@@ -865,6 +964,32 @@ internal class NodeExecutionState(
   private fun delegatedOutputMessage() =
     "Node '${node.name}' delegated its output to a useAsOutput child and must not produce one of" +
       " its own."
+}
+
+/** Runs of a node's children keyed by `name@runId`, kept across the node's attempts. */
+// The mutex guards every access to byKey, and a run's Context is read only after it completes.
+@Suppress("UnsafeCoroutineCrossing")
+internal class ChildRuns {
+  private val mutex = Mutex()
+  private val byKey = HashMap<String, CompletableDeferred<Context>>()
+
+  /** Registers [run] under [key] and returns null, or returns the run already registered. */
+  suspend fun claim(key: String, run: CompletableDeferred<Context>): CompletableDeferred<Context>? =
+    mutex.withLock {
+      byKey.getOrPut(key) { run }.takeIf { it !== run }
+    }
+
+  /** Removes [run] from [key] if it is still the registered run, so the next call runs again. */
+  suspend fun release(key: String, run: CompletableDeferred<Context>) {
+    // A cancelled caller must still release its run.
+    withContext(NonCancellable) {
+      mutex.withLock {
+        if (byKey[key] === run) {
+          val unused = byKey.remove(key)
+        }
+      }
+    }
+  }
 }
 
 /** Per-child-name run-ID counters for a node activation. */
