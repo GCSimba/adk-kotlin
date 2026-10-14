@@ -51,6 +51,7 @@ import com.google.adk.kt.types.Role
 import com.google.adk.kt.workflow.Node
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.jvm.JvmSynthetic
 import kotlin.jvm.Volatile
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -923,6 +924,16 @@ data class ContextFrameworkData(
    */
   internal val sessionAppendLock = Mutex()
 }
+
+/**
+ * Returns a copy of this config for a fresh live session, with the resumption handle cleared and
+ * the rest (including `transparent`) kept, as ADK Python's `run_config_for_new_live_session` does.
+ *
+ * `@JvmSynthetic` hides the top-level internal function from Java callers.
+ */
+@JvmSynthetic
+internal fun RunConfig.forNewLiveSession(): RunConfig =
+  copy(sessionResumption = sessionResumption?.copy(handle = null))
 
 /**
  * Per-invocation LLM-call counter for enforcing [RunConfig.maxLlmCalls]. The type is public only
