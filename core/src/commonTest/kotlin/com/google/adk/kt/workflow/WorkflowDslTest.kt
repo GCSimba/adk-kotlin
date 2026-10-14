@@ -57,13 +57,13 @@ class WorkflowDslTest {
     // Arrange
     val a = StubNode("a")
     val b = StubNode("b")
-    val block = EdgesDslBlock<EdgesBuilder> { Start.then(a).route { on("x") then b } }
+    val graphDefinition = EdgesDslBlock<EdgesBuilder> { Start.then(a).route { on("x") then b } }
 
     // Act
-    val graphEdges = edges(block)
+    val graphEdges = edges(graphDefinition)
 
     // Assert
-    assertEquals(workflow("wf", block = block).edges, graphEdges)
+    assertEquals(workflow("wf", graphDefinition = graphDefinition).edges, graphEdges)
   }
 
   @Test

@@ -123,11 +123,11 @@ class Workflow(
     fun edges(vararg edges: Edge): Builder = apply { this.edges = edges.toList() }
 
     /**
-     * Sets the edges that [block] declares, so Java can write `.edges(g -> ...)` without
+     * Sets the edges that [graphDefinition] declares, so Java can write `.edges(g -> ...)` without
      * `EdgesDsl.edges`.
      */
-    fun edges(block: EdgesDslBlock<EdgesBuilder>): Builder = apply {
-      this.edges = com.google.adk.kt.workflow.edges(block)
+    fun edges(graphDefinition: EdgesDslBlock<EdgesBuilder>): Builder = apply {
+      this.edges = com.google.adk.kt.workflow.edges(graphDefinition)
     }
 
     fun description(description: String): Builder = apply { this.description = description }

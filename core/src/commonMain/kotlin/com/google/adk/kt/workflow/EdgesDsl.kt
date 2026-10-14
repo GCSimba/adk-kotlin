@@ -33,7 +33,8 @@ import kotlin.jvm.JvmSynthetic
 @DslMarker internal annotation class EdgesDslMarker
 
 /**
- * Returns the edges declared by [block] for a [Workflow]; [workflow] builds both in one step.
+ * Returns the edges declared by [graphDefinition] for a [Workflow]; [workflow] builds both in one
+ * step.
  *
  * ```
  * val graphEdges = edges {
@@ -53,9 +54,9 @@ import kotlin.jvm.JvmSynthetic
  * @throws IllegalStateException if an `on` was never completed with `then`.
  */
 @ExperimentalWorkflowApi
-fun edges(block: EdgesDslBlock<EdgesBuilder>): List<Edge> {
+fun edges(graphDefinition: EdgesDslBlock<EdgesBuilder>): List<Edge> {
   val builder = EdgesBuilder()
-  with(block) { builder.declare() }
+  with(graphDefinition) { builder.declare() }
   return builder.build()
 }
 
@@ -218,15 +219,15 @@ class EdgesBuilder internal constructor() {
     RouteSet(listOf(first, second, *rest))
 
   /**
-   * Adds this node's routing map, with an edge for each route [block] maps to a node. A routing map
-   * ends the statement; connect its targets onward in separate statements. An empty map throws
-   * [IllegalArgumentException], and an entry not completed with `then` throws
+   * Adds this node's routing map, with an edge for each route [routeMapDefinition] maps to a node.
+   * A routing map ends the statement; connect its targets onward in separate statements. An empty
+   * map throws [IllegalArgumentException], and an entry not completed with `then` throws
    * [IllegalStateException].
    */
   @JvmSynthetic
-  infix fun Node.route(block: EdgesDslBlock<RouteMapBuilder>) {
+  infix fun Node.route(routeMapDefinition: EdgesDslBlock<RouteMapBuilder>) {
     val routes = RouteMapBuilder(this)
-    with(block) { routes.declare() }
+    with(routeMapDefinition) { routes.declare() }
     routes.built = true
     check(routes.pendingEntries.isEmpty()) {
       "on(...) in the routing map of node '$name' has no target; complete it with then(node)."
@@ -579,8 +580,8 @@ class EdgeChain internal constructor(private val builder: EdgesBuilder, private 
     with(builder) { PendingEdgeChain(builder, node.on(routes)) }
 
   /** Adds the current node's routing map and ends the chain. */
-  fun route(block: EdgesDslBlock<RouteMapBuilder>) {
-    with(builder) { node.route(block) }
+  fun route(routeMapDefinition: EdgesDslBlock<RouteMapBuilder>) {
+    with(builder) { node.route(routeMapDefinition) }
   }
 }
 

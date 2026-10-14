@@ -20,7 +20,7 @@ import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.types.Schema
 
 /**
- * Builds a [Workflow] from the edges [block] declares.
+ * Builds a [Workflow] from the edges [graphDefinition] declares.
  *
  * ```
  * val support = workflow("support_triage") {
@@ -49,11 +49,11 @@ fun workflow(
   inputSchema: Schema? = null,
   outputSchema: Schema? = null,
   stateSchema: Schema? = null,
-  block: EdgesDslBlock<EdgesBuilder>,
+  graphDefinition: EdgesDslBlock<EdgesBuilder>,
 ): Workflow =
   Workflow(
     name = name,
-    edges = edges(block),
+    edges = edges(graphDefinition),
     description = description,
     maxConcurrency = maxConcurrency,
     rerunOnResume = rerunOnResume,
