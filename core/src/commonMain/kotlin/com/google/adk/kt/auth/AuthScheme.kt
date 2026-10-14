@@ -155,4 +155,407 @@ sealed interface AuthScheme {
       @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
     }
   }
+
+  /**
+   * An OAuth2 scheme: the flows the service supports, with their endpoints and scopes.
+   *
+   * @property flows The OAuth2 flows the service supports.
+   * @property issuerUrl The authorization server's issuer URL, from which its endpoints can be
+   *   discovered.
+   * @property description A description of the scheme.
+   */
+  @ExperimentalAuthApi
+  data class OAuth2(
+    val flows: Flows,
+    val issuerUrl: String? = null,
+    val description: String? = null,
+  ) : AuthScheme {
+    override val type: String
+      get() = "oauth2"
+
+    /**
+     * Returns a [Builder] initialized with this instance's properties, primarily for Java callers.
+     * Prefer it over `copy` from Java: `copy` takes every property positionally, so its signature
+     * changes whenever a property is added.
+     */
+    @AdkJavaInteropApi
+    fun toBuilder(): Builder = Builder().flows(flows).issuerUrl(issuerUrl).description(description)
+
+    /**
+     * The OAuth2 flows a service supports. Each property is set when the service supports that
+     * flow.
+     *
+     * @property implicit The implicit flow.
+     * @property password The resource owner password flow.
+     * @property clientCredentials The client credentials flow.
+     * @property authorizationCode The authorization code flow.
+     */
+    @ExperimentalAuthApi
+    data class Flows(
+      val implicit: Flow.Implicit? = null,
+      val password: Flow.Password? = null,
+      val clientCredentials: Flow.ClientCredentials? = null,
+      val authorizationCode: Flow.AuthorizationCode? = null,
+    ) {
+      /**
+       * Returns a [Builder] initialized with this instance's properties, primarily for Java
+       * callers. Prefer it over `copy` from Java: `copy` takes every property positionally, so its
+       * signature changes whenever a property is added.
+       */
+      @AdkJavaInteropApi
+      fun toBuilder(): Builder =
+        Builder()
+          .implicit(implicit)
+          .password(password)
+          .clientCredentials(clientCredentials)
+          .authorizationCode(authorizationCode)
+
+      /**
+       * Fluent builder for [Flows], provided primarily for Java callers. Any property left unset
+       * falls back to the same default as the constructor.
+       */
+      @AdkJavaInteropApi
+      @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+      class Builder {
+        private var implicit: Flow.Implicit? = null
+        private var password: Flow.Password? = null
+        private var clientCredentials: Flow.ClientCredentials? = null
+        private var authorizationCode: Flow.AuthorizationCode? = null
+
+        fun implicit(implicit: Flow.Implicit?): Builder = apply { this.implicit = implicit }
+
+        fun password(password: Flow.Password?): Builder = apply { this.password = password }
+
+        fun clientCredentials(clientCredentials: Flow.ClientCredentials?): Builder = apply {
+          this.clientCredentials = clientCredentials
+        }
+
+        fun authorizationCode(authorizationCode: Flow.AuthorizationCode?): Builder = apply {
+          this.authorizationCode = authorizationCode
+        }
+
+        fun build(): Flows =
+          Flows(
+            implicit = implicit,
+            password = password,
+            clientCredentials = clientCredentials,
+            authorizationCode = authorizationCode,
+          )
+      }
+
+      companion object {
+        @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+      }
+    }
+
+    /** An OAuth2 flow: its endpoints and the scopes to request. */
+    @ExperimentalAuthApi
+    sealed interface Flow {
+      /** The endpoint for refreshing tokens. */
+      val refreshUrl: String?
+
+      /** The scopes to request, each mapped to its description. */
+      val scopes: Map<String, String>
+
+      /**
+       * The implicit flow.
+       *
+       * @property authorizationUrl The authorization endpoint.
+       * @property refreshUrl The endpoint for refreshing tokens.
+       * @property scopes The scopes to request, each mapped to its description.
+       */
+      @ExperimentalAuthApi
+      data class Implicit(
+        val authorizationUrl: String,
+        override val refreshUrl: String? = null,
+        override val scopes: Map<String, String> = emptyMap(),
+      ) : Flow {
+        /**
+         * Returns a [Builder] initialized with this instance's properties, primarily for Java
+         * callers. Prefer it over `copy` from Java: `copy` takes every property positionally, so
+         * its signature changes whenever a property is added.
+         */
+        @AdkJavaInteropApi
+        fun toBuilder(): Builder =
+          Builder().authorizationUrl(authorizationUrl).refreshUrl(refreshUrl).scopes(scopes)
+
+        /**
+         * Fluent builder for [Implicit], provided primarily for Java callers. Any property left
+         * unset falls back to the same default as the constructor.
+         */
+        @AdkJavaInteropApi
+        @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+        class Builder {
+          private var authorizationUrl: String? = null
+          private var refreshUrl: String? = null
+          private var scopes: Map<String, String> = emptyMap()
+
+          fun authorizationUrl(authorizationUrl: String): Builder = apply {
+            this.authorizationUrl = authorizationUrl
+          }
+
+          fun refreshUrl(refreshUrl: String?): Builder = apply { this.refreshUrl = refreshUrl }
+
+          fun scopes(scopes: Map<String, String>): Builder = apply { this.scopes = scopes }
+
+          fun build(): Implicit =
+            Implicit(
+              authorizationUrl =
+                checkNotNull(authorizationUrl) {
+                  "AuthScheme.OAuth2.Flow.Implicit.Builder requires authorizationUrl to be set."
+                },
+              refreshUrl = refreshUrl,
+              scopes = scopes,
+            )
+        }
+
+        companion object {
+          @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+        }
+      }
+
+      /**
+       * The resource owner password flow.
+       *
+       * @property tokenUrl The token endpoint.
+       * @property refreshUrl The endpoint for refreshing tokens.
+       * @property scopes The scopes to request, each mapped to its description.
+       */
+      @ExperimentalAuthApi
+      data class Password(
+        val tokenUrl: String,
+        override val refreshUrl: String? = null,
+        override val scopes: Map<String, String> = emptyMap(),
+      ) : Flow {
+        /**
+         * Returns a [Builder] initialized with this instance's properties, primarily for Java
+         * callers. Prefer it over `copy` from Java: `copy` takes every property positionally, so
+         * its signature changes whenever a property is added.
+         */
+        @AdkJavaInteropApi
+        fun toBuilder(): Builder =
+          Builder().tokenUrl(tokenUrl).refreshUrl(refreshUrl).scopes(scopes)
+
+        /**
+         * Fluent builder for [Password], provided primarily for Java callers. Any property left
+         * unset falls back to the same default as the constructor.
+         */
+        @AdkJavaInteropApi
+        @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+        class Builder {
+          private var tokenUrl: String? = null
+          private var refreshUrl: String? = null
+          private var scopes: Map<String, String> = emptyMap()
+
+          fun tokenUrl(tokenUrl: String): Builder = apply { this.tokenUrl = tokenUrl }
+
+          fun refreshUrl(refreshUrl: String?): Builder = apply { this.refreshUrl = refreshUrl }
+
+          fun scopes(scopes: Map<String, String>): Builder = apply { this.scopes = scopes }
+
+          fun build(): Password =
+            Password(
+              tokenUrl =
+                checkNotNull(tokenUrl) {
+                  "AuthScheme.OAuth2.Flow.Password.Builder requires tokenUrl to be set."
+                },
+              refreshUrl = refreshUrl,
+              scopes = scopes,
+            )
+        }
+
+        companion object {
+          @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+        }
+      }
+
+      /**
+       * The client credentials flow.
+       *
+       * @property tokenUrl The token endpoint.
+       * @property refreshUrl The endpoint for refreshing tokens.
+       * @property scopes The scopes to request, each mapped to its description.
+       */
+      @ExperimentalAuthApi
+      data class ClientCredentials(
+        val tokenUrl: String,
+        override val refreshUrl: String? = null,
+        override val scopes: Map<String, String> = emptyMap(),
+      ) : Flow {
+        /**
+         * Returns a [Builder] initialized with this instance's properties, primarily for Java
+         * callers. Prefer it over `copy` from Java: `copy` takes every property positionally, so
+         * its signature changes whenever a property is added.
+         */
+        @AdkJavaInteropApi
+        fun toBuilder(): Builder =
+          Builder().tokenUrl(tokenUrl).refreshUrl(refreshUrl).scopes(scopes)
+
+        /**
+         * Fluent builder for [ClientCredentials], provided primarily for Java callers. Any property
+         * left unset falls back to the same default as the constructor.
+         */
+        @AdkJavaInteropApi
+        @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+        class Builder {
+          private var tokenUrl: String? = null
+          private var refreshUrl: String? = null
+          private var scopes: Map<String, String> = emptyMap()
+
+          fun tokenUrl(tokenUrl: String): Builder = apply { this.tokenUrl = tokenUrl }
+
+          fun refreshUrl(refreshUrl: String?): Builder = apply { this.refreshUrl = refreshUrl }
+
+          fun scopes(scopes: Map<String, String>): Builder = apply { this.scopes = scopes }
+
+          fun build(): ClientCredentials =
+            ClientCredentials(
+              tokenUrl =
+                checkNotNull(tokenUrl) {
+                  "AuthScheme.OAuth2.Flow.ClientCredentials.Builder requires tokenUrl to be set."
+                },
+              refreshUrl = refreshUrl,
+              scopes = scopes,
+            )
+        }
+
+        companion object {
+          @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+        }
+      }
+
+      /**
+       * The authorization code flow.
+       *
+       * @property authorizationUrl The authorization endpoint.
+       * @property tokenUrl The token endpoint.
+       * @property refreshUrl The endpoint for refreshing tokens.
+       * @property scopes The scopes to request, each mapped to its description.
+       */
+      @ExperimentalAuthApi
+      data class AuthorizationCode(
+        val authorizationUrl: String,
+        val tokenUrl: String,
+        override val refreshUrl: String? = null,
+        override val scopes: Map<String, String> = emptyMap(),
+      ) : Flow {
+        /**
+         * Returns a [Builder] initialized with this instance's properties, primarily for Java
+         * callers. Prefer it over `copy` from Java: `copy` takes every property positionally, so
+         * its signature changes whenever a property is added.
+         */
+        @AdkJavaInteropApi
+        fun toBuilder(): Builder =
+          Builder()
+            .authorizationUrl(authorizationUrl)
+            .tokenUrl(tokenUrl)
+            .refreshUrl(refreshUrl)
+            .scopes(scopes)
+
+        /**
+         * Fluent builder for [AuthorizationCode], provided primarily for Java callers. Any property
+         * left unset falls back to the same default as the constructor.
+         */
+        @AdkJavaInteropApi
+        @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+        class Builder {
+          private var authorizationUrl: String? = null
+          private var tokenUrl: String? = null
+          private var refreshUrl: String? = null
+          private var scopes: Map<String, String> = emptyMap()
+
+          fun authorizationUrl(authorizationUrl: String): Builder = apply {
+            this.authorizationUrl = authorizationUrl
+          }
+
+          fun tokenUrl(tokenUrl: String): Builder = apply { this.tokenUrl = tokenUrl }
+
+          fun refreshUrl(refreshUrl: String?): Builder = apply { this.refreshUrl = refreshUrl }
+
+          fun scopes(scopes: Map<String, String>): Builder = apply { this.scopes = scopes }
+
+          fun build(): AuthorizationCode =
+            AuthorizationCode(
+              authorizationUrl =
+                checkNotNull(authorizationUrl) {
+                  "AuthScheme.OAuth2.Flow.AuthorizationCode.Builder requires authorizationUrl " +
+                    "to be set."
+                },
+              tokenUrl =
+                checkNotNull(tokenUrl) {
+                  "AuthScheme.OAuth2.Flow.AuthorizationCode.Builder requires tokenUrl to be set."
+                },
+              refreshUrl = refreshUrl,
+              scopes = scopes,
+            )
+        }
+
+        companion object {
+          @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+        }
+      }
+    }
+
+    /**
+     * Fluent builder for [OAuth2], provided primarily for Java callers. Any property left unset
+     * falls back to the same default as the constructor.
+     */
+    @AdkJavaInteropApi
+    @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+    class Builder {
+      private var flows: Flows? = null
+      private var issuerUrl: String? = null
+      private var description: String? = null
+
+      fun flows(flows: Flows): Builder = apply { this.flows = flows }
+
+      fun issuerUrl(issuerUrl: String?): Builder = apply { this.issuerUrl = issuerUrl }
+
+      fun description(description: String?): Builder = apply { this.description = description }
+
+      fun build(): OAuth2 =
+        OAuth2(
+          flows = checkNotNull(flows) { "AuthScheme.OAuth2.Builder requires flows to be set." },
+          issuerUrl = issuerUrl,
+          description = description,
+        )
+    }
+
+    companion object {
+      /**
+       * Returns a scheme with only the authorization code flow, for calls the client makes on a
+       * user's behalf after the user consents.
+       */
+      @JvmStatic
+      fun authorizationCode(
+        authorizationUrl: String,
+        tokenUrl: String,
+        scopes: Map<String, String>,
+      ): OAuth2 =
+        OAuth2(
+          flows =
+            Flows(
+              authorizationCode =
+                Flow.AuthorizationCode(
+                  authorizationUrl = authorizationUrl,
+                  tokenUrl = tokenUrl,
+                  scopes = scopes,
+                )
+            )
+        )
+
+      /**
+       * Returns a scheme with only the client credentials flow, for calls the client makes on its
+       * own behalf, with no user.
+       */
+      @JvmStatic
+      fun clientCredentials(tokenUrl: String, scopes: Map<String, String>): OAuth2 =
+        OAuth2(
+          flows =
+            Flows(clientCredentials = Flow.ClientCredentials(tokenUrl = tokenUrl, scopes = scopes))
+        )
+
+      @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+    }
+  }
 }
