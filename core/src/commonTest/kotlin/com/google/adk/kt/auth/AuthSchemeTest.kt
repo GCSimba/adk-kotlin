@@ -30,6 +30,18 @@ class AuthSchemeTest {
     assertEquals("apiKey", API_KEY.type)
     assertEquals("http", HTTP.type)
     assertEquals("oauth2", OAUTH2.type)
+    assertEquals("openIdConnect", OPEN_ID_CONNECT_URL.type)
+    assertEquals("openIdConnect", OPEN_ID_CONNECT.type)
+  }
+
+  @Test
+  fun toBuilder_openIdConnectUrl_matchesCopy() {
+    assertEquals(OPEN_ID_CONNECT_URL.copy(), OPEN_ID_CONNECT_URL.toBuilder().build())
+  }
+
+  @Test
+  fun toBuilder_openIdConnect_matchesCopy() {
+    assertEquals(OPEN_ID_CONNECT.copy(), OPEN_ID_CONNECT.toBuilder().build())
   }
 
   @Test
@@ -75,6 +87,20 @@ class AuthSchemeTest {
       AuthScheme.OAuth2.builder().flows(AuthScheme.OAuth2.Flows()).build(),
     )
     assertEquals(AuthScheme.OAuth2.Flows(), AuthScheme.OAuth2.Flows.builder().build())
+    assertEquals(
+      AuthScheme.OpenIdConnectUrl(openIdConnectUrl = DISCOVERY_URL),
+      AuthScheme.OpenIdConnectUrl.builder().openIdConnectUrl(DISCOVERY_URL).build(),
+    )
+    assertEquals(
+      AuthScheme.OpenIdConnect(
+        authorizationEndpoint = AUTHORIZATION_URL,
+        tokenEndpoint = TOKEN_URL,
+      ),
+      AuthScheme.OpenIdConnect.builder()
+        .authorizationEndpoint(AUTHORIZATION_URL)
+        .tokenEndpoint(TOKEN_URL)
+        .build(),
+    )
   }
 
   @Test
@@ -206,11 +232,46 @@ class AuthSchemeTest {
     )
   }
 
+  @Test
+  fun builder_openIdConnectUrlWithoutUrl_throws() {
+    assertFailsWith<IllegalStateException> { AuthScheme.OpenIdConnectUrl.builder().build() }
+  }
+
+  @Test
+  fun builder_openIdConnectWithoutAuthorizationEndpoint_throws() {
+    assertFailsWith<IllegalStateException> {
+      AuthScheme.OpenIdConnect.builder().tokenEndpoint(TOKEN_URL).build()
+    }
+  }
+
+  @Test
+  fun builder_openIdConnectWithoutTokenEndpoint_throws() {
+    assertFailsWith<IllegalStateException> {
+      AuthScheme.OpenIdConnect.builder().authorizationEndpoint(AUTHORIZATION_URL).build()
+    }
+  }
+
   private companion object {
     const val AUTHORIZATION_URL = "https://auth.example.com/authorize"
     const val TOKEN_URL = "https://auth.example.com/token"
     const val REFRESH_URL = "https://auth.example.com/refresh"
+    const val DISCOVERY_URL = "https://auth.example.com/.well-known/openid-configuration"
     val SCOPES = mapOf("openid" to "Sign in", "email" to "Read your email address")
+
+    val OPEN_ID_CONNECT_URL =
+      AuthScheme.OpenIdConnectUrl(openIdConnectUrl = DISCOVERY_URL, description = "OIDC discovery")
+
+    val OPEN_ID_CONNECT =
+      AuthScheme.OpenIdConnect(
+        authorizationEndpoint = AUTHORIZATION_URL,
+        tokenEndpoint = TOKEN_URL,
+        userinfoEndpoint = "https://auth.example.com/userinfo",
+        revocationEndpoint = "https://auth.example.com/revoke",
+        tokenEndpointAuthMethodsSupported = listOf("client_secret_basic", "private_key_jwt"),
+        grantTypesSupported = listOf("authorization_code", "refresh_token"),
+        scopes = listOf("openid", "email"),
+        description = "OIDC sign-in",
+      )
 
     val IMPLICIT =
       AuthScheme.OAuth2.Flow.Implicit(

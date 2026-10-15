@@ -22,8 +22,9 @@ import kotlin.jvm.JvmOverloads
 import kotlin.jvm.JvmStatic
 
 /**
- * How a service expects a tool to authenticate, such as with an API key or an HTTP credential. Each
- * scheme matches an OpenAPI security scheme.
+ * How a service expects a tool to authenticate, such as with an API key, an HTTP credential or
+ * OAuth2. Most schemes match OpenAPI security schemes; [OpenIdConnect] gives a provider's endpoints
+ * directly.
  */
 @ExperimentalAuthApi
 sealed interface AuthScheme {
@@ -555,6 +556,172 @@ sealed interface AuthScheme {
             Flows(clientCredentials = Flow.ClientCredentials(tokenUrl = tokenUrl, scopes = scopes))
         )
 
+      @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+    }
+  }
+
+  /**
+   * An OpenID Connect scheme given by the provider's discovery URL.
+   *
+   * @property openIdConnectUrl The provider's OpenID Connect discovery URL.
+   * @property description A description of the scheme.
+   */
+  @ExperimentalAuthApi
+  data class OpenIdConnectUrl(val openIdConnectUrl: String, val description: String? = null) :
+    AuthScheme {
+    override val type: String
+      get() = "openIdConnect"
+
+    /**
+     * Returns a [Builder] initialized with this instance's properties, primarily for Java callers.
+     * Prefer it over `copy` from Java: `copy` takes every property positionally, so its signature
+     * changes whenever a property is added.
+     */
+    @AdkJavaInteropApi
+    fun toBuilder(): Builder = Builder().openIdConnectUrl(openIdConnectUrl).description(description)
+
+    /**
+     * Fluent builder for [OpenIdConnectUrl], provided primarily for Java callers. Any property left
+     * unset falls back to the same default as the constructor.
+     */
+    @AdkJavaInteropApi
+    @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+    class Builder {
+      private var openIdConnectUrl: String? = null
+      private var description: String? = null
+
+      fun openIdConnectUrl(openIdConnectUrl: String): Builder = apply {
+        this.openIdConnectUrl = openIdConnectUrl
+      }
+
+      fun description(description: String?): Builder = apply { this.description = description }
+
+      fun build(): OpenIdConnectUrl =
+        OpenIdConnectUrl(
+          openIdConnectUrl =
+            checkNotNull(openIdConnectUrl) {
+              "AuthScheme.OpenIdConnectUrl.Builder requires openIdConnectUrl to be set."
+            },
+          description = description,
+        )
+    }
+
+    companion object {
+      @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+    }
+  }
+
+  /**
+   * An OpenID Connect scheme with the provider's endpoints given directly.
+   *
+   * @property authorizationEndpoint The authorization endpoint.
+   * @property tokenEndpoint The token endpoint.
+   * @property userinfoEndpoint The UserInfo endpoint.
+   * @property revocationEndpoint The token revocation endpoint.
+   * @property tokenEndpointAuthMethodsSupported The ways a client can authenticate to the token
+   *   endpoint, such as `client_secret_basic`.
+   * @property grantTypesSupported The OAuth2 grant types the provider supports, such as
+   *   `authorization_code`.
+   * @property scopes The scopes to request.
+   * @property description A description of the scheme.
+   */
+  @ExperimentalAuthApi
+  data class OpenIdConnect(
+    val authorizationEndpoint: String,
+    val tokenEndpoint: String,
+    val userinfoEndpoint: String? = null,
+    val revocationEndpoint: String? = null,
+    val tokenEndpointAuthMethodsSupported: List<String>? = null,
+    val grantTypesSupported: List<String>? = null,
+    val scopes: List<String>? = null,
+    val description: String? = null,
+  ) : AuthScheme {
+    override val type: String
+      get() = "openIdConnect"
+
+    /**
+     * Returns a [Builder] initialized with this instance's properties, primarily for Java callers.
+     * Prefer it over `copy` from Java: `copy` takes every property positionally, so its signature
+     * changes whenever a property is added.
+     */
+    @AdkJavaInteropApi
+    fun toBuilder(): Builder =
+      Builder()
+        .authorizationEndpoint(authorizationEndpoint)
+        .tokenEndpoint(tokenEndpoint)
+        .userinfoEndpoint(userinfoEndpoint)
+        .revocationEndpoint(revocationEndpoint)
+        .tokenEndpointAuthMethodsSupported(tokenEndpointAuthMethodsSupported)
+        .grantTypesSupported(grantTypesSupported)
+        .scopes(scopes)
+        .description(description)
+
+    /**
+     * Fluent builder for [OpenIdConnect], provided primarily for Java callers. Any property left
+     * unset falls back to the same default as the constructor.
+     */
+    @AdkJavaInteropApi
+    @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+    class Builder {
+      private var authorizationEndpoint: String? = null
+      private var tokenEndpoint: String? = null
+      private var userinfoEndpoint: String? = null
+      private var revocationEndpoint: String? = null
+      private var tokenEndpointAuthMethodsSupported: List<String>? = null
+      private var grantTypesSupported: List<String>? = null
+      private var scopes: List<String>? = null
+      private var description: String? = null
+
+      fun authorizationEndpoint(authorizationEndpoint: String): Builder = apply {
+        this.authorizationEndpoint = authorizationEndpoint
+      }
+
+      fun tokenEndpoint(tokenEndpoint: String): Builder = apply {
+        this.tokenEndpoint = tokenEndpoint
+      }
+
+      fun userinfoEndpoint(userinfoEndpoint: String?): Builder = apply {
+        this.userinfoEndpoint = userinfoEndpoint
+      }
+
+      fun revocationEndpoint(revocationEndpoint: String?): Builder = apply {
+        this.revocationEndpoint = revocationEndpoint
+      }
+
+      fun tokenEndpointAuthMethodsSupported(
+        tokenEndpointAuthMethodsSupported: List<String>?
+      ): Builder = apply {
+        this.tokenEndpointAuthMethodsSupported = tokenEndpointAuthMethodsSupported
+      }
+
+      fun grantTypesSupported(grantTypesSupported: List<String>?): Builder = apply {
+        this.grantTypesSupported = grantTypesSupported
+      }
+
+      fun scopes(scopes: List<String>?): Builder = apply { this.scopes = scopes }
+
+      fun description(description: String?): Builder = apply { this.description = description }
+
+      fun build(): OpenIdConnect =
+        OpenIdConnect(
+          authorizationEndpoint =
+            checkNotNull(authorizationEndpoint) {
+              "AuthScheme.OpenIdConnect.Builder requires authorizationEndpoint to be set."
+            },
+          tokenEndpoint =
+            checkNotNull(tokenEndpoint) {
+              "AuthScheme.OpenIdConnect.Builder requires tokenEndpoint to be set."
+            },
+          userinfoEndpoint = userinfoEndpoint,
+          revocationEndpoint = revocationEndpoint,
+          tokenEndpointAuthMethodsSupported = tokenEndpointAuthMethodsSupported,
+          grantTypesSupported = grantTypesSupported,
+          scopes = scopes,
+          description = description,
+        )
+    }
+
+    companion object {
       @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
     }
   }
