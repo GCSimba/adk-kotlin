@@ -47,11 +47,17 @@ import com.google.adk.kt.testing.DummyModel
 import com.google.adk.kt.testing.DummyTool
 import com.google.adk.kt.testing.DummyTracer
 import com.google.adk.kt.testing.TRANSFER_TO_AGENT_RESPONSE_PART
+import com.google.adk.kt.testing.connectionDrop
+import com.google.adk.kt.testing.goAway
+import com.google.adk.kt.testing.handleUpdate
+import com.google.adk.kt.testing.inputTranscription
 import com.google.adk.kt.testing.modelFunctionCallResponse
 import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.testing.modelTransferToAgentResponse
+import com.google.adk.kt.testing.outputTranscription
 import com.google.adk.kt.testing.simplifyEvents
 import com.google.adk.kt.testing.transferToAgentCallPart
+import com.google.adk.kt.testing.turnComplete
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.tools.FunctionTool
 import com.google.adk.kt.tools.ToolContext
@@ -305,19 +311,15 @@ class LlmAgentTurnTest {
     val model =
       DummyModel("transcribing-model") {
         flow {
-          emit(LlmResponse(outputTranscription = Transcription(text = "hi", finished = true)))
-          emit(LlmResponse(inputTranscription = Transcription(text = "hey", finished = true)))
+          emit(outputTranscription("hi", finished = true))
+          emit(inputTranscription("hey", finished = true))
           emit(
             LlmResponse(
               voiceActivity = VoiceActivity(voiceActivityType = VoiceActivityType.ACTIVITY_START)
             )
           )
-          emit(
-            LlmResponse(
-              liveSessionResumptionUpdate = LiveServerSessionResumptionUpdate(newHandle = "h")
-            )
-          )
-          emit(LlmResponse(turnComplete = true))
+          emit(handleUpdate("h"))
+          emit(turnComplete())
           emit(LlmResponse(content = modelMessage("Hello.")))
         }
       }
@@ -477,9 +479,7 @@ class LlmAgentTurnTest {
     // Only a live run keeps a usage-only response; the turn-based test above checks the other case.
     val usage = UsageMetadata(totalTokenCount = 7)
     val connection =
-      RecordingLiveConnection(
-        listOf(LlmResponse(usageMetadata = usage), LlmResponse(turnComplete = true))
-      )
+      RecordingLiveConnection(listOf(LlmResponse(usageMetadata = usage), turnComplete()))
     val agent = liveAgent(connection)
 
     val events = agent.runLive(liveContextFor(agent)).toList()
@@ -492,9 +492,7 @@ class LlmAgentTurnTest {
     // The live counterpart of the turn-based drop test above: a live run keeps the signal.
     val spoken = Transcription(text = "hello there", finished = true)
     val connection =
-      RecordingLiveConnection(
-        listOf(LlmResponse(outputTranscription = spoken), LlmResponse(turnComplete = true))
-      )
+      RecordingLiveConnection(listOf(LlmResponse(outputTranscription = spoken), turnComplete()))
     val agent = liveAgent(connection)
 
     val events = agent.runLive(liveContextFor(agent)).toList()
@@ -511,7 +509,7 @@ class LlmAgentTurnTest {
         listOf(
           LlmResponse(voiceActivity = activity),
           LlmResponse(liveSessionResumptionUpdate = update),
-          LlmResponse(turnComplete = true),
+          turnComplete(),
         )
       )
     val agent = liveAgent(connection)
@@ -530,9 +528,7 @@ class LlmAgentTurnTest {
     // Transcribed input is the user's words; the agent as author would misattribute them.
     val heard = Transcription(text = "is the room free", finished = false)
     val connection =
-      RecordingLiveConnection(
-        listOf(LlmResponse(inputTranscription = heard), LlmResponse(turnComplete = true))
-      )
+      RecordingLiveConnection(listOf(LlmResponse(inputTranscription = heard), turnComplete()))
     val agent = liveAgent(connection)
 
     val events = agent.runLive(liveContextFor(agent)).toList()
@@ -544,10 +540,7 @@ class LlmAgentTurnTest {
   fun runLive_serverContentMarkedUser_isAttributedToTheUser() = runBlocking {
     // User-role content is the user's too; the transcription test above does not cover it.
     val spoken = Content(Role.USER, listOf(Part(text = "book it")))
-    val connection =
-      RecordingLiveConnection(
-        listOf(LlmResponse(content = spoken), LlmResponse(turnComplete = true))
-      )
+    val connection = RecordingLiveConnection(listOf(LlmResponse(content = spoken), turnComplete()))
     val agent = liveAgent(connection)
 
     val events = agent.runLive(liveContextFor(agent)).toList()
@@ -557,7 +550,7 @@ class LlmAgentTurnTest {
 
   @Test
   fun runLive_sessionHistory_seedsTheConnection() = runBlocking {
-    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val connection = RecordingLiveConnection(listOf(turnComplete()))
     val agent = liveAgent(connection)
 
     agent.runLive(liveContextFor(agent, session = sessionWithEarlierMessage())).toList()
@@ -571,7 +564,7 @@ class LlmAgentTurnTest {
   @Test
   fun runLive_callersResumptionHandle_skipsTheHistory() = runBlocking {
     // The server already holds a resumed session's history, as ADK Python assumes.
-    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val connection = RecordingLiveConnection(listOf(turnComplete()))
     val agent = liveAgent(connection)
     val runConfig = RunConfig(sessionResumption = SessionResumptionConfig(handle = "h-1"))
     // The caller handle makes a clean close reconnect now, so the caller closes to end the run.
@@ -589,7 +582,7 @@ class LlmAgentTurnTest {
 
   @Test
   fun runLive_emptyHistory_doesNotSeedTheConnection() = runBlocking {
-    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val connection = RecordingLiveConnection(listOf(turnComplete()))
     val agent = liveAgent(connection)
 
     agent.runLive(liveContextFor(agent)).toList()
@@ -603,7 +596,7 @@ class LlmAgentTurnTest {
     Telemetry.setTracerForTest(tracer)
     TelemetryConfig.captureMessageContent = false
     try {
-      val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val connection = RecordingLiveConnection(listOf(turnComplete()))
       val agent = liveAgent(connection)
       val context = liveContextFor(agent, session = sessionWithEarlierMessage())
 
@@ -626,7 +619,7 @@ class LlmAgentTurnTest {
 
   @Test
   fun runLive_seedingHistory_sendsTheHistoryInsideTheSendDataSpan() = runBlocking {
-    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val connection = RecordingLiveConnection(listOf(turnComplete()))
     Telemetry.setTracerForTest(SpanLoggingTracer(connection.log))
     try {
       val agent = liveAgent(connection)
@@ -647,7 +640,7 @@ class LlmAgentTurnTest {
     val tracer = DummyTracer()
     Telemetry.setTracerForTest(tracer)
     try {
-      val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val connection = RecordingLiveConnection(listOf(turnComplete()))
       val agent = liveAgent(connection)
 
       agent.runLive(liveContextFor(agent)).toList()
@@ -664,7 +657,7 @@ class LlmAgentTurnTest {
     Telemetry.setTracerForTest(tracer)
     try {
       repeat(2) {
-        val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+        val connection = RecordingLiveConnection(listOf(turnComplete()))
         val agent = liveAgent(connection)
         agent.runLive(liveContextFor(agent, session = sessionWithEarlierMessage())).toList()
       }
@@ -685,7 +678,7 @@ class LlmAgentTurnTest {
     Telemetry.setTracerForTest(tracer)
     TelemetryConfig.captureMessageContent = true
     try {
-      val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val connection = RecordingLiveConnection(listOf(turnComplete()))
       val agent = liveAgent(connection)
       val history =
         userMessage(
@@ -720,7 +713,7 @@ class LlmAgentTurnTest {
     val tracer = DummyTracer()
     Telemetry.setTracerForTest(tracer)
     try {
-      val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val connection = RecordingLiveConnection(listOf(turnComplete()))
       val agent = liveAgent(connection)
       val runConfig = RunConfig(sessionResumption = SessionResumptionConfig(handle = "h-1"))
       // The caller handle makes a clean close reconnect now, so the caller closes to end the run.
@@ -799,8 +792,8 @@ class LlmAgentTurnTest {
   fun runLive_secondTurn_isReadOnTheSameConnection() = runBlocking {
     val connection =
       RecordingLiveConnection(
-        listOf(LlmResponse(content = modelMessage("first")), LlmResponse(turnComplete = true)),
-        listOf(LlmResponse(content = modelMessage("second")), LlmResponse(turnComplete = true)),
+        listOf(LlmResponse(content = modelMessage("first")), turnComplete()),
+        listOf(LlmResponse(content = modelMessage("second")), turnComplete()),
       )
     val agent = liveAgent(connection)
 
@@ -1017,8 +1010,7 @@ class LlmAgentTurnTest {
 
   @Test
   fun executeLive_requestPreparationEndsTheInvocation_doesNotConnect() = runBlocking {
-    val model =
-      RecordingLiveModel(RecordingLiveConnection(listOf(LlmResponse(turnComplete = true))))
+    val model = RecordingLiveModel(RecordingLiveConnection(listOf(turnComplete())))
     val agent = LlmAgent(name = "LiveAgent", model = model)
     val context = liveContextFor(agent)
     val ending =
@@ -1157,7 +1149,7 @@ class LlmAgentTurnTest {
         RecordingLiveConnection(
           listOf(
             LlmResponse(outputTranscription = Transcription(text = "hi"), partial = true),
-            LlmResponse(turnComplete = true),
+            turnComplete(),
           )
         ),
         afterModelCallbacks =
@@ -1191,10 +1183,7 @@ class LlmAgentTurnTest {
     val agent =
       liveAgent(
         RecordingLiveConnection(
-          listOf(
-            LlmResponse(outputTranscription = Transcription(text = "hi")),
-            LlmResponse(turnComplete = true),
-          )
+          listOf(LlmResponse(outputTranscription = Transcription(text = "hi")), turnComplete())
         ),
         afterModelCallbacks =
           listOf(
@@ -1230,13 +1219,10 @@ class LlmAgentTurnTest {
         listOf(
           LlmResponse(outputTranscription = Transcription(text = "Hel")),
           LlmResponse(outputTranscription = Transcription(text = "lo")),
-          LlmResponse(outputTranscription = Transcription(text = "Hello", finished = true)),
-          LlmResponse(turnComplete = true),
+          outputTranscription("Hello", finished = true),
+          turnComplete(),
         ),
-        listOf(
-          LlmResponse(outputTranscription = Transcription(text = "Bye")),
-          LlmResponse(turnComplete = true),
-        ),
+        listOf(LlmResponse(outputTranscription = Transcription(text = "Bye")), turnComplete()),
       )
     val agent =
       liveAgent(
@@ -1262,9 +1248,7 @@ class LlmAgentTurnTest {
   fun runLive_afterModelCallback_skipsResponsesWithoutOutputTranscription() = runBlocking {
     var calls = 0
     val connection =
-      RecordingLiveConnection(
-        listOf(LlmResponse(content = modelMessage("hi")), LlmResponse(turnComplete = true))
-      )
+      RecordingLiveConnection(listOf(LlmResponse(content = modelMessage("hi")), turnComplete()))
     val agent =
       liveAgent(
         connection,
@@ -1291,10 +1275,10 @@ class LlmAgentTurnTest {
           listOf(
             LlmResponse(outputTranscription = Transcription(text = "secret")),
             LlmResponse(content = modelMessage("never seen")),
-            LlmResponse(turnComplete = true),
+            turnComplete(),
           )
         )
-      val second = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val second = RecordingLiveConnection(listOf(turnComplete()))
       val model = RecordingLiveModel(first, second)
       val agent =
         LlmAgent(
@@ -1334,12 +1318,12 @@ class LlmAgentTurnTest {
         RecordingLiveConnection(
           listOf(
             LlmResponse(inputTranscription = Transcription(text = "forbid")),
-            LlmResponse(inputTranscription = Transcription(text = "forbidden", finished = true)),
+            inputTranscription("forbidden", finished = true),
             LlmResponse(content = modelMessage("never seen")),
-            LlmResponse(turnComplete = true),
+            turnComplete(),
           )
         )
-      val second = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+      val second = RecordingLiveConnection(listOf(turnComplete()))
       val model = RecordingLiveModel(first, second)
       val agent =
         LlmAgent(
@@ -1401,10 +1385,7 @@ class LlmAgentTurnTest {
     // Each session speaks once, then a handle-less go-away, which reopens a fresh session.
     fun goAwayTurn() =
       RecordingLiveConnection(
-        listOf(
-          LlmResponse(content = modelMessage("x"), turnComplete = true),
-          LlmResponse(goAway = LiveServerGoAway()),
-        )
+        listOf(LlmResponse(content = modelMessage("x"), turnComplete = true), goAway())
       )
     val model =
       RecordingLiveModel(
@@ -1476,10 +1457,7 @@ class LlmAgentTurnTest {
     val queue = LiveRequestQueue()
     val first =
       RecordingLiveConnection(
-        listOf(
-          LlmResponse(outputTranscription = Transcription(text = "secret")),
-          LlmResponse(turnComplete = true),
-        )
+        listOf(LlmResponse(outputTranscription = Transcription(text = "secret")), turnComplete())
       )
     val second = RecordingLiveConnection(untilClosed = true)
     // The input arrives only after the first sender has stopped, so only the restart can read it.
@@ -1514,12 +1492,9 @@ class LlmAgentTurnTest {
   fun runLive_restartAfterABlockedTurn_replaysItEvenWhenTheCallerStoresItSlowly() = runBlocking {
     val first =
       RecordingLiveConnection(
-        listOf(
-          LlmResponse(outputTranscription = Transcription(text = "secret")),
-          LlmResponse(turnComplete = true),
-        )
+        listOf(LlmResponse(outputTranscription = Transcription(text = "secret")), turnComplete())
       )
-    val second = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val second = RecordingLiveConnection(listOf(turnComplete()))
     val model = RecordingLiveModel(first, second)
     val agent =
       LlmAgent(
@@ -1622,7 +1597,7 @@ class LlmAgentTurnTest {
         override val name = "child-model"
 
         override suspend fun connect(request: LlmRequest): LiveConnection =
-          RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+          RecordingLiveConnection(listOf(turnComplete()))
 
         override fun generateContent(request: LlmRequest, stream: Boolean): Flow<LlmResponse> =
           flow {
@@ -1646,7 +1621,7 @@ class LlmAgentTurnTest {
                 listOf(Part(functionCall = FunctionCall("hand_off", emptyMap(), id = "t1"))),
               )
           ),
-          LlmResponse(turnComplete = true),
+          turnComplete(),
         )
       )
     val root =
@@ -1692,7 +1667,7 @@ class LlmAgentTurnTest {
     val agent =
       liveAgent(
         RecordingLiveConnection(
-          listOf(LlmResponse(content = modelMessage("hi")), LlmResponse(turnComplete = true)),
+          listOf(LlmResponse(content = modelMessage("hi")), turnComplete()),
           untilClosed = true,
         ),
         beforeModelCallbacks = listOf(writeStateAndContinue("c", "d")),
@@ -1725,7 +1700,7 @@ class LlmAgentTurnTest {
     val agent =
       liveAgent(
         RecordingLiveConnection(
-          listOf(LlmResponse(content = modelMessage("hi")), LlmResponse(turnComplete = true)),
+          listOf(LlmResponse(content = modelMessage("hi")), turnComplete()),
           untilClosed = true,
         ),
         beforeModelCallbacks = listOf(writeStateAndContinue("c", "d")),
@@ -1764,12 +1739,12 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         committed.await()
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     first.onSendContent = { c -> firstSent += c.parts.mapNotNull { it.text } }
     val second =
       ScriptedConn("c1") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -1812,12 +1787,12 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         committed.await()
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     first.onSendContent = { c -> firstSent += c.parts.mapNotNull { it.text } }
     val second =
       ScriptedConn("c1") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -2252,10 +2227,7 @@ class LlmAgentTurnTest {
     )
 
   private fun outputKeyAgent(response: LlmResponse) =
-    liveAgent(
-      RecordingLiveConnection(listOf(response, LlmResponse(turnComplete = true))),
-      outputKey = "answer",
-    )
+    liveAgent(RecordingLiveConnection(listOf(response, turnComplete())), outputKey = "answer")
 
   /** A model turn that calls `my_function`, then completes. */
   private fun toolCallTurn(liveSessionId: String? = null): List<LlmResponse> =
@@ -2268,7 +2240,7 @@ class LlmAgentTurnTest {
           ),
         liveSessionId = liveSessionId,
       ),
-      LlmResponse(turnComplete = true),
+      turnComplete(),
     )
 
   /** Writes state [key] = [value] and lets the input through. */
@@ -2312,10 +2284,7 @@ class LlmAgentTurnTest {
   /** A turn whose output transcription reads "secret", then completes. */
   private fun secretTurn() =
     RecordingLiveConnection(
-      listOf(
-        LlmResponse(outputTranscription = Transcription(text = "secret")),
-        LlmResponse(turnComplete = true),
-      )
+      listOf(LlmResponse(outputTranscription = Transcription(text = "secret")), turnComplete())
     )
 
   /** A turn whose first chunk is a partial output transcription reading "secret". */
@@ -2323,7 +2292,7 @@ class LlmAgentTurnTest {
     RecordingLiveConnection(
       listOf(
         LlmResponse(outputTranscription = Transcription(text = "secret"), partial = true),
-        LlmResponse(turnComplete = true),
+        turnComplete(),
       )
     )
 
@@ -2515,7 +2484,7 @@ class LlmAgentTurnTest {
 
   @Test
   fun runLive_callersResumptionHandle_resumesTheFirstConnectionFromIt() = runBlocking {
-    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val connection = RecordingLiveConnection(listOf(turnComplete()))
     val model = RecordingLiveModel(connection)
     val agent = LlmAgent(name = "live_agent", description = "A live agent.", model = model)
     val runConfig = RunConfig(sessionResumption = SessionResumptionConfig(handle = "h-1"))
@@ -2574,9 +2543,6 @@ class LlmAgentTurnTest {
     }
   }
 
-  private fun handleUpdate(handle: String): LlmResponse =
-    LlmResponse(liveSessionResumptionUpdate = LiveServerSessionResumptionUpdate(newHandle = handle))
-
   @Test
   fun runLive_reconnectAfterADrop_closesEachConnectionOnce() = runTest {
     // The close-once flag is per connection, so a reconnect's new connection is also closed once.
@@ -2584,7 +2550,7 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     val second = ScriptedConn("c1") { it.closed.await() }
     val model = RecordingLiveModel(first, second) { connects -> if (connects == 2) queue.close() }
@@ -2618,7 +2584,7 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
-        emit(LlmResponse(goAway = LiveServerGoAway()))
+        emit(goAway())
       }
     // conn2 resumes, waits for the re-sent "first", takes a new "second", then ends the run.
     val firstResent = CompletableDeferred<Unit>()
@@ -2667,11 +2633,11 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     val third =
       ScriptedConn("c2") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -2698,11 +2664,7 @@ class LlmAgentTurnTest {
   @Test
   fun runLive_firstOpenDropsWithoutAHandle_failsAtOnce() = runBlocking {
     // With no handle to resume from, a drop while opening fails the run as any drop does.
-    val openFailure =
-      IllegalStateException(
-        "The live session failed to open.",
-        GenAiApiException(1006, "ConnectionClosed", "socket closed"),
-      )
+    val openFailure = IllegalStateException("The live session failed to open.", connectionDrop())
     val model =
       RecordingLiveModel(ScriptedConn("unused") {}) { connects ->
         if (connects == 1) throw openFailure
@@ -2725,7 +2687,7 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     val second = ScriptedConn("c1") { it.closed.await() }
     val model =
@@ -2764,13 +2726,10 @@ class LlmAgentTurnTest {
           if (connects == 1) {
             return ScriptedConn("c0") {
               emit(handleUpdate("h-1"))
-              throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+              throw connectionDrop()
             }
           }
-          throw IllegalStateException(
-            "The live session failed to open.",
-            GenAiApiException(1006, "ConnectionClosed", "socket closed"),
-          )
+          throw IllegalStateException("The live session failed to open.", connectionDrop())
         }
       }
     val agent = LlmAgent(name = "live_agent", model = model)
@@ -2806,14 +2765,14 @@ class LlmAgentTurnTest {
     val connection =
       ScriptedConn("c0") {
         emit(handleUpdate("h-old"))
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         emit(
           LlmResponse(
             liveSessionResumptionUpdate =
               LiveServerSessionResumptionUpdate(newHandle = null, resumable = false)
           )
         )
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     val model = RecordingLiveModel(connection)
     val agent = LlmAgent(name = "live_agent", model = model)
@@ -2856,7 +2815,7 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
-        emit(LlmResponse(goAway = LiveServerGoAway()))
+        emit(goAway())
         it.closed.await()
       }
     val second =
@@ -2895,7 +2854,7 @@ class LlmAgentTurnTest {
           val first = connects == 1
           return ScriptedConn("c$connects") {
             if (first) emit(handleUpdate("h-1"))
-            throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+            throw connectionDrop()
           }
         }
       }
@@ -2926,23 +2885,20 @@ class LlmAgentTurnTest {
             1 ->
               ScriptedConn("c1") {
                 emit(handleUpdate("h-1"))
-                throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+                throw connectionDrop()
               }
             5 ->
               ScriptedConn("c5") {
-                emit(LlmResponse(turnComplete = true))
-                throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+                emit(turnComplete())
+                throw connectionDrop()
               }
             10 ->
               ScriptedConn("c10") {
-                emit(LlmResponse(turnComplete = true))
+                emit(turnComplete())
                 queue.close()
                 it.closed.await()
               }
-            else ->
-              ScriptedConn("c$connects") {
-                throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
-              }
+            else -> ScriptedConn("c$connects") { throw connectionDrop() }
           }
         }
       }
@@ -2989,7 +2945,7 @@ class LlmAgentTurnTest {
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
         mayDrop.await()
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     first.onSendContent = {
       sendStarted.complete(Unit)
@@ -3019,7 +2975,7 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         emit(LlmResponse(content = modelMessage("hi"), turnComplete = true))
-        emit(LlmResponse(goAway = LiveServerGoAway()))
+        emit(goAway())
       }
     val second =
       ScriptedConn("c1") {
@@ -3068,7 +3024,7 @@ class LlmAgentTurnTest {
           return if (connects <= 7) {
             ScriptedConn("c$connects") {
               if (withHandle) emit(handleUpdate("h"))
-              emit(LlmResponse(goAway = LiveServerGoAway()))
+              emit(goAway())
             }
           } else {
             ScriptedConn("c$connects") {
@@ -3097,11 +3053,11 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         callbackRan.await()
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     val second =
       ScriptedConn("c1") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -3264,7 +3220,7 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
-        emit(LlmResponse(goAway = LiveServerGoAway()))
+        emit(goAway())
         it.closed.await()
       }
     first.onSendContent = { awaitCancellation() }
@@ -3286,11 +3242,11 @@ class LlmAgentTurnTest {
       ScriptedConn("c0") {
         emit(LlmResponse(content = modelMessage("hi"), turnComplete = true))
         emit(handleUpdate(""))
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     val second =
       ScriptedConn("c1") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -3339,7 +3295,7 @@ class LlmAgentTurnTest {
       }
     val second =
       ScriptedConn("c1") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -3361,7 +3317,7 @@ class LlmAgentTurnTest {
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
         job?.cancel()
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     val second = ScriptedConn("c1") { it.closed.await() }
     val model = RecordingLiveModel(first, second)
@@ -3391,7 +3347,7 @@ class LlmAgentTurnTest {
       ScriptedConn("c0") {
         emit(LlmResponse(content = modelMessage("hi"), turnComplete = true))
         duringSeen.await()
-        emit(LlmResponse(goAway = LiveServerGoAway()))
+        emit(goAway())
       }
     // The first connection persists "during" before signalling, so the restart can rebuild with it.
     first.onSendContent = { content ->
@@ -3399,7 +3355,7 @@ class LlmAgentTurnTest {
     }
     val second =
       ScriptedConn("c1") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -3423,11 +3379,11 @@ class LlmAgentTurnTest {
     fun goAwayTurn() =
       ScriptedConn("c") {
         emit(LlmResponse(content = modelMessage("hi"), turnComplete = true))
-        emit(LlmResponse(goAway = LiveServerGoAway()))
+        emit(goAway())
       }
     val last =
       ScriptedConn("last") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -3479,11 +3435,11 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         gate.complete(Unit)
-        emit(LlmResponse(goAway = LiveServerGoAway()))
+        emit(goAway())
       }
     first.onSendContent = {
       gate.await()
-      throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+      throw connectionDrop()
     }
     val second =
       ScriptedConn("c1") {
@@ -3512,7 +3468,7 @@ class LlmAgentTurnTest {
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
         sendFailed.await()
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     first.onSendContent = {
       sendFailed.complete(Unit)
@@ -3523,7 +3479,7 @@ class LlmAgentTurnTest {
     val second =
       ScriptedConn("c1") {
         resent.await()
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -3562,7 +3518,7 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         gate.complete(Unit)
-        emit(LlmResponse(goAway = LiveServerGoAway()))
+        emit(goAway())
       }
     first.onSendContent = {
       gate.await()
@@ -3704,7 +3660,7 @@ class LlmAgentTurnTest {
     val second =
       ScriptedConn("c1") {
         resent.await()
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -3732,11 +3688,11 @@ class LlmAgentTurnTest {
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
         handling.await()
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     val second =
       ScriptedConn("c1") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -3785,14 +3741,14 @@ class LlmAgentTurnTest {
       }
     first.onSendContent = {
       handling.await()
-      throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+      throw connectionDrop()
     }
     val resent = CompletableDeferred<Unit>()
     val secondSent = mutableListOf<String>()
     val second =
       ScriptedConn("c1") {
         resent.await()
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -3822,7 +3778,7 @@ class LlmAgentTurnTest {
   @Test
   fun runLive_callersEmptyResumptionHandle_stillSeedsTheHistory() = runBlocking {
     // An empty handle names no session to resume, so the run starts fresh and sends history.
-    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val connection = RecordingLiveConnection(listOf(turnComplete()))
     val agent = liveAgent(connection)
     val runConfig = RunConfig(sessionResumption = SessionResumptionConfig(handle = ""))
 
@@ -3837,7 +3793,7 @@ class LlmAgentTurnTest {
   fun runLive_partialContent_isNotRecordedInTheSession() = runBlocking {
     val sessionService = InMemorySessionService()
     val key = SessionKey("app", "user", "partial")
-    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val connection = RecordingLiveConnection(listOf(turnComplete()))
     val agent = liveAgent(connection)
     val queue = LiveRequestQueue()
     queue.sendContent(userMessage("half"), partial = true)
@@ -3865,7 +3821,7 @@ class LlmAgentTurnTest {
   fun runLive_toolAnswerFromTheCaller_isNotRecordedAsAUserTurn() = runBlocking {
     val sessionService = InMemorySessionService()
     val key = SessionKey("app", "user", "tool-answer")
-    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val connection = RecordingLiveConnection(listOf(turnComplete()))
     val agent = liveAgent(connection)
     val queue = LiveRequestQueue()
     queue.sendContent(
@@ -3902,10 +3858,7 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         emit(handleUpdate("h-1"))
-        throw IllegalStateException(
-          "wrapped",
-          GenAiApiException(1006, "ConnectionClosed", "socket closed"),
-        )
+        throw IllegalStateException("wrapped", connectionDrop())
       }
     val second = ScriptedConn("c1") { it.closed.await() }
     val model = RecordingLiveModel(first, second)
@@ -3929,7 +3882,7 @@ class LlmAgentTurnTest {
           connects++
           if (connects == 1) {
             throw kotlinx.coroutines.CancellationException("open cancelled").apply {
-              initCause(GenAiApiException(1006, "ConnectionClosed", "socket closed"))
+              initCause(connectionDrop())
             }
           }
           // Reached only by a retry; closing the queue lets that run end on its own.
@@ -3963,12 +3916,12 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         committed.await()
-        throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+        throw connectionDrop()
       }
     first.onSendRealtime = { firstSent++ }
     val second =
       ScriptedConn("c1") {
-        emit(LlmResponse(turnComplete = true))
+        emit(turnComplete())
         queue.close()
         it.closed.await()
       }
@@ -4002,7 +3955,7 @@ class LlmAgentTurnTest {
     val first =
       ScriptedConn("c0") {
         it.closed.await()
-        emit(LlmResponse(goAway = LiveServerGoAway()))
+        emit(goAway())
       }
     val second = ScriptedConn("c1") { it.closed.await() }
     val model = RecordingLiveModel(first, second)
@@ -4018,7 +3971,7 @@ class LlmAgentTurnTest {
     // Live user events carry no branch, as ADK Python's live user events do not.
     val sessionService = InMemorySessionService()
     val key = SessionKey("app", "user", "branch")
-    val connection = RecordingLiveConnection(listOf(LlmResponse(turnComplete = true)))
+    val connection = RecordingLiveConnection(listOf(turnComplete()))
     val agent = liveAgent(connection)
     val queue = LiveRequestQueue()
     queue.sendContent(userMessage("hi"))
