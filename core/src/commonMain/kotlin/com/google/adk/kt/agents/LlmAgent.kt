@@ -409,9 +409,10 @@ class LlmAgent(
         // An empty/whitespace result is an empty final stream chunk; do not parse it as JSON.
         if (result.isBlank()) return
         SchemaUtils.validateOutputSchema(result, outputSchema).getOrElse { cause ->
-          logger.error(cause) {
-            "LlmAgent output for outputKey '$outputKey' did not match the outputSchema. " +
-              "Saving raw output to state."
+          // The cause's message can quote the model's output, so only its type is logged.
+          logger.error {
+            "LlmAgent output for outputKey '$outputKey' did not match the outputSchema " +
+              "(${cause::class.simpleName}). Saving raw output to state."
           }
           result
         }
