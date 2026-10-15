@@ -101,7 +101,8 @@ internal fun offeredTransferTargets(agent: BaseAgent, context: InvocationContext
 
 /**
  * Returns the agents [agent] may transfer control to: its sub-agents, and (when permitted) its
- * parent and peers. Requests read it through [offeredTransferTargets].
+ * parent and peers. Requests read it through [offeredTransferTargets], and a turn rejects a
+ * transfer to any other agent.
  */
 internal fun findTransferTargets(agent: BaseAgent): List<BaseAgent> {
   val targets = buildList {

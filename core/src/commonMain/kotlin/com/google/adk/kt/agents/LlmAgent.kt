@@ -42,6 +42,7 @@ import com.google.adk.kt.processors.LlmRequestProcessor
 import com.google.adk.kt.processors.LlmResponseProcessor
 import com.google.adk.kt.processors.OutputSchemaProcessor
 import com.google.adk.kt.processors.RequestConfirmationProcessor
+import com.google.adk.kt.processors.findTransferTargets
 import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.tools.Toolset
 import com.google.adk.kt.types.Content
@@ -57,9 +58,8 @@ import kotlinx.coroutines.flow.onEach
  * LLM-based Agent.
  *
  * When this agent is a sub-agent and the parent transfers control to it via `transfer_to_agent`,
- * the runner decides who handles the *next* user turn based on the [disallowTransferToParent] /
- * [disallowTransferToPeers] flags inherited from `BaseAgent` - see those flags for the full
- * dispatch rules.
+ * the runner decides who handles the *next* user turn based on the [disallowTransferToParent] flag
+ * inherited from `BaseAgent` - see that flag for the full dispatch rules.
  *
  * @property model The model to use for the agent.
  * @property tools Tools available to this agent.
@@ -217,7 +217,9 @@ class LlmAgent(
     if (event.author == fromAgent) {
       val transferTo = event.actions.transferToAgent
       if (transferTo != null && transferTo != fromAgent) {
-        return rootAgent.findAgent(transferTo)
+        // Check declared targets first, so a same-named agent elsewhere cannot be resumed instead.
+        return findTransferTargets(this).firstOrNull { it.name == transferTo }
+          ?: rootAgent.findAgent(transferTo)
       }
     }
     return null
@@ -303,10 +305,13 @@ class LlmAgent(
       if (context.shouldPauseInvocation(event)) {
         shouldPause = true
       }
-      // On a transfer this agent authored, close this agent here -- before the transferred-to
-      // sub-agent runs -- so its checkpoint marks it done and a later turn resumes at the
-      // sub-agent, not the finished root (Python 2.x transfer).
-      if (context.isResumable && !transferred && getTransferToAgentOrNull(event, name) != null) {
+      // Mark this agent done before target validation so resume does not run it again.
+      if (
+        context.isResumable &&
+          !transferred &&
+          event.author == name &&
+          event.actions.transferToAgent != null
+      ) {
         transferred = true
         context.setAgentState(name, endOfAgent = true)
         emitEndOfAgent(context)

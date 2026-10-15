@@ -29,11 +29,13 @@ import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.serialization.Json
 import com.google.adk.kt.testing.DummyModel
+import com.google.adk.kt.testing.ResumableEvents
 import com.google.adk.kt.testing.TRANSFER_TO_AGENT_RESPONSE_PART
 import com.google.adk.kt.testing.modelFunctionCallResponse
 import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.testing.modelTransferToAgentResponse
 import com.google.adk.kt.testing.simplifyEvents
+import com.google.adk.kt.testing.simplifyResumableEvents
 import com.google.adk.kt.testing.transferToAgentCallPart
 import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
@@ -41,11 +43,13 @@ import com.google.adk.kt.tools.TransferToAgentTool.Companion.TRANSFER_TO_AGENT_T
 import com.google.adk.kt.types.Role
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 
 /**
@@ -831,17 +835,10 @@ class AgentTransferIntegrationTest {
   }
 
   /**
-   * Parity with Python's `test_auto_to_auto_to_auto_forms_transfer_loop`: a chain of auto (LLM)
-   * agents transfers back to the root agent within the same invocation, and the root then produces
-   * its own follow-up response. On the next user turn, root continues.
-   *
-   * Tree:
-   * - root (auto) -> sub_agent_1 (auto) -> sub_agent_2 (auto)
-   *
-   * The transfer target is looked up via `rootAgent.findAgent(name)` (see
-   * [com.google.adk.kt.agents.LlmAgentTurn]'s `handleActions`), and `BaseAgent.findAgent` returns
-   * `this` when `name == this.name`, so transferring to `"root"` from any descendant resolves
-   * correctly.
+   * Parity with Python's `test_transfer_cyclic_loop`: root -> sub_agent_1 -> sub_agent_2 -> root in
+   * one invocation, after which root answers and keeps the next turn. The tree is flat because a
+   * transfer may only reach a sub-agent, the parent or a peer (see
+   * [runAsync_transferToGrandparent_isRejected]).
    */
   @Test
   fun runAsync_autoToAutoToAuto_transferBackToRoot_resumesInSameInvocation() = runTest {
@@ -860,7 +857,6 @@ class AgentTransferIntegrationTest {
           DummyModel("sub-agent-1-model") {
             flowOf(modelTransferToAgentResponse("sub_agent_2", id = "sub1_to_sub2"))
           },
-        subAgents = listOf(subAgent2),
       )
     val rootAgent =
       LlmAgent(
@@ -874,7 +870,7 @@ class AgentTransferIntegrationTest {
               LlmResponse(content = modelMessage("root-next-turn")),
             ),
           ),
-        subAgents = listOf(subAgent1),
+        subAgents = listOf(subAgent1, subAgent2),
       )
     val runner = InMemoryRunner(agent = rootAgent)
 
@@ -912,4 +908,411 @@ class AgentTransferIntegrationTest {
       secondTurnAgentEvents.firstOrNull()?.content?.parts?.singleOrNull()?.text,
     )
   }
+
+  /**
+   * A transfer may only reach a sub-agent, the parent or a peer. A grandchild is none of these, so
+   * the transfer fails and the grandchild never runs. Mirrors Python's
+   * `test_transfer_to_unoffered_agent_raises_value_error`.
+   */
+  @Test
+  fun runAsync_transferToGrandchild_isRejectedAndTheGrandchildNeverRuns() = runBlocking {
+    var grandchildRuns = 0
+    val runner = InMemoryRunner(agent = rootTransferringToGrandchild { grandchildRuns++ })
+
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi")).toList()
+      }
+
+    assertEquals("Agent 'root' is not allowed to transfer to the requested agent.", error.message)
+    assertEquals(0, grandchildRuns, "the grandchild must not run on a disallowed transfer")
+  }
+
+  /**
+   * Resumable variant of [runAsync_transferToGrandchild_isRejectedAndTheGrandchildNeverRuns]: root
+   * writes its end-of-agent event before the transfer fails, the same order as Python's resumable
+   * transfer.
+   */
+  @Test
+  fun runAsync_resumable_transferToGrandchild_endsTheCallerThenFails() = runBlocking {
+    var grandchildRuns = 0
+    val runner = resumableRunner(rootTransferringToGrandchild { grandchildRuns++ })
+    val events = mutableListOf<Event>()
+
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        runner
+          .runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi"))
+          .toList(events)
+      }
+
+    assertEquals("Agent 'root' is not allowed to transfer to the requested agent.", error.message)
+    assertEquals(
+      listOf(
+        "root" to transferToAgentCallPart("grandchild"),
+        "root" to TRANSFER_TO_AGENT_RESPONSE_PART,
+        "root" to ResumableEvents.END_OF_AGENT,
+      ),
+      simplifyResumableEvents(events),
+    )
+    assertEquals(0, grandchildRuns, "the grandchild must not run on a disallowed transfer")
+  }
+
+  /**
+   * On a resumable run, a transfer to the agent itself still ends the agent before the failure, so
+   * resuming that invocation does not run the agent again.
+   */
+  @Test
+  fun runAsync_resumable_transferToSelf_endsTheAgentAndResumeDoesNotRerunIt() = runBlocking {
+    var rootModelCalls = 0
+    val runner = resumableRunner(rootTransferringTo("root") { rootModelCalls++ })
+    val events = mutableListOf<Event>()
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        runner
+          .runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi"))
+          .toList(events)
+      }
+
+    val resumed =
+      runner
+        .runAsync(userId = "u", sessionId = "s", invocationId = events.first().invocationId)
+        .toList()
+
+    assertEquals("Agent 'root' cannot transfer to itself.", error.message)
+    assertEquals(
+      listOf(
+        "root" to transferToAgentCallPart("root"),
+        "root" to TRANSFER_TO_AGENT_RESPONSE_PART,
+        "root" to ResumableEvents.END_OF_AGENT,
+      ),
+      simplifyResumableEvents(events),
+    )
+    assertEquals(emptyList(), simplifyEvents(resumed))
+    assertEquals(1, rootModelCalls, "resuming must not run root again")
+  }
+
+  /**
+   * On a resumable run, a transfer to a name that is not in the tree also ends the caller first.
+   */
+  @Test
+  fun runAsync_resumable_transferToUnknownAgent_endsTheCallerThenFails() = runBlocking {
+    val runner = resumableRunner(rootTransferringTo("missing") {})
+    val events = mutableListOf<Event>()
+
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        runner
+          .runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi"))
+          .toList(events)
+      }
+
+    assertEquals(
+      "Agent 'root' requested a transfer to an agent that is not in the agent tree.",
+      error.message,
+    )
+    assertEquals(
+      listOf(
+        "root" to transferToAgentCallPart("missing"),
+        "root" to TRANSFER_TO_AGENT_RESPONSE_PART,
+        "root" to ResumableEvents.END_OF_AGENT,
+      ),
+      simplifyResumableEvents(events),
+    )
+  }
+
+  /** A transfer up past the parent, here from a grandchild to the root, fails too. */
+  @Test
+  fun runAsync_transferToGrandparent_isRejected() = runBlocking {
+    var rootModelCalls = 0
+    val rootAgent =
+      LlmAgent(
+        name = "root",
+        model =
+          DummyModel("root-model") {
+            rootModelCalls++
+            if (rootModelCalls == 1) {
+              flowOf(modelTransferToAgentResponse("mid"))
+            } else {
+              flowOf(LlmResponse(content = modelMessage("root again")))
+            }
+          },
+        subAgents =
+          listOf(
+            LlmAgent(
+              name = "mid",
+              model = DummyModel("mid-model") { flowOf(modelTransferToAgentResponse("leaf")) },
+              subAgents =
+                listOf(
+                  LlmAgent(
+                    name = "leaf",
+                    model =
+                      DummyModel("leaf-model") { flowOf(modelTransferToAgentResponse("root")) },
+                  )
+                ),
+            )
+          ),
+      )
+    val runner = InMemoryRunner(agent = rootAgent)
+
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi")).toList()
+      }
+
+    assertEquals("Agent 'leaf' is not allowed to transfer to the requested agent.", error.message)
+    assertEquals(1, rootModelCalls, "root must not run again on a disallowed transfer")
+  }
+
+  /**
+   * `disallowTransferToParent` also stops the agent's own transfer to its parent. Mirrors Python's
+   * `test_tool_driven_transfer_to_parent_refused_when_disallowed`.
+   */
+  @Test
+  fun runAsync_transferToParent_withDisallowTransferToParent_isRejected() = runBlocking {
+    var rootModelCalls = 0
+    val rootAgent =
+      LlmAgent(
+        name = "root",
+        model =
+          DummyModel("root-model") {
+            rootModelCalls++
+            if (rootModelCalls == 1) {
+              flowOf(modelTransferToAgentResponse("sub"))
+            } else {
+              flowOf(LlmResponse(content = modelMessage("root again")))
+            }
+          },
+        subAgents =
+          listOf(
+            LlmAgent(
+              name = "sub",
+              model = DummyModel("sub-model") { flowOf(modelTransferToAgentResponse("root")) },
+              disallowTransferToParent = true,
+            ),
+            // Only here so that `sub` is offered the transfer tool.
+            LlmAgent(name = "peer", model = DummyModel("peer-model")),
+          ),
+      )
+    val runner = InMemoryRunner(agent = rootAgent)
+
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi")).toList()
+      }
+
+    assertEquals("Agent 'sub' is not allowed to transfer to the requested agent.", error.message)
+    assertEquals(1, rootModelCalls, "root must not run again on a disallowed transfer")
+  }
+
+  /**
+   * `disallowTransferToPeers` stops the agent's transfer to a peer. Mirrors Python's
+   * `test_tool_driven_transfer_to_peer_refused_when_disallowed`.
+   */
+  @Test
+  fun runAsync_transferToPeer_withDisallowTransferToPeers_isRejectedAndThePeerNeverRuns() =
+    runBlocking {
+      var peerRuns = 0
+      val runner = InMemoryRunner(agent = rootWithSubDisallowingPeers { peerRuns++ })
+
+      val error =
+        assertFailsWith<IllegalArgumentException> {
+          runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi")).toList()
+        }
+
+      assertEquals("Agent 'sub' is not allowed to transfer to the requested agent.", error.message)
+      assertEquals(0, peerRuns, "the peer must not run on a disallowed transfer")
+    }
+
+  /**
+   * A rejected transfer stays in the session history, and the next turn still runs: it goes to the
+   * agent that tried the transfer, as in Python, instead of failing on that history again.
+   */
+  @Test
+  fun runAsync_afterRejectedPeerTransfer_nextTurnContinuesWithTheCaller() = runBlocking {
+    var peerRuns = 0
+    val runner = InMemoryRunner(agent = rootWithSubDisallowingPeers { peerRuns++ })
+    assertFailsWith<IllegalArgumentException> {
+      runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("t1")).toList()
+    }
+
+    val turn2 =
+      simplifyEvents(
+        runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("t2")).toList()
+      )
+
+    assertEquals(listOf("sub" to "sub turn 2"), turn2)
+    assertEquals(0, peerRuns, "the peer must not run on either turn")
+  }
+
+  /**
+   * A transfer to an agent that is not in the tree fails with its own message. Mirrors Python's
+   * `test_transfer_to_unknown_agent_raises_value_error`.
+   */
+  @Test
+  fun runAsync_transferToUnknownAgent_failsAsNotInTree() = runBlocking {
+    val rootAgent =
+      LlmAgent(
+        name = "root",
+        model = DummyModel("root-model") { flowOf(modelTransferToAgentResponse("missing")) },
+        subAgents = listOf(LlmAgent(name = "sub", model = DummyModel("sub-model"))),
+      )
+    val runner = InMemoryRunner(agent = rootAgent)
+
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi")).toList()
+      }
+
+    assertEquals(
+      "Agent 'root' requested a transfer to an agent that is not in the agent tree.",
+      error.message,
+    )
+  }
+
+  /**
+   * With two agents of the same name, a transfer runs the caller's own sub-agent, not the namesake
+   * a tree-wide search would reach first. Mirrors Python's
+   * `test_transfer_to_duplicate_name_returns_declared_target`.
+   */
+  @Test
+  fun runAsync_transferToDuplicateName_runsTheDeclaredTarget() = runBlocking {
+    val rootAgent =
+      LlmAgent(
+        name = "root",
+        model = DummyModel("root-model") { flowOf(modelTransferToAgentResponse("shared")) },
+        subAgents =
+          listOf(
+            // Listed first, so a depth-first search of the tree reaches its `shared` first.
+            LlmAgent(
+              name = "other_branch",
+              model = DummyModel("other-model"),
+              subAgents =
+                listOf(
+                  LlmAgent(
+                    name = "shared",
+                    model =
+                      DummyModel("undeclared-model") {
+                        flowOf(LlmResponse(content = modelMessage("undeclared shared")))
+                      },
+                  )
+                ),
+            ),
+            LlmAgent(
+              name = "shared",
+              model =
+                DummyModel("declared-model") {
+                  flowOf(LlmResponse(content = modelMessage("declared shared")))
+                },
+            ),
+          ),
+      )
+    val runner = InMemoryRunner(agent = rootAgent)
+
+    val lastAgentEvent =
+      runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi")).toList().last {
+        it.author != Role.USER
+      }
+
+    assertEquals("declared shared", lastAgentEvent.content?.parts?.singleOrNull()?.text)
+  }
+
+  /**
+   * A transfer to the agent itself fails, and the agent does not run again. Mirrors Python's
+   * `test_transfer_to_self_raises_error`.
+   */
+  @Test
+  fun runAsync_transferToSelf_isRejected() = runBlocking {
+    var rootModelCalls = 0
+    val runner = InMemoryRunner(agent = rootTransferringTo("root") { rootModelCalls++ })
+
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("hi")).toList()
+      }
+
+    assertEquals("Agent 'root' cannot transfer to itself.", error.message)
+    assertEquals(1, rootModelCalls, "root must not run again on a transfer to itself")
+  }
+
+  /** Root, whose model transfers to its grandchild under `sub`, which calls [onGrandchildRun]. */
+  private fun rootTransferringToGrandchild(onGrandchildRun: () -> Unit): LlmAgent =
+    LlmAgent(
+      name = "root",
+      model = DummyModel("root-model") { flowOf(modelTransferToAgentResponse("grandchild")) },
+      subAgents =
+        listOf(
+          LlmAgent(
+            name = "sub",
+            model = DummyModel("sub-model"),
+            subAgents =
+              listOf(
+                LlmAgent(
+                  name = "grandchild",
+                  model =
+                    DummyModel("grandchild-model") {
+                      onGrandchildRun()
+                      flowOf(LlmResponse(content = modelMessage("grandchild response")))
+                    },
+                )
+              ),
+          )
+        ),
+    )
+
+  /**
+   * Root, whose model first transfers to [target] and then answers "root again", calling
+   * [onRootRun] on each model call. Its `helper` sub-agent is only there so the transfer tool is
+   * offered.
+   */
+  private fun rootTransferringTo(target: String, onRootRun: () -> Unit): LlmAgent {
+    var modelCalls = 0
+    return LlmAgent(
+      name = "root",
+      model =
+        DummyModel("root-model") {
+          onRootRun()
+          modelCalls++
+          if (modelCalls == 1) {
+            flowOf(modelTransferToAgentResponse(target))
+          } else {
+            flowOf(LlmResponse(content = modelMessage("root again")))
+          }
+        },
+      subAgents = listOf(LlmAgent(name = "helper", model = DummyModel("helper-model"))),
+    )
+  }
+
+  /**
+   * Root transfers to `sub`, which sets `disallowTransferToPeers` and whose model first transfers
+   * to its peer and then answers "sub turn 2". The peer calls [onPeerRun] each time it runs.
+   */
+  private fun rootWithSubDisallowingPeers(onPeerRun: () -> Unit): LlmAgent =
+    LlmAgent(
+      name = "root",
+      model = DummyModel("root-model") { flowOf(modelTransferToAgentResponse("sub")) },
+      subAgents =
+        listOf(
+          LlmAgent(
+            name = "sub",
+            model =
+              DummyModel.createSequential(
+                "sub-model",
+                listOf(
+                  modelTransferToAgentResponse("peer"),
+                  LlmResponse(content = modelMessage("sub turn 2")),
+                ),
+              ),
+            disallowTransferToPeers = true,
+          ),
+          LlmAgent(
+            name = "peer",
+            model =
+              DummyModel("peer-model") {
+                onPeerRun()
+                flowOf(LlmResponse(content = modelMessage("peer")))
+              },
+          ),
+        ),
+    )
 }
