@@ -230,37 +230,26 @@ open class Context(
 
   /**
    * The delta-aware state of the current session: committed session state merged with pending
-   * [actions] `stateDelta` writes and this activation's transient writes, with removed keys
-   * filtered out.
+   * [actions] `stateDelta` writes, with removed keys filtered out.
    *
-   * This map is read-only; modify state through [updateState]. A [State.TEMP_PREFIX] key on a node
-   * activation stays on that activation, per [updateState].
+   * This map is read-only; modify state through [updateState].
    */
   final override val state: Map<String, Any>
     get() = buildMap {
       putAll(invocationContext.session.state.toMap())
       putAll(actions.stateDelta)
-      putAll(nodeState?.transientState.orEmpty())
       values.removeAll { it == State.REMOVED }
     }
 
   /**
-   * Records a state change so it shows up in [state] and, on a callback or tool context, flushes on
-   * the next event as a delta.
-   *
-   * On a node activation, a [State.TEMP_PREFIX] key is held on this activation alone, reaching no
-   * event and no successor node; every other key writes into [actions] `stateDelta` via
-   * copy-on-write, so a holder of the previous [actions] instance does not see the write. Under a
-   * node's state schema the write must match its declared key, or it fails.
+   * Records a state change in [actions] `stateDelta` (copy-on-write) so it appears in [state] and
+   * flushes on the next event. [State.TEMP_PREFIX] keys last for the current invocation and are
+   * never stored; keys without an `app:`, `user:` or `temp:` prefix must match the node's state
+   * schema, if any.
    */
   fun updateState(key: String, value: Any) {
     effectiveStateSchema?.let { validateStateEntry(it, key, value) }
-    val ns = nodeState
-    if (ns != null && key.startsWith(State.TEMP_PREFIX)) {
-      ns.transientState[key] = value
-    } else {
-      actions = actions.copy(stateDelta = (actions.stateDelta + (key to value)).toMutableMap())
-    }
+    actions = actions.copy(stateDelta = (actions.stateDelta + (key to value)).toMutableMap())
   }
 
   /** Validates every entry of [delta] against the state schema in force here, if there is one. */
@@ -802,7 +791,6 @@ internal class NodeExecutionState(
   val interruptIds: Set<String>
     get() = interruptIdsRef.load()
 
-  val transientState = mutableMapOf<String, Any>()
   var selectedRoutes: List<Route>? = null
   var routesEmitted: Boolean = false
   var failure: NodeExecutionFailure? = null

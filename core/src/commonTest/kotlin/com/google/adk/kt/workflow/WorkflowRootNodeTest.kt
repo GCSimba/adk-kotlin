@@ -350,6 +350,32 @@ class WorkflowRootNodeTest {
   }
 
   @Test
+  fun runAsync_tempKeyFromPredecessor_isVisibleToSuccessorButNotStored() = runBlocking {
+    // Arrange
+    val writer = StateWriter("writer", "temp:shared")
+    val reader = SessionStateReader("reader", "temp:shared")
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, writer), Edge(writer, reader)))
+    val runner = InMemoryRunner(app = App(appName = "graph_app", rootNode = workflow))
+
+    // Act
+    val events =
+      runner.runAsync(userId = "u", sessionId = "s", newMessage = userMessage("go")).toList()
+    val session = assertNotNull(runner.sessionService.getSession(SessionKey("graph_app", "u", "s")))
+
+    // Assert
+    assertEquals("v", reader.observedValue)
+    assertNull(session.state["temp:shared"])
+    assertTrue(
+      session.events.none { "temp:shared" in it.actions.stateDelta },
+      "a temp: key reached a stored event",
+    )
+    assertTrue(
+      events.none { "temp:shared" in it.actions.stateDelta },
+      "a temp: key reached a returned event",
+    )
+  }
+
+  @Test
   fun aNodeNestedInAWorkflowRootResumesOnlyAfterTheRunnerPersistsItsEvent() = runBlocking {
     // Arrange: the probe runs one level below the root, inside the workflow's scheduler.
     val probe = PersistenceProbeNode("probe")

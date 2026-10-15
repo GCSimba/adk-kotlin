@@ -166,11 +166,10 @@ class ContextTest {
     assertEquals("temp-value", context.state["temp:scratch"])
   }
 
-  // On a node context, temp: writes stay on the activation's transientState and do not reach
-  // actions.
+  // A node context writes a temp: key to actions.stateDelta and state, like any other context.
   @Test
   @OptIn(ExperimentalWorkflowApi::class)
-  fun updateState_tempKeyOnNodeContext_writesToTransientStateAndNotActions() {
+  fun updateState_tempKeyOnNodeContext_writesToActionsAndState() {
     val node =
       object : Node {
         override val name = "test-node"
@@ -180,12 +179,9 @@ class ContextTest {
     val context =
       Context(invocationContext = testInvocationContext(), node = node, eventSink = { _, _ -> })
 
-    context.updateState("temp:scratch", "transient-value")
-    context.updateState("persistent", "persistent-value")
+    context.updateState("temp:scratch", "temp-value")
 
-    assertNull(context.actions.stateDelta["temp:scratch"])
-    assertEquals("transient-value", context.state["temp:scratch"])
-    assertEquals("persistent-value", context.actions.stateDelta["persistent"])
-    assertEquals("persistent-value", context.state["persistent"])
+    assertEquals("temp-value", context.actions.stateDelta["temp:scratch"])
+    assertEquals("temp-value", context.state["temp:scratch"])
   }
 }
