@@ -84,12 +84,11 @@ class Workflow(
   }
 
   /**
-   * Runs this workflow as the root of an invocation, through the node runner, so its own timeout
-   * and retry policy apply. Each non-partial event pauses the node that emitted it until the flow's
-   * collector returns, and a node failure is rethrown only after the event stream drains. Nested
-   * inside another graph it runs through [runNode] instead.
+   * Runs this workflow as the root of [context] without a Runner, so emitted state deltas never
+   * reach the session and later nodes miss them; only tests use it. Production code runs a workflow
+   * via [com.google.adk.kt.runners.Runner.runAsync], and a nested workflow runs via [runNode].
    */
-  fun runAsync(context: InvocationContext): Flow<Event> = NodeRunner.runRoot(this, context)
+  internal fun runAsync(context: InvocationContext): Flow<Event> = NodeRunner.runRoot(this, context)
 
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
     val graph = graph ?: return@flow

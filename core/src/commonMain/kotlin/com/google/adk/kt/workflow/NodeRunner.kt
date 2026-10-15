@@ -358,13 +358,11 @@ private constructor(
 
   companion object {
     /**
-     * Runs [node] as the root of [context], streaming the events it (and any nested graph) emits.
-     *
-     * Each non-partial event suspends the emitting node until the downstream collector has
-     * persisted and emitted it, so a successor node always observes its predecessor's committed
-     * state deltas and session history, and a failure's error event is persisted before its
-     * exception surfaces; partial events do not wait. If the collector throws an Exception that is
-     * not a cancellation, this function attaches each queued node failure to it as suppressed.
+     * Runs [node] as the root of [context]; only the [com.google.adk.kt.runners.Runner] should
+     * collect it. Each non-partial event suspends the emitting node until the Runner persists and
+     * emits it, so a successor sees committed state deltas and an error event is stored before its
+     * exception surfaces; partial events do not wait. If the collector throws a non-cancellation
+     * Exception, this attaches each queued node failure to it as suppressed.
      */
     // Confined to the flow's coroutineScope: async sends to channel, and emit runs on the collector
     // coroutine.
