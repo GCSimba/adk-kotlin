@@ -23,7 +23,6 @@ import com.google.adk.kt.sessions.dto.toAdk
 import com.google.adk.kt.sessions.dto.toDto
 import com.google.auth.oauth2.GoogleCredentials
 import io.ktor.client.HttpClient
-import io.ktor.client.engine.java.Java
 import java.time.Duration as JavaDuration
 import kotlin.jvm.JvmStatic
 import kotlin.time.Duration
@@ -79,7 +78,7 @@ internal constructor(
    * @param reasoningEngineId The numeric id of the reasoning engine to address.
    * @param credentials Credentials for the Vertex AI API; defaults to application-default
    *   credentials scoped for Google Cloud Platform.
-   * @param httpClient The underlying ktor [HttpClient].
+   * @param httpClient The underlying Ktor [HttpClient]; by default one on the OkHttp engine.
    * @param sessionTtl Lifetime applied to every session this service creates, including those the
    *   runner creates through the [SessionService] interface. A per-call `ttl` or `expireTime`
    *   overrides it; `null` leaves the backend default in place.
@@ -89,7 +88,7 @@ internal constructor(
     location: String,
     reasoningEngineId: String,
     credentials: GoogleCredentials = GoogleApiClient.defaultCredentials(),
-    httpClient: HttpClient = HttpClient(Java),
+    httpClient: HttpClient = GoogleApiClient.defaultHttpClient(),
     sessionTtl: Duration? = null,
   ) : this(
     VertexAiSessionsClient(GoogleApiClient(httpClient, credentials)),
@@ -272,7 +271,7 @@ internal constructor(
             "VertexAiSessionService.Builder requires reasoningEngineId to be set."
           },
         credentials = credentials ?: GoogleApiClient.defaultCredentials(),
-        httpClient = httpClient ?: HttpClient(Java),
+        httpClient = httpClient ?: GoogleApiClient.defaultHttpClient(),
         sessionTtl = sessionTtl,
       )
   }

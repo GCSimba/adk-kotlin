@@ -43,7 +43,6 @@ import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.auth.oauth2.GoogleCredentials
 import io.ktor.client.HttpClient
-import io.ktor.client.engine.java.Java
 import java.time.Instant
 import kotlin.jvm.JvmStatic
 import kotlinx.serialization.json.JsonElement
@@ -76,15 +75,16 @@ class VertexAiMemoryBankService internal constructor(private val client: VertexA
    *   `"1234567890"`.
    * @param credentials Credentials for the Vertex AI API; defaults to application-default
    *   credentials scoped for Google Cloud Platform.
-   * @param httpClient The underlying ktor [HttpClient]; it is closed (and the failure rethrown) if
-   *   the arguments are invalid, so a bad project/location/engine id never leaves a client behind.
+   * @param httpClient The underlying Ktor [HttpClient], by default one on the OkHttp engine; it is
+   *   closed (and the failure rethrown) if the arguments are invalid, so a bad project/location/
+   *   engine id never leaves a client behind.
    */
   constructor(
     project: String,
     location: String,
     agentEngineId: String,
     credentials: GoogleCredentials = GoogleApiClient.defaultCredentials(),
-    httpClient: HttpClient = HttpClient(Java),
+    httpClient: HttpClient = GoogleApiClient.defaultHttpClient(),
   ) : this(
     closingHttpClientOnFailure(httpClient) {
       VertexAiMemoryBankClient(
@@ -304,7 +304,7 @@ class VertexAiMemoryBankService internal constructor(private val client: VertexA
             "VertexAiMemoryBankService.Builder requires agentEngineId to be set."
           },
         credentials = credentials ?: GoogleApiClient.defaultCredentials(),
-        httpClient = httpClient ?: HttpClient(Java),
+        httpClient = httpClient ?: GoogleApiClient.defaultHttpClient(),
       )
   }
 

@@ -19,13 +19,17 @@ package com.google.adk.kt.gcp
 import com.google.auth.oauth2.GoogleCredentials
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.java.Java
+import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.header
 import io.ktor.client.request.request
 import io.ktor.client.statement.HttpResponse
 import io.ktor.http.HttpHeaders
+import java.time.Duration
+import java.util.concurrent.Executors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Dispatcher
 
 /**
  * A thin authenticated transport for Google Cloud REST APIs.
@@ -71,5 +75,27 @@ internal class GoogleApiClient(
     fun defaultCredentials(): GoogleCredentials =
       GoogleCredentials.getApplicationDefault()
         .createScoped("https://www.googleapis.com/auth/cloud-platform")
+
+    /**
+     * A Ktor client on the OkHttp engine, as the Gemini model uses, which closes the connection of
+     * a cancelled call. It uses daemon threads and OkHttp's call limits and timeouts, with
+     * [readTimeout] in place of OkHttp's 10 seconds when set, and never resends a request after a
+     * connection failure.
+     */
+    fun defaultHttpClient(readTimeout: Duration? = null): HttpClient =
+      HttpClient(OkHttp) {
+        engine {
+          config {
+            // OkHttp's own dispatcher threads would hold the JVM open for a minute.
+            dispatcher(Dispatcher(Executors.newCachedThreadPool(::daemonThread)))
+            readTimeout?.let { this.readTimeout(it) }
+            // OkHttp would resend a POST the server already read, so a write could run twice.
+            retryOnConnectionFailure(false)
+          }
+        }
+      }
+
+    private fun daemonThread(task: Runnable): Thread =
+      Thread(task, "ADK Google API client").apply { isDaemon = true }
   }
 }

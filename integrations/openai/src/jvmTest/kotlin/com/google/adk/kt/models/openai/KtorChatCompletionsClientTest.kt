@@ -765,7 +765,10 @@ class KtorChatCompletionsClientTest {
         )
 
       runBlocking {
-        val running = launch { call(client) }
+        val running = launch {
+          // Cancelling closes the socket, so the call can end with a SocketException instead.
+          val unusedResult = runCatching { call(client) }
+        }
         val unused = withTimeout(5.seconds) { requestReceived.await() }
         val elapsed = measureTime { running.cancelAndJoin() }
         assertThat(elapsed.inWholeMilliseconds).isLessThan(5_000)

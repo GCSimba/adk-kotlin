@@ -33,7 +33,7 @@ import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Part
 import com.google.auth.oauth2.GoogleCredentials
 import io.ktor.client.HttpClient
-import io.ktor.client.engine.java.Java
+import java.time.Duration
 import java.util.Base64
 import kotlin.jvm.JvmStatic
 import kotlin.math.roundToLong
@@ -83,8 +83,10 @@ internal constructor(
    *   threshold.
    * @param credentials Credentials for the Vertex AI API; defaults to application-default
    *   credentials scoped for Google Cloud Platform.
-   * @param httpClient The underlying ktor [HttpClient]; it is closed (and the failure rethrown) if
-   *   the arguments are invalid, so a bad corpus/project/location never leaves a client behind.
+   * @param httpClient The underlying Ktor [HttpClient], by default one on the OkHttp engine that
+   *   waits up to 10 minutes for a response, since an upload answers only after the corpus imports
+   *   the file. It is closed (and the failure rethrown) if the arguments are invalid, so a bad
+   *   corpus/project/location never leaves a client behind.
    */
   constructor(
     project: String,
@@ -93,7 +95,7 @@ internal constructor(
     similarityTopK: Int? = null,
     vectorDistanceThreshold: Double = DEFAULT_VECTOR_DISTANCE_THRESHOLD,
     credentials: GoogleCredentials = GoogleApiClient.defaultCredentials(),
-    httpClient: HttpClient = HttpClient(Java),
+    httpClient: HttpClient = GoogleApiClient.defaultHttpClient(UPLOAD_READ_TIMEOUT),
   ) : this(
     // Validate before wrapping httpClient, closing it if the corpus is invalid.
     corpusName =
@@ -251,7 +253,7 @@ internal constructor(
         similarityTopK = similarityTopK,
         vectorDistanceThreshold = vectorDistanceThreshold,
         credentials = credentials ?: GoogleApiClient.defaultCredentials(),
-        httpClient = httpClient ?: HttpClient(Java),
+        httpClient = httpClient ?: GoogleApiClient.defaultHttpClient(UPLOAD_READ_TIMEOUT),
       )
   }
 
@@ -262,6 +264,9 @@ internal constructor(
 
     /** Default matches the Python ADK `VertexAiRagMemoryService`. */
     private const val DEFAULT_VECTOR_DISTANCE_THRESHOLD = 10.0
+
+    /** A 3.5 MB upload took 76 seconds in a live test; Python's client sets no limit. */
+    private val UPLOAD_READ_TIMEOUT: Duration = Duration.ofMinutes(10)
 
     /**
      * Versioned prefix for the RAG file display name. Everything after it is three
