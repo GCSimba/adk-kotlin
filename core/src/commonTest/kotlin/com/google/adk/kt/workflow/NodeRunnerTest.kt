@@ -26,15 +26,37 @@ import com.google.adk.kt.testing.DummyAgent
 import com.google.adk.kt.testing.testInvocationContext
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Part
+import com.google.adk.kt.types.Role
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+
+/** A custom node that writes [value]'s JSON form with `Context.setOutput`. */
+private class SetOutputNode(override val name: String, private val value: List<Int>) : Node {
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    context.setOutput(value)
+  }
+}
+
+/** A custom node that passes an [Event] to `Context.setOutput`, which has no JSON form. */
+private class SetEventOutputNode(override val name: String) : Node {
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    context.setOutput(Event(output = 1))
+  }
+}
+
+/** Runs a workflow of `Start -> node` through the runner, returning a failed run too. */
+private fun runAlone(node: Node): AppRun =
+  runWorkflowAsAppCatching(Workflow(name = "wf", edges = listOf(Edge(Start, node))))
 
 /** Emits a single content event flagged as the node's output, optionally carrying [output] too. */
 private class MessageNode(
@@ -496,6 +518,86 @@ class NodeRunnerTest {
     assertTrue(
       cancellation.suppressedExceptions.isEmpty(),
       "node failure attached to a cancellation",
+    )
+  }
+
+  /** Fails a node whose output has no JSON form, naming the type but not the value. */
+  @Test
+  fun run_outputWithoutJsonForm_failsTheNode() {
+    // Arrange
+    val order = LiveOrder("secret-id")
+    val nodes =
+      listOf(
+        Emitter("raw", order),
+        Emitter("event", Event(output = order)),
+        Emitter("set", setOf(1)),
+        node<Any?, Event>("typed_event") { _, _ -> Event(output = order) },
+        SetEventOutputNode("set_event"),
+      )
+
+    // Act
+    val runs = nodes.map { runAlone(it) }
+
+    // Assert
+    runs.zip(nodes).forEach { (run, node) ->
+      assertIs<IllegalArgumentException>(run.failure)
+      val error = run.session.events.single { it.errorCode != null }
+      val message = error.errorMessage!!
+      assertEquals("wf@1/${node.name}@1", error.nodeInfo?.path)
+      assertContains(message, "output of node '${node.name}' contains a value of type")
+      assertContains(message, "Emit its JSON form instead")
+      assertFalse("secret-id" in message, message)
+    }
+    assertContains(
+      runs[0].session.events.single { it.errorCode != null }.errorMessage!!,
+      "type LiveOrder,",
+    )
+  }
+
+  /** Passes JSON-native values, a [Content], a `setOutput` result and a typed node's output. */
+  @Test
+  fun run_outputWithJsonForm_isTheNodeOutput() {
+    // Arrange
+    val content = Content.fromText(Role.MODEL, "hi")
+    val nodes =
+      listOf(
+        Emitter("map", mapOf("k" to 1)),
+        Emitter("list", listOf("a")),
+        Emitter("scalar", 3),
+        Emitter("content", content),
+        SetOutputNode("set_output", listOf(1, 2)),
+        node<Any?, Int>("typed") { _, _ -> 7 },
+      )
+
+    // Act
+    val runs = nodes.map { runAlone(it) }
+
+    // Assert
+    assertEquals(List(nodes.size) { null }, runs.map { it.failure })
+    val outputs =
+      runs.zip(nodes).map { (run, node) ->
+        run.session.events.single { it.nodeInfo?.path == "wf@1/${node.name}@1" }.output
+      }
+    assertEquals(listOf(mapOf("k" to 1), listOf("a"), 3, content, listOf(1L, 2L), 7L), outputs)
+  }
+
+  /** Keeps a custom node's emitted [RequestInput] an interrupt, which the check leaves alone. */
+  @Test
+  fun run_customNodeEmitsRequestInput_pausesForInput() {
+    // Arrange
+    val asker = Emitter("asker", RequestInput(interruptId = "approval", message = "Approve?"))
+
+    // Act
+    val run = runAlone(asker)
+
+    // Assert
+    assertNull(run.failure)
+    assertEquals(emptyList(), run.session.events.mapNotNull { it.errorCode })
+    val request = run.session.events.single { it.nodeInfo?.path == "wf@1/asker@1" }
+    assertEquals(setOf("approval"), request.longRunningToolIds)
+    assertEquals(
+      RequestInput.FUNCTION_CALL_NAME,
+      request.content?.parts?.single()?.functionCall?.name,
     )
   }
 }

@@ -44,6 +44,7 @@ import com.google.adk.kt.workflow.ResumeScan
 import com.google.adk.kt.workflow.Route
 import com.google.adk.kt.workflow.ValueCodec
 import com.google.adk.kt.workflow.Workflow
+import com.google.adk.kt.workflow.requireJsonForm
 import com.google.adk.kt.workflow.schemaForm
 import com.google.adk.kt.workflow.validateInput
 import com.google.adk.kt.workflow.validateNodeName
@@ -303,11 +304,13 @@ open class Context(
   }
 
   /**
-   * Sets this node's [output] to [value]'s JSON form under [T]'s serializer, or to a `Content` or
-   * `Event` as it is, so a successor typed [T] reads it back, live and after a session reload. Can
-   * be called at most once per activation.
+   * Sets this node's [output] to [value]'s JSON form under [T]'s serializer, or to a `Content` as
+   * it is, so a successor typed [T] reads it back, live and after a session reload. Can be called
+   * at most once per activation. Use it from a custom node for a typed value, since emitting that
+   * value directly fails the node.
    *
-   * @throws IllegalArgumentException if [T] has no serializer or [value] has no JSON form.
+   * @throws IllegalArgumentException if [T] has no serializer or [value] has no JSON form, an
+   *   `Event` included.
    * @throws IllegalStateException if an output was already produced or delegated.
    */
   @ExperimentalWorkflowApi
@@ -323,7 +326,9 @@ open class Context(
     val ns = requireNodeState()
     val node = ns.node
     val json = ValueCodec<Any?>(kType).schemaForm(value, "output of node '${node.name}'")
-    ns.produceOutput(if (node is FunctionNode<*, *>) node.encodeOutput(json) else json)
+    val output = if (node is FunctionNode<*, *>) node.encodeOutput(json) else json
+    requireJsonForm(output, node.name)
+    ns.produceOutput(output)
   }
 
   /**

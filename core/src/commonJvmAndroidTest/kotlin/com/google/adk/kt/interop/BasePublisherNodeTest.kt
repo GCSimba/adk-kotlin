@@ -21,17 +21,22 @@ package com.google.adk.kt.interop
 import com.google.adk.kt.agents.Context
 import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
+import com.google.adk.kt.events.Event
+import com.google.adk.kt.workflow.LiveOrder
 import com.google.adk.kt.workflow.NodeConfig
 import com.google.adk.kt.workflow.RetryConfig
 import com.google.adk.kt.workflow.Route
 import com.google.adk.kt.workflow.Start
 import com.google.adk.kt.workflow.StubNode
 import com.google.adk.kt.workflow.runWorkflow
+import com.google.adk.kt.workflow.runWorkflowAsAppCatching
 import com.google.adk.kt.workflow.workflow
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.flow.flow
@@ -141,5 +146,28 @@ class BasePublisherNodeTest {
   @Test
   fun invalidName_failsAtConstruction() {
     assertFailsWith<IllegalArgumentException> { PublishingNode("a.b", emptyList()) }
+  }
+
+  /** Fails a Java node that sets a live object as an event's output through `Event.builder()`. */
+  @Test
+  fun publishedEventWithLiveObjectOutput_failsTheNode() {
+    // Arrange: mirrors the Java call a BasePublisherNode subclass makes.
+    val event = Event.builder().output(LiveOrder("secret-id")).build()
+    val graph = workflow("wf") { Start.then(PublishingNode("publisher", listOf(event))) }
+
+    // Act
+    val run = runWorkflowAsAppCatching(graph)
+
+    // Assert
+    val failure = assertIs<IllegalArgumentException>(run.failure)
+    assertContains(
+      failure.message!!,
+      "output of node 'publisher' contains a value of type LiveOrder,",
+    )
+    assertFalse("secret-id" in failure.message!!)
+    assertEquals(
+      "wf@1/publisher@1",
+      run.session.events.single { it.errorCode != null }.nodeInfo?.path,
+    )
   }
 }

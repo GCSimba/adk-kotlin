@@ -87,14 +87,15 @@ interface Node {
    *
    * Emits any of:
    * - A raw output value, which becomes this node's output and is normalized into an
-   *   [Event][com.google.adk.kt.events.Event] by the engine. A persistent session saves it only if
-   *   it is JSON-native (a map, list, string, number, boolean, null, or `JsonElement`) or a
-   *   [Content][com.google.adk.kt.types.Content]; for a typed value, call [Context.setOutput],
-   *   which writes its JSON form.
+   *   [Event][com.google.adk.kt.events.Event] by the engine. It must be JSON-native (a map, list,
+   *   string, number, boolean, null, or `JsonElement`) or a
+   *   [Content][com.google.adk.kt.types.Content], the form a persistent session saves; any other
+   *   value fails the node. For a typed value, call [Context.setOutput], which writes its JSON
+   *   form.
    * - A [RequestInput], which the engine normalizes into an `adk_request_input` interrupt event
    *   that pauses the graph until the user answers.
    * - An [Event][com.google.adk.kt.events.Event], which passes through directly (useful for
-   *   progress emissions or custom events).
+   *   progress emissions or custom events); its output must have a JSON form too.
    * - `null` or [Unit], both of which signify that no output was produced. [Unit] represents
    *   side-effecting Kotlin lambdas/functions that return no value, while `null` represents the
    *   explicit absence of an output.

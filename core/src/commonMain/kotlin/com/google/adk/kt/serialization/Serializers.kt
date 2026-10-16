@@ -90,6 +90,17 @@ internal object AnySerializer : KSerializer<Any> {
 
 @FrameworkInternalApi
 fun anyToJsonElement(value: Any?): JsonElement =
+  anyToJsonElement(value) { unsupported ->
+    throw IllegalArgumentException(
+      "AnySerializer cannot serialize value of type ${unsupported::class.simpleName}. Tool results " +
+        "must be JSON-native (Map/List/String/number/Boolean/null); return a Map or use @Tool " +
+        "to return a data class."
+    )
+  }
+
+/** [anyToJsonElement], calling [onUnsupported] with the first value that has no JSON form. */
+@OptIn(FrameworkInternalApi::class)
+internal fun anyToJsonElement(value: Any?, onUnsupported: (Any) -> Nothing): JsonElement =
   when (value) {
     null -> JsonNull
     State.REMOVED -> REMOVED_JSON.value
@@ -103,16 +114,13 @@ fun anyToJsonElement(value: Any?): JsonElement =
     is Byte -> JsonPrimitive(value)
     is Short -> JsonPrimitive(value)
     is Map<*, *> ->
-      JsonObject(value.entries.associate { (k, v) -> k.toString() to anyToJsonElement(v) })
-    is List<*> -> JsonArray(value.map { anyToJsonElement(it) })
+      JsonObject(
+        value.entries.associate { (k, v) -> k.toString() to anyToJsonElement(v, onUnsupported) }
+      )
+    is List<*> -> JsonArray(value.map { anyToJsonElement(it, onUnsupported) })
     // A framework value in workflow outputs, written in its wire form as in Event.content.
     is Content -> adkJson.encodeToJsonElement(Content.serializer(), value)
-    else ->
-      throw IllegalArgumentException(
-        "AnySerializer cannot serialize value of type ${value::class.simpleName}. Tool results " +
-          "must be JSON-native (Map/List/String/number/Boolean/null); return a Map or use @Tool " +
-          "to return a data class."
-      )
+    else -> onUnsupported(value)
   }
 
 @FrameworkInternalApi

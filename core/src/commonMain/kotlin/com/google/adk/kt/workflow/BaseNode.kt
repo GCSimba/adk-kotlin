@@ -21,6 +21,7 @@ import com.google.adk.kt.agents.Context
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
+import com.google.adk.kt.serialization.anyToJsonElement
 import com.google.adk.kt.types.Schema
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -33,8 +34,10 @@ import kotlinx.coroutines.flow.flow
  * `BasePublisherNode` can extend it. It is framework plumbing: write a node by implementing [Node],
  * or from Java by extending `BasePublisherNode`.
  *
- * Subclasses implement [runNode] and emit raw values; [run] normalizes each into an [Event]. Node
- * names must be unique within a graph, since the scheduler keys on them.
+ * Subclasses implement [runNode] and emit raw values; [run] normalizes each into an [Event] and
+ * throws [IllegalArgumentException] for an output with no JSON form (map, list, string, number,
+ * boolean, null or Content), so a live object fails here rather than when a persistent session
+ * saves it. Node names must be unique within a graph, since the scheduler keys on them.
  *
  * @property name Identifies the node within its graph.
  * @property description What the node does, for humans and for a model that may call it.
@@ -94,14 +97,18 @@ abstract class BaseNode(
           if (item.output == null) {
             emit(item)
           } else {
-            emit(item.copy(output = validateOutput(item.output)))
+            emit(item.copy(output = checkOutput(item.output)))
           }
         // The author stays empty here and is stamped later by the node runner, which knows the
         // node's place in the graph.
-        else -> emit(Event(output = validateOutput(item)))
+        else -> emit(Event(output = checkOutput(item)))
       }
     }
   }
+
+  /** Runs [validateOutput], then requires the output to have a JSON form ([requireJsonForm]). */
+  private fun checkOutput(output: Any?): Any? =
+    validateOutput(output).also { requireJsonForm(it, name) }
 
   /**
    * Checks [nodeInput] against [inputSchema], if there is one, and returns the input to run on. A
@@ -124,4 +131,20 @@ abstract class BaseNode(
     val schema = outputSchema ?: return output
     return SchemaUtils.validateValue(output, schema, "output of node '$name'").getOrThrow()
   }
+}
+
+/**
+ * Throws [IllegalArgumentException] unless [output] has the JSON form a session saves, so a live
+ * object fails at the node rather than when a persistent session saves it.
+ */
+internal fun requireJsonForm(output: Any?, nodeName: String) {
+  val unused =
+    anyToJsonElement(output) { unsupported ->
+      val type = unsupported::class.simpleName?.let { "type $it" } ?: "an unnamed type"
+      throw IllegalArgumentException(
+        "output of node '$nodeName' contains a value of $type, which has no JSON form here (map," +
+          " list, string, number, boolean, null or Content). Emit its JSON form instead, in" +
+          " Kotlin with context.setOutput(value)."
+      )
+    }
 }

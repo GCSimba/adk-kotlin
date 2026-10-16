@@ -37,6 +37,9 @@ import kotlinx.coroutines.runBlocking
  * build - which compiles the whole test source set together - sees a single definition of each.
  */
 
+/** A live object with no JSON form, as a custom node might emit it. */
+internal data class LiveOrder(val id: String)
+
 /** A node that emits a fixed value as its output. */
 internal class Emitter(override val name: String, private val value: Any?) : Node {
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow { emit(value) }
@@ -115,4 +118,21 @@ internal fun runWorkflowAsApp(workflow: Workflow): Session = runBlocking {
   val runner = InMemoryRunner(app = App(appName = "workflow_app", rootNode = workflow))
   runner.runAsync(userId = "user", sessionId = "session", newMessage = userMessage("go")).toList()
   checkNotNull(runner.sessionService.getSession(SessionKey("workflow_app", "user", "session")))
+}
+
+/** The session a run left, and what the run threw, if anything. */
+internal data class AppRun(val session: Session, val failure: Throwable?)
+
+/** Runs [workflow] like [runWorkflowAsApp], but returns a failed run instead of throwing. */
+internal fun runWorkflowAsAppCatching(workflow: Workflow): AppRun = runBlocking {
+  val runner = InMemoryRunner(app = App(appName = "workflow_app", rootNode = workflow))
+  val failure =
+    runCatching {
+        runner
+          .runAsync(userId = "user", sessionId = "session", newMessage = userMessage("go"))
+          .toList()
+      }
+      .exceptionOrNull()
+  val session = runner.sessionService.getSession(SessionKey("workflow_app", "user", "session"))
+  AppRun(checkNotNull(session), failure)
 }
