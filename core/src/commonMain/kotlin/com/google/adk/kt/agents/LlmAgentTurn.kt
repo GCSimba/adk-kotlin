@@ -79,8 +79,12 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
@@ -98,6 +102,9 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.flow.transform
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.withLock
@@ -124,6 +131,24 @@ internal class LlmAgentTurn(
   private val requestProcessors: List<LlmRequestProcessor>,
   private val responseProcessors: List<LlmResponseProcessor>,
 ) {
+
+  /**
+   * Keeps the run's audio when `RunConfig.saveLiveBlob` asks for it; null records nothing. It is
+   * also null without an artifact service, which leaves nowhere to save a recording.
+   */
+  private val audioCache: AudioCacheManager? by lazy {
+    when {
+      context.runConfig?.saveLiveBlob != true -> null
+      context.artifactService == null -> {
+        logger.warn {
+          "RunConfig.saveLiveBlob is set but the run has no artifact service, so live audio is " +
+            "not recorded."
+        }
+        null
+      }
+      else -> AudioCacheManager(context)
+    }
+  }
 
   /**
    * The request the send loop has taken off the queue but not yet written.
@@ -154,6 +179,12 @@ internal class LlmAgentTurn(
    * ADK Python enqueues the reply before waiting.
    */
   private val pendingBlockedReply = AtomicReference<Event?>(null)
+
+  /** Saves recordings for the connection being read; null between connections. */
+  private val recordingSaves = AtomicReference<RecordingSaves?>(null)
+
+  /** Whether the store timed out on the saves still running when the last connection ended. */
+  @Volatile private var storeTimedOut = false
 
   /**
    * Executes the turn logic and returns a flow of events.
@@ -338,6 +369,8 @@ internal class LlmAgentTurn(
 
     var attempt = 0
     while (true) {
+      // A timeout at the last connection's end says nothing about this connection's saves.
+      storeTimedOut = false
       val handle = resumptionHandle.load()
       val attemptRequest = if (handle == null) request else request.resumingFrom(handle)
       // Null until the open returns, so the teardown can tell a failed open from a live connection.
@@ -413,11 +446,22 @@ internal class LlmAgentTurn(
       pendingBlockedReply.exchange(null)?.let { collector.emit(it) }
 
       // A blocked turn starts a fresh session, as ADK Python's restart does; it is not a drop.
-      if (result.end == LiveTurnsEnd.BLOCKED) return true
+      if (result.end == LiveTurnsEnd.BLOCKED) {
+        // Save both sides' audio heard before the block, so the blocked sentence is its own
+        // recording rather than joined with the next turn's; the next turn then starts clean.
+        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a blocked turn").forEach {
+          collector.emit(it)
+        }
+        return true
+      }
 
       val goAway = result.end == LiveTurnsEnd.GO_AWAY
       // Stop once the caller hung up, unless a go-away still has queued input left to drain.
       if (result.closedByCaller || (!goAway && queue.isClosed)) {
+        // Best effort: save what both sides said since the last turn ended, unlike ADK Python.
+        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "close").forEach {
+          collector.emit(it)
+        }
         failure?.let { throw it }
         break
       }
@@ -435,6 +479,10 @@ internal class LlmAgentTurn(
       val transferTo = handover?.transferTo
       // Transfer before the drop rethrow, so a drop during the handover still hands over.
       transferTo?.let { agentName ->
+        // Save the audio so far, so the next agent does not save this agent's audio as its own.
+        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a transfer").forEach {
+          collector.emit(it)
+        }
         val target =
           if (agentName == agent.name) agent
           else
@@ -447,20 +495,38 @@ internal class LlmAgentTurn(
       }
 
       // Any other handover is a task_completed, which ends its run (in a sequence, the step).
-      if (handover != null) return false
+      if (handover != null) {
+        // Save the audio so far, so the next step does not save this step's audio as its own.
+        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a completed step")
+          .forEach { collector.emit(it) }
+        return false
+      }
 
       // Without a handle a drop fails the run; a go-away continues in a fresh session below.
-      if (droppedBy != null && !goAway && resumptionHandle.load() == null) throw droppedBy
+      if (droppedBy != null && !goAway && resumptionHandle.load() == null) {
+        // Save the audio so far, so the failed run keeps it, as the close branch does.
+        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a drop").forEach {
+          collector.emit(it)
+        }
+        throw droppedBy
+      }
       // A go-away with no handle cannot resume, so it reopens a fresh session.
       val freshRestart = goAway && resumptionHandle.load() == null
       // A clean close with a handle reconnects, as ADK Python does; with none the run ends.
       if (!freshRestart && resumptionHandle.load() == null) {
+        // Save the audio so far, so a later step does not save this agent's audio as its own.
+        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a server close").forEach {
+          collector.emit(it)
+        }
         failure?.let { throw it }
         break
       }
       // A go-away never counts against the budget; a completed turn resets it too.
       if (result.completedATurn || goAway) attempt = 0
       if (attempt >= MAX_RECONNECT_ATTEMPTS) {
+        // Save the audio so far, so an exhausted reconnect keeps it, as the close branch does.
+        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "exhausted reconnects")
+          .forEach { collector.emit(it) }
         // The exhausting failure surfaces as itself; a go-away is reset above and never gets here.
         failure?.let { throw it }
         error("live connection could not be resumed after $MAX_RECONNECT_ATTEMPTS attempts")
@@ -484,6 +550,10 @@ internal class LlmAgentTurn(
         // A go-away still drains queued input, so a closed queue does not cut the wait short.
         goAway -> delay(liveReconnectDelay(attempt))
         withTimeoutOrNull(liveReconnectDelay(attempt)) { queue.closed.await() } != null -> {
+          // A hang-up while waiting saves what both sides said, as the close above does.
+          saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "close").forEach {
+            collector.emit(it)
+          }
           failure?.let { throw it }
           break
         }
@@ -516,7 +586,20 @@ internal class LlmAgentTurn(
           send(event to handled)
           handled.await()
         }
-        val receiver = async { receiveTurns(request, connection, queue, result, deliver) }
+        val saves = RecordingSaves(this, deliver)
+        recordingSaves.store(saves)
+        // A transport drop the sender saw, kept so it surfaces after the saves finish instead of
+        // cancelling the scope and its in-flight saves; read once the sender has joined below.
+        var sendDrop: Throwable? = null
+        val receiver = async {
+          try {
+            receiveTurns(request, connection, queue, result, deliver)
+          } catch (e: Throwable) {
+            // A drop or error cancels this scope; let running saves deliver their recordings first.
+            if (e !is CancellationException && !saves.finish()) storeTimedOut = true
+            throw e
+          }
+        }
         /**
          * Writes [pending]; on a [LiveWriteFailure] it records the error when the turn was already
          * stored, then waits for `receiver` to end, and if it is still running after
@@ -535,6 +618,13 @@ internal class LlmAgentTurn(
               result.outlivedWriteFailure = true
               if (!close()) receiver.cancel()
             }
+            return false
+          } catch (e: Throwable) {
+            // A transport drop would otherwise cancel the scope and its saves. Keep it, stop the
+            // receiver, and let the saves finish below; it is rethrown like a receive-side drop.
+            if (e is CancellationException || !e.isLiveTransportDrop()) throw e
+            sendDrop = e
+            receiver.cancel()
             return false
           }
         }
@@ -565,6 +655,12 @@ internal class LlmAgentTurn(
         }
         // Joined so the sender has stopped before the caller restarts or reconnects.
         sender.cancelAndJoin()
+        // Recordings still saving go out before a transfer, restart, reconnect or the run's end.
+        if (!saves.finish()) storeTimedOut = true
+        recordingSaves.store(null)
+        // Surfaced after the saves, so a send-side drop fails or resumes as a receive-side one
+        // does.
+        sendDrop?.let { throw it }
       }
       .buffer(Channel.RENDEZVOUS)
       .transform { (event, handled) ->
@@ -748,6 +844,8 @@ internal class LlmAgentTurn(
         )
       }
       emitEvent(event)
+      // Cut-off audio is left out; audio on a turnComplete response is flushed with this turn.
+      if (!response.interrupted) cacheModelAudio(event)
       sendToolResponse(queue, event)
     }
     val heard = response.inputTranscription
@@ -836,7 +934,7 @@ internal class LlmAgentTurn(
    * later or resumed run sees what it is replying to.
    *
    * Partial content is skipped as superseded, and function responses reach the session by their own
-   * path. Realtime audio is spoken over the connection, not recorded as a user turn.
+   * path. Realtime audio is not stored here; `saveLiveBlob` records it through the audio cache.
    */
   private suspend fun persistUserTurn(
     liveRequest: LiveRequest,
@@ -925,6 +1023,8 @@ internal class LlmAgentTurn(
 
     // Skipped on a replay, so a re-sent request does not record the same user turn twice.
     if (!pending.persisted) {
+      // Cached just before the send, as Python does.
+      if (input is RealtimeInput.Audio) audioCache?.cacheInput(input.blob)
       val storedTurn =
         input is ContentInput &&
           content != null &&
@@ -1016,6 +1116,201 @@ internal class LlmAgentTurn(
   }
 
   /**
+   * Records the model's audio, so a completed turn can be written out as one artifact.
+   *
+   * Reading the emitted event rather than the raw response records what the response processors
+   * produced, which is what the caller heard and what ADK Python records.
+   */
+  private suspend fun cacheModelAudio(event: Event) {
+    val cache = audioCache ?: return
+    event.content?.parts?.forEach { part -> part.inlineData?.let { cache.cacheOutput(it) } }
+  }
+
+  /**
+   * Saves the requested caches now, outside any connection, for a blocked turn, a close by either
+   * side, a transfer, a completed step, a drop with no handle or an exhausted reconnect. It waits
+   * at most [RecordingSaves.SAVE_TIMEOUT], and skips the save when the store already timed out at
+   * this connection's end, so a stuck store holds the run for one timeout, not two, and costs the
+   * recording rather than the run; [where] names the moment in the log.
+   */
+  // cache is shared with later connections but its caches are lock-guarded; taken is this save's
+  // own; saved is read while the job may still run and is safe because it is atomic.
+  @Suppress("UnsafeCoroutineCrossing")
+  private suspend fun saveRecordingsNow(
+    flushUserAudio: Boolean,
+    flushModelAudio: Boolean,
+    where: String,
+  ): List<Event> {
+    val cache = audioCache ?: return emptyList()
+    // Taken first, so the audio leaves the caches even when it is not saved.
+    val taken = cache.take(flushUserAudio, flushModelAudio)
+    if (taken.input.isEmpty() && taken.output.isEmpty()) return emptyList()
+    if (storeTimedOut) {
+      logger.error { "Dropped live audio at $where: the artifact store already timed out." }
+      return emptyList()
+    }
+    // The save runs detached, so a store that ignores cancellation cannot hold the run past the
+    // bound; each recording is published as it saves and read back after a bounded wait. A save
+    // past
+    // the bound still finishes detached -- its artifact lands in the store -- but its event is
+    // never
+    // read, so none is delivered after the run moved on. The scope is cancelled in the finally so a
+    // cancel during the wait does not leave the save running.
+    val saved = AtomicReference(emptyList<Event>())
+    val saveScope = CoroutineScope(currentCoroutineContext() + SupervisorJob())
+    try {
+      val job = saveScope.launch {
+        try {
+          val acc = mutableListOf<Event>()
+          cache.write(taken) { event ->
+            acc += event
+            saved.store(acc.toList())
+          }
+        } catch (e: CancellationException) {
+          throw e
+        } catch (e: Throwable) {
+          // Logged, not rethrown: an uncaught throw here would crash the process on Android.
+          logger.error { "Failed to save live audio at $where (${e::class.simpleName})." }
+        }
+      }
+      if (withTimeoutOrNull(RecordingSaves.SAVE_TIMEOUT) { job.join() } == null) {
+        storeTimedOut = true
+        logger.error {
+          "Dropped live audio still saving at $where after ${RecordingSaves.SAVE_TIMEOUT}."
+        }
+      }
+    } finally {
+      saveScope.cancel()
+    }
+    return saved.load()
+  }
+
+  /**
+   * Writes the recorded audio out when a turn ends, emitting one event per recording after the
+   * control event. An interruption flushes only the model's side, since the caller is mid-sentence.
+   *
+   * The control event goes out first, as in ADK Go, so a slow artifact save cannot delay a
+   * barge-in; ADK Python waits for the save and, when it saved a recording, drops the control
+   * event.
+   */
+  private suspend fun flushAudioOnControlEvent(
+    response: LlmResponse,
+    emitEvent: suspend (Event) -> Unit,
+  ) {
+    val cache = audioCache ?: return
+    val flushUserAudio =
+      when {
+        response.interrupted -> false
+        response.turnComplete == true -> true
+        else -> return
+      }
+    // Taken now, so the turn ends here; the save runs in the background when a connection is read.
+    val taken = cache.take(flushUserAudio = flushUserAudio, flushModelAudio = true)
+    val saves = recordingSaves.load()
+    if (saves != null && saves.isActive) saves.start(cache, taken)
+    else cache.write(taken, emitEvent)
+  }
+
+  /**
+   * Saves recordings off the receive loop, so a slow artifact store delays no other event; each is
+   * delivered once saved, in turn order. [finish] waits up to [SAVE_TIMEOUT], then leaves a
+   * still-running save to finish detached: its artifact still lands in the store, but its event is
+   * dropped, so nothing is delivered after the run moved on. A store that ignores cancellation can
+   * leave such detached saves running across reconnects until it returns; a cancellable one is
+   * cancelled when this connection's scope ends.
+   */
+  private class RecordingSaves(
+    private val scope: CoroutineScope,
+    private val deliver: suspend (Event) -> Unit,
+  ) {
+    // Saves run here, detached from [scope], so a store that ignores cancellation cannot hold the
+    // run open past [finish]; the dispatcher is [scope]'s, the job an independent supervisor.
+    private val saveScope = CoroutineScope(scope.coroutineContext + SupervisorJob())
+    // The delivery jobs, children of [scope] so [finish] can bound them; read once [finish]
+    // stopped.
+    private val jobs = mutableListOf<Job>()
+    // Completed by [finish] when it gives up waiting, so a delivery job stops waiting for a save
+    // still running and emits only what that save has already stored.
+    private val cutOff = CompletableDeferred<Unit>()
+
+    init {
+      // Cancel the detached saves whenever this connection's scope ends, including the abnormal
+      // exits that skip [finish] (a caller cancel, a collector or sender failure), so no save
+      // outlives the run; a cancellable store then stops and frees its taken audio.
+      scope.coroutineContext.job.invokeOnCompletion { saveScope.cancel() }
+    }
+
+    // The caches lock, writes go to the artifact service, and taken audio never changes. Each save
+    // publishes an immutable snapshot as it stores each recording, so a delivery cut short still
+    // sees what was saved before the cut-off without racing the save.
+    @Suppress("UnsafeCoroutineCrossing")
+    fun start(cache: AudioCacheManager, taken: AudioCacheManager.TakenAudio) {
+      val previous = jobs.lastOrNull()
+      val saved = AtomicReference(emptyList<Event>())
+      // Detached, so a stuck save never blocks the run.
+      val write = saveScope.launch {
+        try {
+          val acc = mutableListOf<Event>()
+          cache.write(taken) { event ->
+            acc += event
+            saved.store(acc.toList())
+          }
+        } catch (e: CancellationException) {
+          throw e
+        } catch (e: Throwable) {
+          // Logged, not rethrown: an uncaught throw here would crash the process on Android.
+          logger.error { "Failed to save live audio (${e::class.simpleName})." }
+        }
+      }
+      jobs += scope.launch {
+        // Wait for the save, unless [finish] cuts the wait short first.
+        select {
+          write.onJoin {}
+          cutOff.onAwait {}
+        }
+        // A later turn's save can finish first; its recordings still wait for this one.
+        previous?.join()
+        // All of it on a normal finish, what was stored so far on a cut-off.
+        for (recording in saved.load()) deliver(recording)
+      }
+    }
+
+    /** Whether recordings can still be started here; false once this connection's scope ended. */
+    val isActive: Boolean
+      get() = scope.isActive
+
+    /**
+     * Waits up to [SAVE_TIMEOUT] for the saves to finish and deliver in turn order. On timeout it
+     * stops waiting and returns false: each delivery then emits only what its save had already
+     * stored, and a save that ignores cancellation is left to finish detached, its later recordings
+     * dropped, so it cannot hold the run open.
+     */
+    suspend fun finish(): Boolean {
+      val running = jobs.filter { it.isActive }
+      if (running.isEmpty()) {
+        saveScope.cancel()
+        return true
+      }
+      if (withTimeoutOrNull(SAVE_TIMEOUT) { running.joinAll() } != null) {
+        saveScope.cancel()
+        return true
+      }
+      logger.error { "Cut off live audio save(s) still running after $SAVE_TIMEOUT." }
+      // Release the delivery jobs to emit what was stored so far; they are bounded now, so join
+      // them, then stop any lingering save (best effort; a non-cancellable one finishes detached).
+      cutOff.complete(Unit)
+      running.joinAll()
+      saveScope.cancel()
+      return false
+    }
+
+    companion object {
+      /** How long to wait for recordings still saving before moving on without them. */
+      val SAVE_TIMEOUT = 10.seconds
+    }
+  }
+
+  /**
    * Runs one live response through the response processors and tool calls, as ADK Python's live
    * postprocessing does; the model callbacks run only where [receiveTurns] calls them.
    */
@@ -1031,6 +1326,7 @@ internal class LlmAgentTurn(
         .withActionsFrom(callbackContext)
     // Live runs record no call_llm span, as in ADK Python.
     processModelResponse(request, response, baseEvent, span = NoOpSpan, emitEvent = emitEvent)
+    flushAudioOnControlEvent(response, emitEvent)
   }
 
   /**

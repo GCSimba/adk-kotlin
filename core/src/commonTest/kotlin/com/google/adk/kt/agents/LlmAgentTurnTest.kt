@@ -19,6 +19,8 @@
 package com.google.adk.kt.agents
 
 import com.google.adk.kt.annotations.ExperimentalLiveApi
+import com.google.adk.kt.artifacts.ArtifactService
+import com.google.adk.kt.artifacts.InMemoryArtifactService
 import com.google.adk.kt.callbacks.AfterAgentCallback
 import com.google.adk.kt.callbacks.AfterModelCallback
 import com.google.adk.kt.callbacks.BeforeModelCallback
@@ -47,6 +49,7 @@ import com.google.adk.kt.telemetry.Tracer
 import com.google.adk.kt.testing.DummyModel
 import com.google.adk.kt.testing.DummyTool
 import com.google.adk.kt.testing.DummyTracer
+import com.google.adk.kt.testing.SaveHookArtifactService
 import com.google.adk.kt.testing.TRANSFER_TO_AGENT_RESPONSE_PART
 import com.google.adk.kt.testing.connectionDrop
 import com.google.adk.kt.testing.goAway
@@ -58,6 +61,7 @@ import com.google.adk.kt.testing.modelParallelFunctionCallsResponse
 import com.google.adk.kt.testing.modelTransferToAgentResponse
 import com.google.adk.kt.testing.outputTranscription
 import com.google.adk.kt.testing.simplifyEvents
+import com.google.adk.kt.testing.storedBytes
 import com.google.adk.kt.testing.transferToAgentCallPart
 import com.google.adk.kt.testing.turnComplete
 import com.google.adk.kt.testing.userMessage
@@ -2215,6 +2219,53 @@ class LlmAgentTurnTest {
     assertNotEquals(events[1].id, events[3].id)
   }
 
+  @Test
+  fun runLive_withSaveLiveBlob_doesNotRecordTheInterruptedChunk() = runBlocking {
+    val artifacts = InMemoryArtifactService()
+    val connection =
+      RecordingLiveConnection(
+        listOf(
+          LlmResponse(content = modelAudio(1, 2)),
+          LlmResponse(content = modelAudio(3), interrupted = true),
+          turnComplete(),
+        )
+      )
+    val agent = liveAgent(connection)
+    val context =
+      liveContextFor(agent, runConfig = RunConfig(saveLiveBlob = true), artifactService = artifacts)
+
+    val events = agent.runLive(context).toList()
+
+    val recording = events.single { it.content?.parts?.firstOrNull()?.fileData != null }
+    assertEquals(
+      listOf<Byte>(1, 2),
+      artifacts.storedBytes(recording, context.session.key)?.toList(),
+    )
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlobButNoArtifactService_keepsNoAudio() = runBlocking {
+    val agent = liveAgent(RecordingLiveConnection(listOf(LlmResponse(content = modelAudio(1, 2)))))
+    val queue = LiveRequestQueue()
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    queue.close()
+    val context = liveContextFor(agent, queue, runConfig = RunConfig(saveLiveBlob = true))
+
+    val unused = agent.runLive(context).toList()
+
+    // With nowhere to save a recording, neither side's audio is held for one.
+    assertEquals(0, context.frameworkData.inputRealtimeCache.take().size)
+    assertEquals(0, context.frameworkData.outputRealtimeCache.take().size)
+  }
+
+  private fun modelAudio(vararg bytes: Byte) =
+    Content(
+      role = Role.MODEL,
+      parts = listOf(Part(inlineData = Blob(mimeType = "audio/pcm;rate=24000", data = bytes))),
+    )
+
   private fun liveAgent(
     connection: LiveConnection,
     outputKey: String? = null,
@@ -2354,6 +2405,7 @@ class LlmAgentTurnTest {
     session: Session? = null,
     sessionService: SessionService? = null,
     runConfig: RunConfig? = null,
+    artifactService: ArtifactService? = null,
   ): InvocationContext =
     InvocationContext(
         agent = agent,
@@ -2362,6 +2414,7 @@ class LlmAgentTurnTest {
             ?: InMemorySessionService().createSession(SessionKey("app", "user", "live-session")),
         runConfig = runConfig,
         sessionService = sessionService,
+        artifactService = artifactService,
       )
       .apply { frameworkData.liveRequestQueue = queue }
 
@@ -3189,6 +3242,33 @@ class LlmAgentTurnTest {
     assertEquals(8, connects)
     assertTrue(events.any { it.content?.parts?.singleOrNull()?.text == "done" })
   }
+
+  @Test
+  fun runLive_withSaveLiveBlob_audioOnATurnCompleteResponse_isRecordedWithItsOwnTurn() =
+    runBlocking {
+      val artifacts = InMemoryArtifactService()
+      val connection =
+        RecordingLiveConnection(
+          listOf(LlmResponse(content = modelAudio(1, 2), turnComplete = true)),
+          listOf(LlmResponse(content = modelAudio(3)), turnComplete()),
+        )
+      val agent = liveAgent(connection)
+      val context =
+        liveContextFor(
+          agent,
+          runConfig = RunConfig(saveLiveBlob = true),
+          artifactService = artifacts,
+        )
+
+      val events = agent.runLive(context).toList()
+
+      val recorded =
+        events
+          .filter { it.content?.parts?.firstOrNull()?.fileData != null }
+          .map { artifacts.storedBytes(it, context.session.key)?.toList() }
+      // The caller heard the audio on the turnComplete response, so that turn's recording keeps it.
+      assertEquals(listOf(listOf<Byte>(1, 2), listOf<Byte>(3)), recorded)
+    }
 
   @Test
   fun runLive_dropWhileWritingTheTransferAnswer_stillTransfers() = runTest {
@@ -4505,6 +4585,1359 @@ class LlmAgentTurnTest {
         override fun nextLong(from: Long, until: Long) = until - 1
       }
     assertEquals(4000L, liveReconnectDelay(5, maxDraw).inWholeMilliseconds)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_interruption_keepsRecordingTheCaller() = runBlocking {
+    val artifacts = InMemoryArtifactService()
+    val connection =
+      RecordingLiveConnection(
+        listOf(
+          LlmResponse(content = modelAudio(1)),
+          LlmResponse(content = modelAudio(2), interrupted = true),
+          turnComplete(),
+        )
+      )
+    val agent = liveAgent(connection)
+    val queue = LiveRequestQueue()
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    queue.close()
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = artifacts,
+      )
+
+    val events = agent.runLive(context).toList()
+
+    val userRecordings = events.filter {
+      it.author == Role.USER && it.content?.parts?.firstOrNull()?.fileData != null
+    }
+    assertEquals(1, userRecordings.size)
+    assertEquals(
+      listOf<Byte>(9),
+      artifacts.storedBytes(userRecordings.single(), context.session.key)?.toList(),
+    )
+    // The caller's recording is emitted at turnComplete, after the earlier interrupted event.
+    val interruptedAt = events.indexOfFirst { it.interrupted }
+    assertTrue(interruptedAt in 0 until events.indexOf(userRecordings.single()))
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_interruption_emitsTheModelRecordingAfterTheInterruption() =
+    runBlocking {
+      val artifacts = InMemoryArtifactService()
+      val connection =
+        RecordingLiveConnection(
+          listOf(
+            LlmResponse(content = modelAudio(1)),
+            LlmResponse(interrupted = true),
+            turnComplete(),
+          )
+        )
+      val agent = liveAgent(connection)
+      val context =
+        liveContextFor(
+          agent,
+          runConfig = RunConfig(saveLiveBlob = true),
+          artifactService = artifacts,
+        )
+
+      val events = agent.runLive(context).toList()
+
+      val recordingAt = events.indexOfFirst { it.content?.parts?.firstOrNull()?.fileData != null }
+      val interruptedAt = events.indexOfFirst { it.interrupted }
+      // The interruption goes out first, so the caller can stop playback before the save.
+      assertTrue(
+        interruptedAt in 0 until recordingAt,
+        "interrupted $interruptedAt, recording $recordingAt",
+      )
+    }
+
+  @Test
+  fun runLive_withSaveLiveBlob_transfer_savesEachAgentsAudioUnderItsOwnName() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    val parentConn =
+      ScriptedConn("parent") {
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        emit(modelTransferToAgentResponse("child"))
+        it.closed.await()
+      }
+    val childConn =
+      ScriptedConn("child") {
+        emit(LlmResponse(content = modelAudio(3)))
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val child = LlmAgent(name = "child", description = "c", model = RecordingLiveModel(childConn))
+    val parent =
+      LlmAgent(name = "parent", model = RecordingLiveModel(parentConn), subAgents = listOf(child))
+    val context =
+      liveContextFor(
+        parent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = artifacts,
+      )
+
+    val events = parent.runLive(context).toList()
+
+    val recordings = events.filter { it.content?.parts?.firstOrNull()?.fileData != null }
+    val parentRecording = recordings.single { it.author == "parent" }
+    assertEquals(
+      listOf<Byte>(1, 2),
+      artifacts.storedBytes(parentRecording, context.session.key)?.toList(),
+    )
+    val childRecording = recordings.single { it.author == "child" }
+    assertEquals(
+      listOf<Byte>(3),
+      artifacts.storedBytes(childRecording, context.session.key)?.toList(),
+    )
+    // The handover saves the parent's audio and the caller's, so both land before the child speaks.
+    val childStartsAt = events.indexOfFirst { it.author == "child" && it !in recordings }
+    val callerRecording = recordings.single { it.author == Role.USER }
+    assertTrue(events.indexOf(parentRecording) in 0 until childStartsAt)
+    assertTrue(events.indexOf(callerRecording) in 0 until childStartsAt)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_transferAfterUnfinishedSpeech_ordersSpeechThenRecordingsThenChild() =
+    runTest {
+      val artifacts = InMemoryArtifactService()
+      val queue = LiveRequestQueue()
+      queue.sendRealtime(
+        RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+      )
+      val parentConn =
+        ScriptedConn("parent") {
+          emit(inputTranscription("Can you transfer me?", finished = false))
+          emit(LlmResponse(content = modelAudio(1, 2)))
+          emit(modelTransferToAgentResponse("child"))
+          it.closed.await()
+        }
+      val childConn =
+        ScriptedConn("child") {
+          emit(LlmResponse(content = modelMessage("child here")))
+          emit(turnComplete())
+          queue.close()
+          it.closed.await()
+        }
+      val child = LlmAgent(name = "child", description = "c", model = RecordingLiveModel(childConn))
+      val parent =
+        LlmAgent(name = "parent", model = RecordingLiveModel(parentConn), subAgents = listOf(child))
+      val context =
+        liveContextFor(
+          parent,
+          queue,
+          runConfig = RunConfig(saveLiveBlob = true),
+          artifactService = artifacts,
+        )
+
+      val events = parent.runLive(context).toList()
+
+      val speechAt = events.indexOfFirst { it.inputTranscription?.finished == true }
+      val recordingsAt =
+        events.indices.filter { i ->
+          events[i].content?.parts?.firstOrNull()?.fileData != null && events[i].author != "child"
+        }
+      val childAt = events.indexOfFirst { it.author == "child" }
+      // The caller's words come first, then this agent's recordings, then the next agent.
+      assertEquals(2, recordingsAt.size)
+      assertTrue(speechAt >= 0)
+      assertTrue(recordingsAt.all { it in (speechAt + 1) until childAt })
+    }
+
+  /**
+   * An artifact store whose saves take [delaysMillis] in call order (the last repeats), like a
+   * remote one.
+   */
+  private fun slowArtifactService(
+    inner: InMemoryArtifactService = InMemoryArtifactService(),
+    delaysMillis: List<Long> = listOf(1_500),
+  ) = SaveHookArtifactService(inner) { delay(delaysMillis[minOf(it, delaysMillis.lastIndex)]) }
+
+  @Test
+  fun runLive_withSaveLiveBlob_slowSave_emitsTheInterruptionWithoutWaitingForIt() = runTest {
+    var interruptSentAt = -1L
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        interruptSentAt = testScheduler.currentTime
+        emit(LlmResponse(interrupted = true))
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        LiveRequestQueue(),
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = slowArtifactService(),
+      )
+    var interruptedAt = -1L
+    var recordedAt = -1L
+    backgroundScope.launch {
+      agent.runLive(context).collect { event ->
+        if (event.interrupted) interruptedAt = testScheduler.currentTime
+        if (event.content?.parts?.firstOrNull()?.fileData != null) {
+          recordedAt = testScheduler.currentTime
+        }
+      }
+    }
+
+    testScheduler.advanceTimeBy(5_000)
+
+    // The caller stops playback on the interruption, so it must not wait for the upload.
+    assertEquals(interruptSentAt, interruptedAt)
+    assertEquals(interruptSentAt + 1_500, recordedAt)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_blockedOutput_savesTheBlockedTurnsAudioOnItsOwn() = runBlocking {
+    val artifacts = InMemoryArtifactService()
+    val model =
+      RecordingLiveModel(
+        RecordingLiveConnection(
+          listOf(
+            LlmResponse(content = modelAudio(1, 2)),
+            LlmResponse(outputTranscription = Transcription(text = "secret")),
+          )
+        ),
+        RecordingLiveConnection(listOf(LlmResponse(content = modelAudio(3)), turnComplete())),
+      )
+    val agent =
+      LlmAgent(name = "LiveAgent", model = model, afterModelCallbacks = listOf(blockSecret()))
+    val context =
+      liveContextFor(agent, runConfig = RunConfig(saveLiveBlob = true), artifactService = artifacts)
+
+    val events = agent.runLive(context).toList()
+
+    val recorded =
+      events
+        .filter { it.content?.parts?.firstOrNull()?.fileData != null }
+        .map { artifacts.storedBytes(it, context.session.key)?.toList() }
+    // The block ends the turn, so the audio heard before it is not folded into the next turn.
+    assertEquals(listOf(listOf<Byte>(1, 2), listOf<Byte>(3)), recorded)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_blockedTurn_savesTheUsersBlockedAudioAsItsOwnRecording() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    // The user speaks [9] before the block.
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    val sent9 = CompletableDeferred<Unit>()
+    val first =
+      ScriptedConn("c0") {
+        // Nothing until [9] is cached; then a transcription the after-model callback blocks.
+        sent9.await()
+        emit(LlmResponse(outputTranscription = Transcription(text = "secret")))
+        it.closed.await()
+      }
+    first.onSendRealtime = { sent9.complete(Unit) }
+    val sent10 = CompletableDeferred<Unit>()
+    val second =
+      ScriptedConn("c1") {
+        // The restarted session hears [10], then the turn completes.
+        queue.sendRealtime(
+          RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(10)))
+        )
+        sent10.await()
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    second.onSendRealtime = { sent10.complete(Unit) }
+    val agent =
+      LlmAgent(
+        name = "a",
+        model = RecordingLiveModel(first, second),
+        afterModelCallbacks = listOf(blockSecret()),
+      )
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = artifacts,
+      )
+
+    val events = agent.runLive(context).toList()
+
+    val userRecordings =
+      events
+        .filter { it.author == Role.USER && it.content?.parts?.firstOrNull()?.fileData != null }
+        .map { artifacts.storedBytes(it, context.session.key)?.toList() }
+    // The blocked sentence is its own recording, not joined with the next turn's input.
+    assertEquals(listOf(listOf<Byte>(9), listOf<Byte>(10)), userRecordings)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_blockedInput_savesTheUsersBlockedAudioAsItsOwnRecording() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    val sent9 = CompletableDeferred<Unit>()
+    val refusal = modelMessage("not allowed")
+    val first =
+      ScriptedConn("c0") {
+        // Nothing until [9] is cached; then a finished input transcription the callback blocks.
+        sent9.await()
+        emit(inputTranscription("forbidden", finished = true))
+        it.closed.await()
+      }
+    first.onSendRealtime = { sent9.complete(Unit) }
+    val sent10 = CompletableDeferred<Unit>()
+    val second =
+      ScriptedConn("c1") {
+        queue.sendRealtime(
+          RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(10)))
+        )
+        sent10.await()
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    second.onSendRealtime = { sent10.complete(Unit) }
+    val agent =
+      LlmAgent(
+        name = "a",
+        model = RecordingLiveModel(first, second),
+        beforeModelCallbacks = listOf(blockText("forbidden", refusal)),
+      )
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = artifacts,
+      )
+
+    val events = agent.runLive(context).toList()
+
+    val userRecordings =
+      events
+        .filter { it.author == Role.USER && it.content?.parts?.firstOrNull()?.fileData != null }
+        .map { artifacts.storedBytes(it, context.session.key)?.toList() }
+    // A blocked spoken sentence is its own recording, not joined with the next turn's input.
+    assertEquals(listOf(listOf<Byte>(9), listOf<Byte>(10)), userRecordings)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_runCancelledMidSave_cancelsTheSave() = runTest {
+    val saving = CompletableDeferred<Unit>()
+    val cancelled = CompletableDeferred<Unit>()
+    // A hung but cancellable store: it signals when a save starts, and when it is cancelled.
+    val store = SaveHookArtifactService {
+      saving.complete(Unit)
+      try {
+        awaitCancellation()
+      } finally {
+        cancelled.complete(Unit)
+      }
+    }
+    val queue = LiveRequestQueue()
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1)))
+        // Starts a background save that then hangs; the connection stays open.
+        emit(turnComplete())
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = store,
+      )
+
+    val run = backgroundScope.launch { agent.runLive(context).collect {} }
+    saving.await()
+    // Cancelling the run must cancel the detached save, not leave it holding the taken audio.
+    run.cancelAndJoin()
+    advanceUntilIdle()
+
+    assertTrue(cancelled.isCompleted, "the save was not cancelled when the run was")
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_callerClosesMidAnswer_stillSavesBothSides() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        queue.close()
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = artifacts,
+      )
+
+    val events = agent.runLive(context).toList()
+
+    val recordings = events.filter { it.content?.parts?.firstOrNull()?.fileData != null }
+    // Hanging up mid-answer still keeps what both sides said so far.
+    assertEquals(
+      listOf<Byte>(1, 2),
+      artifacts.storedBytes(recordings.single { it.author == "a" }, context.session.key)?.toList(),
+    )
+    assertEquals(
+      listOf<Byte>(9),
+      artifacts
+        .storedBytes(recordings.single { it.author == Role.USER }, context.session.key)
+        ?.toList(),
+    )
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_callerClosesDuringTheReconnectWait_stillSavesBothSides() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    val sent = CompletableDeferred<Unit>()
+    val first =
+      ScriptedConn("c0") {
+        emit(handleUpdate("h-1"))
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        sent.await()
+      }
+    first.onSendRealtime = { sent.complete(Unit) }
+    // Launched from the teardown so the hang-up lands in the wait before the reconnect; this relies
+    // on nothing suspending between the teardown and the queue.isClosed check above the wait.
+    first.onClose = { launch { queue.close() } }
+    val second = ScriptedConn("c1") { it.closed.await() }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(first, second))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = artifacts,
+      )
+
+    val events = agent.runLive(context).toList()
+
+    val recorded =
+      events
+        .filter { it.content?.parts?.firstOrNull()?.fileData != null }
+        .map { it.author to artifacts.storedBytes(it, context.session.key)?.toList() }
+    // Hanging up before the clean close resumes still keeps what both sides said so far. On a zero
+    // jitter draw (about 1 run in 251) the normal close branch saves instead, so green is stable.
+    assertEquals(listOf(Role.USER to listOf<Byte>(9), "a" to listOf<Byte>(1, 2)), recorded)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_closeWhoseModelSaveHangs_stillDeliversTheCallersRecording() =
+    runTest {
+      val artifacts = InMemoryArtifactService()
+      val queue = LiveRequestQueue()
+      queue.sendRealtime(
+        RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+      )
+      val connection =
+        ScriptedConn("model") {
+          emit(LlmResponse(content = modelAudio(1, 2)))
+          queue.close()
+          it.closed.await()
+        }
+      val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+      val context =
+        liveContextFor(
+          agent,
+          queue,
+          runConfig = RunConfig(saveLiveBlob = true),
+          // The caller's audio saves first; the model's save then never finishes.
+          artifactService = SaveHookArtifactService(artifacts) { if (it == 1) awaitCancellation() },
+        )
+
+      val events = withTimeoutOrNull(60_000) { agent.runLive(context).toList() }
+
+      val recorded =
+        checkNotNull(events)
+          .filter { it.content?.parts?.firstOrNull()?.fileData != null }
+          .map { it.author to artifacts.storedBytes(it, context.session.key)?.toList() }
+      // A stored recording is still reported when the save after it times out.
+      assertEquals(listOf(Role.USER to listOf<Byte>(9)), recorded)
+    }
+
+  @Test
+  fun runLive_withSaveLiveBlob_slowSave_doesNotDelayTheEventsAfterIt() = runTest {
+    var interruptSentAt = -1L
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        interruptSentAt = testScheduler.currentTime
+        emit(LlmResponse(interrupted = true))
+        emit(LlmResponse(inputTranscription = Transcription(text = "stop", finished = true)))
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        LiveRequestQueue(),
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = slowArtifactService(),
+      )
+    var heardAt = -1L
+    backgroundScope.launch {
+      agent.runLive(context).collect { event ->
+        if (event.inputTranscription?.text == "stop") heardAt = testScheduler.currentTime
+      }
+    }
+
+    testScheduler.advanceTimeBy(5_000)
+
+    // The recording saves in the background, so the caller's next words are not held behind it.
+    assertEquals(interruptSentAt, heardAt)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_dropDuringASave_stillDeliversTheRecording() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    val first =
+      ScriptedConn("c0") {
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        emit(LlmResponse(interrupted = true))
+        delay(200)
+        throw connectionDrop()
+      }
+    val second =
+      ScriptedConn("c1") {
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(first, second))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig =
+          RunConfig(
+            saveLiveBlob = true,
+            sessionResumption = SessionResumptionConfig(handle = "h-1"),
+          ),
+        artifactService = slowArtifactService(artifacts),
+      )
+
+    val events = agent.runLive(context).toList()
+
+    // The drop must not cancel a save that is still running.
+    val recording = events.single { it.content?.parts?.firstOrNull()?.fileData != null }
+    assertEquals(
+      listOf<Byte>(1, 2),
+      artifacts.storedBytes(recording, context.session.key)?.toList(),
+    )
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_dropOnTheSendSideDuringASave_stillDeliversTheRecording() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    val first =
+      ScriptedConn("c0") {
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        emit(turnComplete())
+        // Sent while the turn's recording is still saving; writing it drops the connection.
+        queue.sendContent(userMessage("hi"))
+        it.closed.await()
+      }
+    first.onSendContent = { throw connectionDrop() }
+    val second =
+      ScriptedConn("c1") {
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(first, second))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig =
+          RunConfig(
+            saveLiveBlob = true,
+            sessionResumption = SessionResumptionConfig(handle = "h-1"),
+          ),
+        artifactService = slowArtifactService(artifacts),
+      )
+
+    val events = agent.runLive(context).toList()
+
+    val recorded =
+      events
+        .filter { it.content?.parts?.firstOrNull()?.fileData != null }
+        .map { artifacts.storedBytes(it, context.session.key)?.toList() }
+    // A drop the send side sees must not cancel a save either.
+    assertEquals(listOf(listOf<Byte>(1, 2)), recorded)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_dropWithNoHandle_savesTheAudioBeforeFailing() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    val connection =
+      ScriptedConn("c0") {
+        // Audio with no turn-complete stays in the cache, then the connection drops with no handle.
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        throw connectionDrop()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = artifacts,
+      )
+
+    val recordings = mutableListOf<Event>()
+    // No handle, so the drop fails the run; the recording must still come out before it does.
+    assertFailsWith<GenAiApiException> {
+      agent.runLive(context).collect { event ->
+        if (event.content?.parts?.firstOrNull()?.fileData != null) recordings += event
+      }
+    }
+
+    val recorded = recordings.map {
+      it.author to artifacts.storedBytes(it, context.session.key)?.toList()
+    }
+    assertEquals(listOf(Role.USER to listOf<Byte>(9), "a" to listOf<Byte>(1, 2)), recorded)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_saveThatNeverEnds_doesNotHoldTheRunOpen() = runTest {
+    val queue = LiveRequestQueue()
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = hungArtifactService(),
+      )
+
+    val events = withTimeoutOrNull(60_000) { agent.runLive(context).toList() }
+
+    // The wait for unfinished saves is bounded, so a stuck store cannot keep the run from ending.
+    assertNotNull(events)
+    assertTrue(testScheduler.currentTime < 60_000)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_twoSavesInFlight_deliverTheirRecordingsInTurnOrder() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1)))
+        emit(LlmResponse(interrupted = true))
+        emit(LlmResponse(content = modelAudio(2)))
+        emit(turnComplete())
+        delay(5_000)
+        queue.close()
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        // The first save is the slow one, so finishing order alone would put it second.
+        artifactService = slowArtifactService(artifacts, listOf(1_500, 100)),
+      )
+
+    val events = agent.runLive(context).toList()
+
+    val recorded =
+      events
+        .filter { it.content?.parts?.firstOrNull()?.fileData != null }
+        .map { artifacts.storedBytes(it, context.session.key)?.toList() }
+    assertEquals(listOf(listOf<Byte>(1), listOf<Byte>(2)), recorded)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_transferDuringASave_deliversItBeforeTheChild() = runTest {
+    val queue = LiveRequestQueue()
+    val parentConn =
+      ScriptedConn("parent") {
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        emit(LlmResponse(interrupted = true))
+        emit(modelTransferToAgentResponse("child"))
+        it.closed.await()
+      }
+    val childConn =
+      ScriptedConn("child") {
+        emit(LlmResponse(content = modelMessage("child here")))
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val child = LlmAgent(name = "child", description = "c", model = RecordingLiveModel(childConn))
+    val parent =
+      LlmAgent(name = "parent", model = RecordingLiveModel(parentConn), subAgents = listOf(child))
+    val context =
+      liveContextFor(
+        parent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = slowArtifactService(),
+      )
+
+    val events = parent.runLive(context).toList()
+
+    // The handover waits for the save, so the parent's recording still comes before the child.
+    val recordingAt = events.indexOfFirst {
+      it.author == "parent" && it.content?.parts?.firstOrNull()?.fileData != null
+    }
+    val childAt = events.indexOfFirst { it.author == "child" }
+    assertTrue(recordingAt in 0 until childAt, "recording $recordingAt, child $childAt")
+  }
+
+  /** An artifact store whose saves never finish, like one that hangs. */
+  private fun hungArtifactService() = SaveHookArtifactService { awaitCancellation() }
+
+  /** A store whose every save blocks uncancellably, like GCS blocking I/O in Dispatchers.IO. */
+  private fun uncancellableHungArtifactService() = SaveHookArtifactService {
+    withContext(NonCancellable) { delay(60_000) }
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_uncancellableCloseSave_proceedsAtTheBoundAndDropsTheRecording() =
+    runTest {
+      val queue = LiveRequestQueue()
+      queue.sendRealtime(
+        RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+      )
+      val connection =
+        ScriptedConn("model") {
+          // Audio with no turn-complete stays cached; the caller then hangs up.
+          emit(LlmResponse(content = modelAudio(1, 2)))
+          queue.close()
+          it.closed.await()
+        }
+      val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+      val context =
+        liveContextFor(
+          agent,
+          queue,
+          runConfig = RunConfig(saveLiveBlob = true),
+          artifactService = uncancellableHungArtifactService(),
+        )
+
+      val events = withTimeoutOrNull(120_000) { agent.runLive(context).toList() }
+      val endedAt = testScheduler.currentTime
+
+      // A store that ignores cancellation cannot hold the close past the bound.
+      assertNotNull(events)
+      assertTrue(endedAt in 10_000..11_000, "ended at $endedAt ms")
+      // The late save's recording is never emitted.
+      assertTrue(checkNotNull(events).none { it.content?.parts?.firstOrNull()?.fileData != null })
+    }
+
+  @Test
+  fun runLive_withSaveLiveBlob_uncancellableBgSave_proceedsAtBoundAndDropsIt() = runTest {
+    val queue = LiveRequestQueue()
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1)))
+        // This turn's background save starts and blocks uncancellably.
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = uncancellableHungArtifactService(),
+      )
+
+    val events = withTimeoutOrNull(120_000) { agent.runLive(context).toList() }
+    val endedAt = testScheduler.currentTime
+
+    // finish()'s wait is bounded even when the save ignores cancellation.
+    assertNotNull(events)
+    assertTrue(endedAt in 10_000..11_000, "ended at $endedAt ms")
+    // The late background recording is cut off, never delivered after the run moved on.
+    assertTrue(checkNotNull(events).none { it.content?.parts?.firstOrNull()?.fileData != null })
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_transferWithAHungStore_stillHandsOver() = runTest {
+    val queue = LiveRequestQueue()
+    val parentConn =
+      ScriptedConn("parent") {
+        emit(LlmResponse(content = modelAudio(1, 2)))
+        emit(modelTransferToAgentResponse("child"))
+        it.closed.await()
+      }
+    val childConn =
+      ScriptedConn("child") {
+        emit(LlmResponse(content = modelMessage("child here")))
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val child = LlmAgent(name = "child", description = "c", model = RecordingLiveModel(childConn))
+    val parent =
+      LlmAgent(name = "parent", model = RecordingLiveModel(parentConn), subAgents = listOf(child))
+    val context =
+      liveContextFor(
+        parent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = hungArtifactService(),
+      )
+
+    val events = withTimeoutOrNull(60_000) { parent.runLive(context).toList() }
+
+    // A stuck store costs the recording, not the handover.
+    assertNotNull(events)
+    assertTrue(checkNotNull(events).any { it.author == "child" })
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_blockedOutputWithAHungStore_stillRestarts() = runTest {
+    val model =
+      RecordingLiveModel(
+        RecordingLiveConnection(
+          listOf(
+            LlmResponse(content = modelAudio(1, 2)),
+            LlmResponse(outputTranscription = Transcription(text = "secret")),
+          )
+        ),
+        RecordingLiveConnection(listOf(turnComplete())),
+      )
+    val agent =
+      LlmAgent(name = "LiveAgent", model = model, afterModelCallbacks = listOf(blockSecret()))
+    val context =
+      liveContextFor(
+        agent,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = hungArtifactService(),
+      )
+
+    val events = withTimeoutOrNull(60_000) { agent.runLive(context).toList() }
+
+    // A stuck store costs the recording, not the restart.
+    assertNotNull(events)
+    assertTrue(checkNotNull(events).any { it.turnComplete })
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_transferWithAHungStore_waitsOneSaveTimeoutInTotal() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    var childAtMs = -1L
+    val parentConn =
+      ScriptedConn("parent") {
+        emit(LlmResponse(content = modelAudio(1)))
+        // This turn's save starts in the background and never finishes.
+        emit(turnComplete())
+        emit(LlmResponse(content = modelAudio(2)))
+        emit(modelTransferToAgentResponse("child"))
+        it.closed.await()
+      }
+    val childConn =
+      ScriptedConn("child") {
+        emit(LlmResponse(content = modelAudio(3)))
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val childModel =
+      RecordingLiveModel(childConn, onConnect = { childAtMs = testScheduler.currentTime })
+    val child = LlmAgent(name = "child", description = "c", model = childModel)
+    val parent =
+      LlmAgent(name = "parent", model = RecordingLiveModel(parentConn), subAgents = listOf(child))
+    val context =
+      liveContextFor(
+        parent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = SaveHookArtifactService(artifacts) { if (it == 0) awaitCancellation() },
+      )
+
+    val events = withTimeoutOrNull(60_000) { parent.runLive(context).toList() }
+
+    // Once the store has timed out, the handover skips its own save instead of waiting again.
+    assertNotNull(events)
+    assertTrue(childAtMs in 10_000..11_000, "child connected at $childAtMs ms")
+    // The parent's last audio is dropped then, not saved under the child's name.
+    val childRecording =
+      checkNotNull(events).single {
+        it.author == "child" && it.content?.parts?.firstOrNull()?.fileData != null
+      }
+    assertEquals(
+      listOf<Byte>(3),
+      artifacts.storedBytes(childRecording, context.session.key)?.toList(),
+    )
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_closeWithAHungStore_waitsOneSaveTimeoutInTotal() = runTest {
+    val queue = LiveRequestQueue()
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1)))
+        // This turn's save starts in the background and never finishes.
+        emit(turnComplete())
+        emit(LlmResponse(content = modelAudio(2)))
+        queue.close()
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = hungArtifactService(),
+      )
+
+    val events = withTimeoutOrNull(60_000) { agent.runLive(context).toList() }
+
+    // Once the store has timed out, the close skips its own save instead of waiting again.
+    assertNotNull(events)
+    assertTrue(
+      testScheduler.currentTime in 10_000..10_500,
+      "ended at ${testScheduler.currentTime} ms",
+    )
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_laterSaveDoneWhileAnEarlierOneHangs_stillDeliversIt() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1)))
+        // This turn's save starts in the background and never finishes.
+        emit(turnComplete())
+        emit(LlmResponse(content = modelAudio(2)))
+        // This turn's save finishes at once, then waits for the first to keep turn order.
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = SaveHookArtifactService(artifacts) { if (it == 0) awaitCancellation() },
+      )
+
+    val events = withTimeoutOrNull(60_000) { agent.runLive(context).toList() }
+
+    val recorded =
+      checkNotNull(events)
+        .filter { it.content?.parts?.firstOrNull()?.fileData != null }
+        .map { artifacts.storedBytes(it, context.session.key)?.toList() }
+    // Only the hung save is dropped; the later recording is already stored, so it still goes out.
+    assertEquals(listOf(listOf<Byte>(2)), recorded)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_turnWhoseModelSaveHangs_stillDeliversTheCallersRecording() =
+    runTest {
+      val artifacts = InMemoryArtifactService()
+      val queue = LiveRequestQueue()
+      queue.sendRealtime(
+        RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+      )
+      val sent = CompletableDeferred<Unit>()
+      val connection =
+        ScriptedConn("model") {
+          sent.await()
+          emit(LlmResponse(content = modelAudio(1, 2)))
+          // This turn's save stores the caller's audio, then never finishes the model's.
+          emit(turnComplete())
+          queue.close()
+          it.closed.await()
+        }
+      connection.onSendRealtime = { sent.complete(Unit) }
+      val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+      val context =
+        liveContextFor(
+          agent,
+          queue,
+          runConfig = RunConfig(saveLiveBlob = true),
+          artifactService = SaveHookArtifactService(artifacts) { if (it == 1) awaitCancellation() },
+        )
+
+      val events = withTimeoutOrNull(60_000) { agent.runLive(context).toList() }
+
+      val recorded =
+        checkNotNull(events)
+          .filter { it.content?.parts?.firstOrNull()?.fileData != null }
+          .map { it.author to artifacts.storedBytes(it, context.session.key)?.toList() }
+      // A background save that times out still reports the recording it stored.
+      assertEquals(listOf(Role.USER to listOf<Byte>(9)), recorded)
+    }
+
+  @Test
+  fun runLive_withSaveLiveBlob_dropAfterAStoreTimeout_skipsTheHandoversSave() = runTest {
+    val queue = LiveRequestQueue()
+    var childAtMs = -1L
+    val parentConn =
+      ScriptedConn("parent") {
+        emitAll(
+          channelFlow {
+            send(LlmResponse(content = modelAudio(1)))
+            // This turn's save starts in the background and never finishes.
+            send(turnComplete())
+            send(LlmResponse(content = modelAudio(2)))
+            send(modelTransferToAgentResponse("child"))
+            // The connection drops during the handover pause.
+            delay(200)
+            throw connectionDrop()
+          }
+        )
+      }
+    val childConn = ScriptedConn("child") { it.closed.await() }
+    val childModel =
+      RecordingLiveModel(
+        childConn,
+        onConnect = {
+          childAtMs = testScheduler.currentTime
+          queue.close()
+        },
+      )
+    val child = LlmAgent(name = "child", description = "c", model = childModel)
+    val parent =
+      LlmAgent(name = "parent", model = RecordingLiveModel(parentConn), subAgents = listOf(child))
+    val context =
+      liveContextFor(
+        parent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = hungArtifactService(),
+      )
+
+    val events = withTimeoutOrNull(60_000) { parent.runLive(context).toList() }
+
+    // The drop's wait already timed out, so the handover skips its own save instead of waiting
+    // again.
+    assertNotNull(events)
+    assertTrue(childAtMs in 10_000..11_000, "child connected at $childAtMs ms")
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_slowSaveThenAHungClose_stillSavesTheTransfersAudio() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    val parentConn =
+      ScriptedConn("parent") {
+        emit(LlmResponse(content = modelAudio(1)))
+        // This turn's save takes 6 s but finishes.
+        emit(turnComplete())
+        emit(LlmResponse(content = modelAudio(2)))
+        emit(modelTransferToAgentResponse("child"))
+        it.closed.await()
+      }
+    // The close never returns, so the teardown waits out its own bound.
+    parentConn.onClose = { awaitCancellation() }
+    val childConn =
+      ScriptedConn("child") {
+        queue.close()
+        it.closed.await()
+      }
+    val child = LlmAgent(name = "child", description = "c", model = RecordingLiveModel(childConn))
+    val parent =
+      LlmAgent(name = "parent", model = RecordingLiveModel(parentConn), subAgents = listOf(child))
+    val context =
+      liveContextFor(
+        parent,
+        queue,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = slowArtifactService(artifacts, listOf(6_000, 0)),
+      )
+
+    val events = withTimeoutOrNull(60_000) { parent.runLive(context).toList() }
+
+    // The slow teardown is not the store's fault, so the handover's own save still runs.
+    val recorded =
+      checkNotNull(events)
+        .filter { it.author == "parent" && it.content?.parts?.firstOrNull()?.fileData != null }
+        .map { artifacts.storedBytes(it, context.session.key)?.toList() }
+    assertEquals(listOf(listOf<Byte>(1), listOf<Byte>(2)), recorded)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_serverEndsDuringASave_leavesNoTimerBehind() = runTest {
+    val connection =
+      ScriptedConn("model") {
+        emit(LlmResponse(content = modelAudio(1)))
+        // This turn's save takes 1.5 s; the server then ends the session with no handle.
+        emit(turnComplete())
+      }
+    val agent = LlmAgent(name = "a", model = RecordingLiveModel(connection))
+    val context =
+      liveContextFor(
+        agent,
+        LiveRequestQueue(),
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = slowArtifactService(),
+      )
+
+    agent.runLive(context).toList()
+    val endedAt = testScheduler.currentTime
+    testScheduler.advanceUntilIdle()
+
+    // Nothing the run started is still waiting once it has ended.
+    assertEquals(endedAt, testScheduler.currentTime)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_sequentialStepWithAHungStore_waitsOneSaveTimeoutInTotal() = runTest {
+    val artifacts = InMemoryArtifactService()
+    var step2AtMs = -1L
+    val step1Model =
+      RecordingLiveModel(
+        RecordingLiveConnection(
+          listOf(
+            LlmResponse(content = modelAudio(1)),
+            // This turn's save starts in the background and never finishes.
+            turnComplete(),
+            LlmResponse(content = modelAudio(2)),
+            taskCompletedCall("tc1"),
+          )
+        )
+      )
+    val step2Model =
+      RecordingLiveModel(
+        RecordingLiveConnection(
+          listOf(LlmResponse(content = modelAudio(3)), turnComplete(), taskCompletedCall("tc2"))
+        ),
+        onConnect = { step2AtMs = testScheduler.currentTime },
+      )
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+    val context =
+      liveContextFor(
+        sequence,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = SaveHookArtifactService(artifacts) { if (it == 0) awaitCancellation() },
+      )
+
+    val events = withTimeoutOrNull(60_000) { sequence.runLive(context).toList() }
+
+    // Once the store has timed out, the step end skips its own save; only the 1 s pause remains.
+    assertNotNull(events)
+    assertTrue(step2AtMs in 11_000..12_000, "step 2 connected at $step2AtMs ms")
+    // Step 1's last audio is dropped then, not saved under step 2's name.
+    val step2Recording =
+      checkNotNull(events).single {
+        it.author == "step2" && it.content?.parts?.firstOrNull()?.fileData != null
+      }
+    assertEquals(
+      listOf<Byte>(3),
+      artifacts.storedBytes(step2Recording, context.session.key)?.toList(),
+    )
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_sequentialStepCompletes_savesItsAudioBeforeTheNextStep() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val step1Model =
+      RecordingLiveModel(
+        RecordingLiveConnection(
+          listOf(LlmResponse(content = modelAudio(1, 2)), taskCompletedCall("tc1"))
+        )
+      )
+    val step2Model =
+      RecordingLiveModel(
+        RecordingLiveConnection(
+          listOf(LlmResponse(content = modelAudio(3)), turnComplete(), taskCompletedCall("tc2"))
+        )
+      )
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+    val context =
+      liveContextFor(
+        sequence,
+        runConfig = RunConfig(saveLiveBlob = true),
+        artifactService = artifacts,
+      )
+
+    val events = sequence.runLive(context).toList()
+
+    val recordings = events.filter { it.content?.parts?.firstOrNull()?.fileData != null }
+    val step1Recording = recordings.single { it.author == "step1" }
+    assertEquals(
+      listOf<Byte>(1, 2),
+      artifacts.storedBytes(step1Recording, context.session.key)?.toList(),
+    )
+    val step2Recording = recordings.single { it.author == "step2" }
+    assertEquals(
+      listOf<Byte>(3),
+      artifacts.storedBytes(step2Recording, context.session.key)?.toList(),
+    )
+    // The step's end saves its audio, so it lands before the next step says anything.
+    val step2StartsAt = events.indexOfFirst { it.author == "step2" && it !in recordings }
+    assertTrue(events.indexOf(step1Recording) in 0 until step2StartsAt)
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_sequentialStepClosedByTheServer_savesItsLastAudioAsItsOwn() =
+    runTest {
+      val artifacts = InMemoryArtifactService()
+      // Step 1's server closes cleanly, with no handle, partway into its second turn.
+      val step1Model =
+        RecordingLiveModel(
+          RecordingLiveConnection(
+            listOf(
+              LlmResponse(content = modelAudio(1)),
+              turnComplete(),
+              LlmResponse(content = modelAudio(2)),
+            )
+          )
+        )
+      val step2Model =
+        RecordingLiveModel(
+          RecordingLiveConnection(
+            listOf(LlmResponse(content = modelAudio(3)), turnComplete(), taskCompletedCall("tc2"))
+          )
+        )
+      val sequence =
+        SequentialAgent(
+          name = "sequence",
+          subAgents =
+            listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+        )
+      val context =
+        liveContextFor(
+          sequence,
+          runConfig = RunConfig(saveLiveBlob = true),
+          artifactService = artifacts,
+        )
+
+      val events = sequence.runLive(context).toList()
+
+      val recorded =
+        events
+          .filter { it.content?.parts?.firstOrNull()?.fileData != null }
+          .map { it.author to artifacts.storedBytes(it, context.session.key)?.toList() }
+      // The close saves the step's last audio, so the next step does not record it as its own.
+      assertEquals(
+        listOf("step1" to listOf<Byte>(1), "step1" to listOf<Byte>(2), "step2" to listOf<Byte>(3)),
+        recorded,
+      )
+    }
+
+  @Test
+  fun runLive_withoutSaveLiveBlob_recordsNothing() = runBlocking {
+    val artifacts = InMemoryArtifactService()
+    val connection =
+      RecordingLiveConnection(listOf(LlmResponse(content = modelAudio(1, 2)), turnComplete()))
+    val agent = liveAgent(connection)
+    val queue = LiveRequestQueue()
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    queue.close()
+    val context = liveContextFor(agent, queue, runConfig = RunConfig(), artifactService = artifacts)
+
+    val events = agent.runLive(context).toList()
+
+    assertTrue(events.none { it.content?.parts?.firstOrNull()?.fileData != null })
+    assertEquals(emptyList<String>(), artifacts.listArtifactKeys(context.session.key))
+  }
+
+  @Test
+  fun runLive_withSaveLiveBlob_dropMidAudioWrite_recordsTheReplayedChunkOnce() = runTest {
+    val artifacts = InMemoryArtifactService()
+    val queue = LiveRequestQueue()
+    queue.sendRealtime(
+      RealtimeInput.Audio(Blob(mimeType = "audio/pcm;rate=16000", data = byteArrayOf(9)))
+    )
+    val writing = CompletableDeferred<Unit>()
+    val first =
+      ScriptedConn("c0") {
+        writing.await()
+        throw connectionDrop()
+      }
+    first.onSendRealtime = {
+      writing.complete(Unit)
+      awaitCancellation()
+    }
+    val resent = CompletableDeferred<Unit>()
+    val second =
+      ScriptedConn("c1") {
+        resent.await()
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    second.onSendRealtime = { resent.complete(Unit) }
+    val agent = LlmAgent(name = "live_agent", model = RecordingLiveModel(first, second))
+    val context =
+      liveContextFor(
+        agent,
+        queue,
+        runConfig =
+          RunConfig(
+            saveLiveBlob = true,
+            sessionResumption = SessionResumptionConfig(handle = "h-1"),
+          ),
+        artifactService = artifacts,
+      )
+
+    val events = agent.runLive(context).toList()
+
+    val recording = events.single { it.content?.parts?.firstOrNull()?.fileData != null }
+    // The replay re-sends the chunk to the new connection but does not record it a second time.
+    assertEquals(listOf<Byte>(9), artifacts.storedBytes(recording, context.session.key)?.toList())
   }
 
   @Test

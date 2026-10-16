@@ -930,6 +930,17 @@ data class ContextFrameworkData(
   @Volatile internal var liveRequestQueue: LiveRequestQueue? = null
 
   /**
+   * Live audio the caller has sent since the last flush.
+   *
+   * Filled only through [AudioCacheManager], when [RunConfig.saveLiveBlob] is set. It lives on the
+   * context rather than in the manager, so a turn restarted on a new connection keeps one
+   * recording; a transfer or a completed step saves it before the next agent runs.
+   */
+  internal val inputRealtimeCache: RealtimeCache = RealtimeCache()
+  /** The audio the model has spoken since the last flush. See [inputRealtimeCache]. */
+  internal val outputRealtimeCache: RealtimeCache = RealtimeCache()
+
+  /**
    * Serializes a live run's appends to [InvocationContext.session] (contexts made with
    * [InvocationContext.copy] share this lock). The turn and its caller both append to that same
    * object under it, because a session service can reject overlapping appends. Never emit while
