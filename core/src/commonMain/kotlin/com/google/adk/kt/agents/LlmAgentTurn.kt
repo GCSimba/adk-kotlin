@@ -55,7 +55,6 @@ import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.tools.GoogleSearchAgentTool
 import com.google.adk.kt.tools.GoogleSearchTool
 import com.google.adk.kt.tools.ToolContext
-import com.google.adk.kt.tools.TransferToAgentTool.Companion.TRANSFER_TO_AGENT_TOOL_NAME
 import com.google.adk.kt.tools.VertexAiSearchAgentTool
 import com.google.adk.kt.tools.VertexAiSearchTool
 import com.google.adk.kt.tools.createGoogleSearchAgent
@@ -578,7 +577,7 @@ internal class LlmAgentTurn(
     var spoken = ""
     // The user's speech in this turn that the connection has not yet marked finished.
     var unfinishedInput = ""
-    // Speech stored ahead of a transfer call, so the connection's own finished copy is skipped.
+    // Speech stored ahead of a tool call, so the connection's own finished copy is skipped.
     var storedInput: String? = null
     while (true) {
       var sawResponse = false
@@ -603,7 +602,7 @@ internal class LlmAgentTurn(
             val rest = response.finishedInputAfter(stored) ?: return@let
             storedInput = null
             unfinishedInput = ""
-            // No handover followed the stored speech, so keep only what the user said after it.
+            // The turn went on after the stored speech, so keep only what the user said after it.
             if (
               rest.isNotEmpty() &&
                 emitAsFinishedInput(request, rest, response, spoken, queue, emitEvent)
@@ -613,14 +612,17 @@ internal class LlmAgentTurn(
             }
             return@takeWhile true
           }
-          if (response.turnComplete == true || response.interrupted) storedInput = null
+          // Cut-off audio or grounding comes before GeminiLiveConnection's finished copy, so wait.
+          val bareInterruption =
+            response.interrupted && response.content == null && response.groundingMetadata == null
+          if (response.turnComplete == true || bareInterruption) storedInput = null
           spoken = spokenSoFar(spoken, response)
           unfinishedInput = unfinishedInputSoFar(unfinishedInput, response)
-          // The connection closes at a handover before the speech is finished: store it first.
-          if (unfinishedInput.isNotEmpty() && response.callsTransferToAgent()) {
+          // Store and screen the speech before any tool runs, as ADK Python does.
+          if (unfinishedInput.isNotEmpty() && response.content?.hasFunctionCall() == true) {
             val speech = unfinishedInput
             unfinishedInput = ""
-            // A blocked question ends the turn before the call, as ADK Python's restart does.
+            // A blocked question runs no tool and ends the turn, as ADK Python's restart does.
             if (emitAsFinishedInput(request, speech, response, spoken, queue, emitEvent)) {
               end = LiveTurnsEnd.BLOCKED
               return@takeWhile false
@@ -630,9 +632,9 @@ internal class LlmAgentTurn(
           val blocked =
             handleLiveResponse(request, response, spoken, queue, emitEvent, unfinishedInput)
           pendingTransfer.load()?.let { transfer ->
-            // A custom tool that asks for the transfer leaves the speech for after its call.
+            // Only a transfer set without a tool call still has unstored speech here.
             if (unfinishedInput.isNotEmpty()) {
-              // The tool has run, so a callback that blocks this speech does not stop the transfer.
+              // The transfer already reached the caller, so blocking this speech cannot stop it.
               val unused =
                 emitAsFinishedInput(request, unfinishedInput, response, spoken, queue, emitEvent)
               unfinishedInput = ""
@@ -1600,10 +1602,6 @@ private val TRANSFER_ANSWER_TIMEOUT = 5.seconds
  * the connection, as in ADK Python.
  */
 private val TRANSFER_HANDOVER_DELAY = 1.seconds
-
-/** Whether this response calls `transfer_to_agent`. */
-private fun LlmResponse.callsTransferToAgent(): Boolean =
-  content?.parts.orEmpty().any { it.functionCall?.name == TRANSFER_TO_AGENT_TOOL_NAME }
 
 /**
  * The rest of a finished transcription that starts with the already stored [speech], or null when

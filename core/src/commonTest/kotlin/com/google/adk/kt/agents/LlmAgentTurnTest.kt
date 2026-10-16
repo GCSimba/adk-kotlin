@@ -3768,8 +3768,7 @@ class LlmAgentTurnTest {
   }
 
   @Test
-  fun runLive_customToolTransferAfterUnfinishedSpeech_storesItBeforeTheChild() = runTest {
-    // A custom tool's transfer shows only after its call, so the speech is stored at the handover.
+  fun runLive_customToolTransferAfterUnfinishedSpeech_storesItBeforeTheCall() = runTest {
     val queue = LiveRequestQueue()
     val handOff =
       DummyTool("hand_off") { toolContext, _ ->
@@ -3801,8 +3800,256 @@ class LlmAgentTurnTest {
 
     val finished = events.filter { it.inputTranscription?.finished == true }
     assertEquals(listOf("Can you hand me over?"), finished.map { it.inputTranscription?.text })
-    assertTrue(events.indexOf(finished.single()) < events.indexOfFirst { it.author == "child" })
+    // Before the call, so the speech is screened before the tool runs.
+    val call = events.indexOfFirst { it.functionCalls().isNotEmpty() }
+    assertTrue(events.indexOf(finished.single()) < call)
+    assertTrue(events.any { it.author == "child" })
   }
+
+  @Test
+  fun runLive_customToolTransferAfterBlockedSpeech_restartsWithoutRunningTheTool() = runTest {
+    val queue = LiveRequestQueue()
+    var runs = 0
+    val handOff =
+      DummyTool("hand_off") { toolContext, _ ->
+        runs++
+        toolContext.actions.transferToAgent = "child"
+        mapOf("status" to "ok")
+      }
+    val parentConn =
+      ScriptedConn("parent") {
+        emit(inputTranscription("hi", finished = false))
+        emit(modelFunctionCallResponse("hand_off"))
+        it.closed.await()
+      }
+    val parentModel =
+      RecordingLiveModel(parentConn, ScriptedConn("restarted") { it.closed.await() }) { n ->
+        if (n == 2) queue.close()
+      }
+    val childModel =
+      RecordingLiveModel(ScriptedConn("child") { it.closed.await() }, onConnect = { queue.close() })
+    val child = LlmAgent(name = "child", description = "c", model = childModel)
+    val parent =
+      LlmAgent(
+        name = "parent",
+        model = parentModel,
+        tools = listOf(handOff),
+        subAgents = listOf(child),
+        beforeModelCallbacks = listOf(slowScreening(block = true)),
+      )
+
+    val events = parent.runLive(liveContextFor(parent, queue)).toList()
+
+    assertEquals(listOf(0, 0, 2), listOf(runs, childModel.connectCalls, parentModel.connectCalls))
+    assertTrue(events.none { it.actions.transferToAgent != null })
+  }
+
+  @Test
+  fun runLive_transferWithoutAToolCallAfterUnfinishedSpeechThatACallbackBlocks_stillTransfers() =
+    runTest {
+      // The transfer event reaches the caller before the screening, so a block cannot stop it.
+      val queue = LiveRequestQueue()
+      val parentConn =
+        ScriptedConn("parent") {
+          emit(inputTranscription("hi", finished = false))
+          emit(LlmResponse(content = modelMessage("ok"), outputTranscription = Transcription("ok")))
+          it.closed.await()
+        }
+      val parentModel =
+        RecordingLiveModel(parentConn, ScriptedConn("restarted") { it.closed.await() }) { n ->
+          if (n == 2) queue.close()
+        }
+      val childConn =
+        ScriptedConn("child") {
+          emit(LlmResponse(content = modelMessage("child here"), turnComplete = true))
+          queue.close()
+          it.closed.await()
+        }
+      val childModel = RecordingLiveModel(childConn)
+      val child = LlmAgent(name = "child", description = "c", model = childModel)
+      val parent =
+        LlmAgent(
+          name = "parent",
+          model = parentModel,
+          subAgents = listOf(child),
+          beforeModelCallbacks = listOf(slowScreening(block = true)),
+          afterModelCallbacks =
+            listOf(
+              AfterModelCallback { ctx, response ->
+                ctx.actions.transferToAgent = "child"
+                response
+              }
+            ),
+        )
+
+      val events = parent.runLive(liveContextFor(parent, queue)).toList()
+
+      val finished = events.filter { it.inputTranscription?.finished == true }
+      assertEquals(listOf("hi"), finished.map { it.inputTranscription?.text })
+      assertTrue(events.indexOf(finished.single()) < events.indexOfFirst { it.author == "child" })
+      assertTrue(events.any { e -> e.content?.parts.orEmpty().any { it.text == "no" } })
+      assertEquals(1 to 1, parentModel.connectCalls to childModel.connectCalls)
+    }
+
+  @Test
+  fun runLive_toolCallAfterUnfinishedSpeech_storesItOnceBeforeTheCallAndRunsTheTool() =
+    runBlocking {
+      val queue = LiveRequestQueue()
+      var runs = 0
+      val lookup =
+        DummyTool("lookup") { _, _ ->
+          runs++
+          mapOf("status" to "ok")
+        }
+      val answers = mutableListOf<String>()
+      val conn =
+        ScriptedConn("parent") {
+          emit(inputTranscription("What is the weather?", finished = false))
+          emit(modelFunctionCallResponse("lookup"))
+          emit(inputTranscription("What is the weather?", finished = true))
+          emit(turnComplete())
+          queue.close()
+          it.closed.await()
+        }
+      conn.onSendContent = { content ->
+        answers += content.parts.mapNotNull { it.functionResponse?.name }
+      }
+      val agent =
+        LlmAgent(name = "parent", model = RecordingLiveModel(conn), tools = listOf(lookup))
+
+      val events = agent.runLive(liveContextFor(agent, queue)).toList()
+
+      val finished = events.filter { it.inputTranscription?.finished == true }
+      assertEquals(listOf("What is the weather?"), finished.map { it.inputTranscription?.text })
+      val call = events.indexOfFirst { it.functionCalls().isNotEmpty() }
+      assertTrue(events.indexOf(finished.single()) < call)
+      assertEquals(1 to listOf("lookup"), runs to answers)
+    }
+
+  @Test
+  fun runLive_toolCallAfterUnfinishedSpeechThatACallbackBlocks_restartsWithoutRunningTheTool() =
+    runTest {
+      // As ADK Python does, a blocked question runs no tool and sends no answer.
+      val queue = LiveRequestQueue()
+      var runs = 0
+      val lookup =
+        DummyTool("lookup") { _, _ ->
+          runs++
+          mapOf("status" to "ok")
+        }
+      val answers = mutableListOf<String>()
+      val conn =
+        ScriptedConn("parent") {
+          emit(inputTranscription("hi", finished = false))
+          emit(modelFunctionCallResponse("lookup"))
+          emit(inputTranscription("hi", finished = true))
+          it.closed.await()
+        }
+      conn.onSendContent = { content ->
+        answers += content.parts.mapNotNull { it.functionResponse?.name }
+      }
+      val model =
+        RecordingLiveModel(conn, ScriptedConn("restarted") { it.closed.await() }) { n ->
+          if (n == 2) queue.close()
+        }
+      val agent =
+        LlmAgent(
+          name = "parent",
+          model = model,
+          tools = listOf(lookup),
+          beforeModelCallbacks = listOf(slowScreening(block = true)),
+        )
+
+      val events = agent.runLive(liveContextFor(agent, queue)).toList()
+
+      assertEquals(0 to 2, runs to model.connectCalls)
+      assertEquals(emptyList<String>(), answers)
+      assertTrue(events.any { e -> e.content?.parts.orEmpty().any { it.text == "no" } })
+      assertTrue(events.none { it.functionCalls().isNotEmpty() })
+    }
+
+  /**
+   * Runs a turn that stores "hi" ahead of a tool call, then gets [between] and a finished "hi".
+   *
+   * @return the finished user transcriptions and how many times "hi" was screened.
+   */
+  private suspend fun storedSpeechThen(between: LlmResponse): Pair<List<String?>, Int> {
+    val queue = LiveRequestQueue()
+    var screens = 0
+    val conn =
+      ScriptedConn("parent") {
+        emit(inputTranscription("hi", finished = false))
+        emit(modelFunctionCallResponse("lookup"))
+        emit(between)
+        emit(inputTranscription("hi", finished = true))
+        emit(turnComplete())
+        queue.close()
+        it.closed.await()
+      }
+    val countScreens = BeforeModelCallback { _, request ->
+      if (request.contents.any { c -> c.parts.any { it.text == "hi" } }) screens++
+      CallbackChoice.Continue(request)
+    }
+    val agent =
+      LlmAgent(
+        name = "parent",
+        model = RecordingLiveModel(conn),
+        tools = listOf(DummyTool("lookup")),
+        beforeModelCallbacks = listOf(countScreens),
+      )
+
+    val events = agent.runLive(liveContextFor(agent, queue)).toList()
+
+    val finished = events.filter { it.inputTranscription?.finished == true }
+    return finished.map { it.inputTranscription?.text } to screens
+  }
+
+  @Test
+  fun runLive_cutOffReplyBetweenStoredSpeechAndItsFinishedCopy_storesTheSpeechOnce() = runBlocking {
+    // The connection sends a cut-off reply's content before its finished copy of the speech.
+    val cutOffReply =
+      LlmResponse(
+        content =
+          Content(
+            Role.MODEL,
+            listOf(Part(inlineData = Blob(mimeType = "audio/pcm", data = ByteArray(8)))),
+          ),
+        interrupted = true,
+      )
+
+    assertEquals(listOf("hi") to 1, storedSpeechThen(cutOffReply))
+  }
+
+  @Test
+  fun runLive_cutOffGroundingBetweenStoredSpeechAndItsFinishedCopy_storesTheSpeechOnce() =
+    runBlocking {
+      // A frame with only grounding and the interruption also comes before the finished copy.
+      val cutOff =
+        LlmResponse(
+          groundingMetadata = GroundingMetadata(webSearchQueries = listOf("q")),
+          interrupted = true,
+        )
+
+      assertEquals(listOf("hi") to 1, storedSpeechThen(cutOff))
+    }
+
+  @Test
+  fun runLive_bareInterruptionAfterStoredSpeech_takesALaterRepeatAsNewSpeech() = runBlocking {
+    assertEquals(listOf("hi", "hi") to 2, storedSpeechThen(LlmResponse(interrupted = true)))
+  }
+
+  @Test
+  fun runLive_turnCompleteAfterStoredSpeech_takesALaterRepeatAsNewSpeech() = runBlocking {
+    assertEquals(listOf("hi", "hi") to 2, storedSpeechThen(turnComplete()))
+  }
+
+  @Test
+  fun runLive_turnCompleteWithContentAfterStoredSpeech_takesALaterRepeatAsNewSpeech() =
+    runBlocking {
+      val reply = LlmResponse(content = modelMessage("ok"), turnComplete = true)
+
+      assertEquals(listOf("hi", "hi") to 2, storedSpeechThen(reply))
+    }
 
   @Test
   fun runLive_dropDuringACustomToolTransferAfterUnfinishedSpeech_stillStoresTheSpeechOnce() =
