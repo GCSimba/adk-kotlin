@@ -24,6 +24,7 @@ import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.ids.Uuid
 import com.google.adk.kt.serialization.adkJson
+import com.google.adk.kt.serialization.anyToJsonElement
 import com.google.adk.kt.serialization.jsonElementToAny
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
@@ -31,6 +32,10 @@ import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.Schema
 import kotlin.jvm.JvmStatic
+import kotlin.jvm.JvmSynthetic
+import kotlin.reflect.KType
+import kotlin.reflect.typeOf
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.serialization.json.encodeToJsonElement
 
 /**
@@ -110,6 +115,54 @@ data class RequestInput(
   }
 }
 
+/**
+ * From a node's body, asks the user for input and ends the run, so a body asks at most once per
+ * run. With `rerunOnResume = true` the body reruns and reads the answer from
+ * `ctx.resumeInputs[interruptId]`; `ctx.resumeInputs[id] ?: requestInput(id)` asks again on a null
+ * answer. Otherwise the answer is the node's output, so pass [responseSchema] to check it.
+ *
+ * Catching the throw (`runCatching`, `catch (t: Throwable)`) cancels the request, and the rest of
+ * the body runs; `catch (e: Exception)` misses it. The receiver keeps it out of code that has no
+ * node flow, such as a tool.
+ */
+@ExperimentalWorkflowApi
+@JvmSynthetic
+fun FlowCollector<Nothing>.requestInput(
+  interruptId: String = Uuid.random(),
+  message: String? = null,
+  responseSchema: Schema? = null,
+): Nothing =
+  throw NodeInterruptedException(RequestInput(interruptId, message, null, responseSchema))
+
+/**
+ * Like the overload without a payload, and also sends [payload] in its JSON form under [P]'s
+ * serializer, as `Context.setOutput` writes an output.
+ *
+ * @throws IllegalArgumentException if [P] has no serializer or [payload] has no JSON form.
+ */
+@ExperimentalWorkflowApi
+@JvmSynthetic
+// typeOf<P>() is a compiler intrinsic and does not require kotlin-reflect.
+@Suppress("KotlinReflectNeeded")
+inline fun <reified P> FlowCollector<Nothing>.requestInput(
+  interruptId: String = Uuid.random(),
+  message: String? = null,
+  payload: P,
+  responseSchema: Schema? = null,
+): Nothing = requestInputWithPayload(interruptId, message, payload, typeOf<P>(), responseSchema)
+
+@PublishedApi
+internal fun requestInputWithPayload(
+  interruptId: String,
+  message: String?,
+  payload: Any?,
+  payloadType: KType,
+  responseSchema: Schema?,
+): Nothing {
+  val json = ValueCodec<Any?>(payloadType).schemaForm(payload, "payload of requestInput")
+  throw NodeInterruptedException(RequestInput(interruptId, message, json, responseSchema))
+}
+
 /** Converts this request into a long-running `adk_request_input` model [Event]. */
 internal fun RequestInput.toEvent(): Event {
   val call =
@@ -120,7 +173,8 @@ internal fun RequestInput.toEvent(): Event {
         mapOf(
           RequestInput.INTERRUPT_ID_KEY to interruptId,
           RequestInput.MESSAGE_KEY to message,
-          RequestInput.PAYLOAD_KEY to payload,
+          // A payload with no JSON form fails here, in the asking node, not in the session service.
+          RequestInput.PAYLOAD_KEY to payload?.let { jsonElementToAny(anyToJsonElement(it)) },
           RequestInput.RESPONSE_SCHEMA_KEY to
             responseSchema?.let { jsonElementToAny(adkJson.encodeToJsonElement(it)) },
         ),

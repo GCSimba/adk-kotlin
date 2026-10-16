@@ -313,6 +313,23 @@ class FunctionNodeTest {
   }
 
   @Test
+  fun node_emitsContent_sendsAMessageBeforeTheOutput() {
+    // Arrange
+    val count =
+      node<Any?, Int>("count") { _, _ ->
+        emit(Content.fromText(Role.MODEL, "counting"))
+        3
+      }
+
+    // Act
+    val events = runWorkflowThroughRunner(Workflow("wf", listOf(Edge(Start, count))))
+
+    // Assert
+    assertEquals(listOf("counting", null), events.map { it.content?.text() })
+    assertEquals(listOf(null, 3L), events.map { it.output })
+  }
+
+  @Test
   fun node_contentReturn_persistsMessageEventWithoutNodeOutput() {
     // Arrange
     val produceContent =

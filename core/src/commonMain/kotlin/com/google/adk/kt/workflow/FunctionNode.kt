@@ -47,10 +47,10 @@ import kotlinx.serialization.descriptors.nullable
  *
  * @param I Expected type of `nodeInput` from predecessor nodes.
  * @param O Type of output value this node returns (`Unit`/`null` emits no output event; [Event]
- *   passes through directly; a [Content] becomes a message event with no node output; any other
- *   value becomes the node's output on an [Event] as its JSON form under [O]'s serializer, so a
- *   node typed `Any?` receives that form). It also types an output emitted on an event or set with
- *   `Context.setOutput`; a `Unit` node that produces one throws.
+ *   passes through directly; a [Content] becomes a message event with no node output; a returned
+ *   [RequestInput] fails; any other value becomes the node's output on an [Event] as its JSON form
+ *   under [O]'s serializer, so a node typed `Any?` receives that form). It also types an output
+ *   emitted on an event or set with `Context.setOutput`; a `Unit` node that produces one throws.
  */
 @ExperimentalWorkflowApi
 class FunctionNode<I, O>
@@ -139,6 +139,10 @@ private constructor(
     when (val result = body(context, input)) {
       // As in adk-python and Go, a returned Content is a message and not the node's output.
       is Content -> emit(Event(content = result))
+      is RequestInput ->
+        throw IllegalArgumentException(
+          "node '$name' returned a RequestInput; call requestInput(...) to ask for input."
+        )
       else -> emit(result)
     }
   }
@@ -229,6 +233,8 @@ internal fun ValueCodec<*>.schemaForm(value: Any?, what: String): Any? =
  * typed `Any?` reads a `Long` for an `Int`, and an input decodes from that form, a quoted number
  * included.
  *
+ * The block asks the user for input with [requestInput].
+ *
  * @throws WorkflowConfigurationException if [I] or [O] has no usable serializer and is not
  *   `Content`, `Event`, `Any`, or `Unit`.
  */
@@ -259,6 +265,15 @@ inline fun <reified I, reified O> node(
     outputType = typeOf<O>(),
     body = { context, input -> block(context, input) },
   )
+}
+
+/**
+ * Emits [content] from a [node] body as a message, which is not the node's output. In a custom
+ * [Node]'s `flow {}`, `emit(content)` emits a raw value instead, which becomes the output.
+ */
+@ExperimentalWorkflowApi
+suspend fun FlowCollector<Event>.emit(content: Content) {
+  emit(Event(content = content))
 }
 
 /**
