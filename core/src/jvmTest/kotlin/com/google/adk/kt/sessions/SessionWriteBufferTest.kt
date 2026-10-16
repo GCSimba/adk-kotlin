@@ -18,6 +18,8 @@ package com.google.adk.kt.sessions
 
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -34,10 +36,13 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
 class SessionWriteBufferTest {
@@ -553,6 +558,48 @@ class SessionWriteBufferTest {
     }
 
   @Test
+  fun flush_writeQueuedWhenBufferStops_waitsForEarlierWriteStillRunning() =
+    runBlocking<Unit> {
+      val executor = Executors.newSingleThreadExecutor()
+      val oneThread = executor.asCoroutineDispatcher()
+      val stopJob = Job(parent)
+      val first = event()
+      store.block(first)
+      val stopping =
+        SessionWriteBuffer(
+          oneThread + stopJob,
+          persist = { write ->
+            // Keeps running after the stop, like a store call that ignores cancellation.
+            if (write.event.id == first.id) {
+              withContext(NonCancellable) { store.persist(write) }
+            } else {
+              store.persist(write)
+            }
+          },
+        )
+      try {
+        val unusedFirst = stopping.append(Session(KEY)) { first }
+        store.awaitAttempt(first)
+        // Holds the only thread, so the next write is still queued when the stop lands.
+        val threadFree = CountDownLatch(1)
+        executor.execute { threadFree.await() }
+        val unusedSecond = stopping.append(Session(KEY)) { event() }
+        stopJob.cancel()
+        threadFree.countDown()
+
+        val flush = async { assertFailsWith<SessionException> { stopping.flush(KEY) } }
+        delay(SETTLE)
+
+        assertFalse(flush.isCompleted, "flush returned while the first write was still running")
+        store.unblockAll()
+        val unusedFailure = flush.await()
+      } finally {
+        store.unblockAll()
+        oneThread.close()
+      }
+    }
+
+  @Test
   fun flushAll_droppedWriteOfRetiredWriterFailed_keepsOtherFailures() =
     runBlocking<Unit> {
       val firstFailing = event()
@@ -619,6 +666,25 @@ class SessionWriteBufferTest {
     }
 
   @Test
+  fun flushAll_errorStopsBufferWithMoreSessionsInFlightThanTheCap_reportsTheError() =
+    runBlocking<Unit> {
+      // Held in the store, so the stop cancels them after the Error is recorded.
+      val held = List(3) { event() }
+      store.block(*held.toTypedArray())
+      val stopped =
+        bufferStoppedByError(maxUnreportedFailures = 2) { stopping ->
+          held.forEachIndexed { i, event ->
+            val unused = stopping.append(Session(KEY.copy(id = "held-$i"))) { event }
+          }
+        }
+
+      val failure = assertFailsWith<SessionException> { stopped.flushAll() }
+
+      assertSame(storeError, failure.cause)
+      assertEquals(3, failure.suppressedExceptions.size)
+    }
+
+  @Test
   fun flushAll_nothingFailed_runsBeforeReportOnceEveryWriteCompleted() =
     runBlocking<Unit> {
       store.persistDelay = 20.milliseconds
@@ -676,12 +742,24 @@ class SessionWriteBufferTest {
     val unused = buffer.append(Session(key)) { event }
   }
 
-  /** Returns a buffer stopped by [storeError], which a write of the session [KEY] threw. */
-  private suspend fun bufferStoppedByError(): SessionWriteBuffer {
+  /**
+   * Returns a buffer stopped by [storeError], which a write of the session [KEY] threw after
+   * [beforeError] ran on the new buffer.
+   */
+  private suspend fun bufferStoppedByError(
+    maxUnreportedFailures: Int = Int.MAX_VALUE,
+    beforeError: suspend (SessionWriteBuffer) -> Unit = {},
+  ): SessionWriteBuffer {
     // Catches the Error, which would otherwise reach the global handler.
     val escaped = CompletableDeferred<Throwable>()
     val handler = CoroutineExceptionHandler { _, error -> escaped.complete(error) }
-    val stopped = SessionWriteBuffer(Dispatchers.Default + parent + handler, store::persist)
+    val stopped =
+      SessionWriteBuffer(
+        Dispatchers.Default + parent + handler,
+        store::persist,
+        maxUnreportedFailures,
+      )
+    beforeError(stopped)
     val failing = event()
     store.fail(failing, cause = storeError)
     val unused = stopped.append(Session(KEY)) { failing }

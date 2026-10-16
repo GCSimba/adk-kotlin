@@ -24,7 +24,6 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
-import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Duration
@@ -41,6 +40,7 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.plus
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -69,7 +69,7 @@ class OrderedEventWriterTest {
 
       val write = writer().write(T0, event, after = emptyList())
 
-      assertNull(write.result)
+      assertFalse(write.isCompleted)
       store.unblockAll()
       assertEquals(WriteResult.Persisted, write.await())
       assertEquals(listOf(event.id), store.persistedIds)
@@ -117,7 +117,6 @@ class OrderedEventWriterTest {
 
       assertEquals(WriteResult.Failed(failure), dropped.await())
       assertEquals(listOf(failing.id), store.attemptedIds)
-      assertSame(failure, writer.lastWriteFailure)
     }
 
   @Test
@@ -164,7 +163,7 @@ class OrderedEventWriterTest {
       val dropped = writer.write(T0, event(), after = listOf(otherSessionsWrite))
       delay(SETTLE)
 
-      assertNull(dropped.result, "the dropped write completed before the write it follows")
+      assertFalse(dropped.isCompleted, "the dropped write completed before the write it follows")
       store.unblockAll()
       assertEquals(WriteResult.Failed(failure), dropped.await())
     }
@@ -173,39 +172,35 @@ class OrderedEventWriterTest {
   fun write_beforeComplete_seesResultBeforeWaiters() =
     runBlocking<Unit> {
       val release = CompletableDeferred<Unit>()
-      val seen = CompletableDeferred<Pair<WriteResult?, WriteResult>>()
+      val seen = CompletableDeferred<Pair<Boolean, WriteResult>>()
       val writer =
         writer(
-          beforeComplete = { write, result ->
-            seen.complete(write.result to result)
+          beforeComplete = { _, write, result ->
+            seen.complete(write.isCompleted to result)
             release.await()
           }
         )
 
       val write = writer.write(T0, event(), after = emptyList())
-      val (visibleResult, passedResult) = seen.await()
+      val (completedWhenSeen, passedResult) = seen.await()
       delay(SETTLE)
 
-      assertNull(visibleResult)
+      assertFalse(completedWhenSeen)
       assertEquals(WriteResult.Persisted, passedResult)
-      assertNull(write.result, "the write completed before beforeComplete returned")
+      assertFalse(write.isCompleted, "the write completed before beforeComplete returned")
       release.complete(Unit)
       assertEquals(WriteResult.Persisted, write.await())
     }
 
   @Test
-  fun lastWriteFailure_runningOrPersisted_isNull() =
+  fun write_beforeComplete_receivesItsWriter() =
     runBlocking<Unit> {
-      val writer = writer()
-      val event = event()
-      store.block(event)
+      val seen = CompletableDeferred<OrderedEventWriter>()
+      val writer = writer(beforeComplete = { writer, _, _ -> seen.complete(writer) })
 
-      val write = writer.write(T0, event, after = emptyList())
+      val unused = writer.write(T0, event(), after = emptyList())
 
-      assertNull(writer.lastWriteFailure)
-      store.unblockAll()
-      write.join()
-      assertNull(writer.lastWriteFailure)
+      assertSame(writer, seen.await())
     }
 
   @Test
@@ -217,7 +212,7 @@ class OrderedEventWriterTest {
       val beforeCompleteResult = CompletableDeferred<WriteResult>()
 
       val result =
-        writer(beforeComplete = { _, result -> beforeCompleteResult.complete(result) })
+        writer(beforeComplete = { _, _, result -> beforeCompleteResult.complete(result) })
           .write(T0, event, after = emptyList())
           .await()
 
@@ -226,38 +221,134 @@ class OrderedEventWriterTest {
     }
 
   @Test
-  fun write_persistThrowsError_completesFailedAndRethrowsIt() =
+  fun write_persistThrowsError_completesFailedThroughBeforeCompleteThenRethrowsIt() =
     runBlocking<Unit> {
-      // Catches the Error the write rethrows, which would otherwise reach the global handler.
       val escaped = CompletableDeferred<Throwable>()
-      val handler = CoroutineExceptionHandler { _, error -> escaped.complete(error) }
-      val failingScope = CoroutineScope(Dispatchers.Default + Job(parent) + handler)
-      val beforeCompleteCalled = MutableStateFlow(false)
+      val beforeCompleteResult = CompletableDeferred<WriteResult>()
       val event = event()
       val error = NotImplementedError("store stub")
       store.fail(event, cause = error)
       val writer =
-        writer(scope = failingScope, beforeComplete = { _, _ -> beforeCompleteCalled.value = true })
+        writer(
+          scope = failingScope(escaped),
+          beforeComplete = { _, _, result -> beforeCompleteResult.complete(result) },
+        )
+
+      val result = writer.write(T0, event, after = emptyList()).await()
+
+      assertEquals(WriteResult.Failed(error), result)
+      assertEquals(result, beforeCompleteResult.await())
+      assertSame(error, escaped.await())
+    }
+
+  @Test
+  fun write_persistThrowsNeitherExceptionNorError_completesFailedThroughBeforeComplete() =
+    runBlocking<Unit> {
+      val escaped = CompletableDeferred<Throwable>()
+      val beforeCompleteResult = CompletableDeferred<WriteResult>()
+      val event = event()
+      val odd = Throwable("neither")
+      store.fail(event, cause = odd)
+      val writer =
+        writer(
+          scope = failingScope(escaped),
+          beforeComplete = { _, _, result -> beforeCompleteResult.complete(result) },
+        )
+
+      val result = writer.write(T0, event, after = emptyList()).await()
+
+      assertEquals(WriteResult.Failed(odd), result)
+      assertEquals(result, beforeCompleteResult.await())
+      assertSame(odd, escaped.await())
+    }
+
+  @Test
+  fun write_storeReady_reachesTheStoreOnlyAfterReturning() =
+    runBlocking<Unit> {
+      val writer = writer(scope = oneThreadScope)
+      val event = event()
+
+      val (write, attemptedOnReturn) =
+        withContext(oneThread) {
+          writer.write(T0, event, after = emptyList()) to store.attemptedIds
+        }
+
+      assertTrue(attemptedOnReturn.isEmpty(), "the write reached the store before write() returned")
+      assertEquals(WriteResult.Persisted, write.await())
+    }
+
+  @Test
+  fun write_beforeCompleteThrows_completesFailedWithItAndRethrowsIt() =
+    runBlocking<Unit> {
+      val escaped = CompletableDeferred<Throwable>()
+      val bug = IllegalStateException("beforeComplete bug")
+      val writer = writer(scope = failingScope(escaped), beforeComplete = { _, _, _ -> throw bug })
+
+      val result = writer.write(T0, event(), after = emptyList()).await()
+
+      val cause = assertIs<WriteResult.Failed>(result).cause
+      // By message: in debug mode, stack-trace recovery rethrows a copy out of withContext.
+      assertEquals(bug.message, cause.message)
+      assertSame(cause, escaped.await())
+    }
+
+  @Test
+  fun write_persistThrowsErrorThenBeforeCompleteThrows_rethrowsTheErrorWithTheOtherSuppressed() =
+    runBlocking<Unit> {
+      val escaped = CompletableDeferred<Throwable>()
+      val event = event()
+      val error = NotImplementedError("store stub")
+      store.fail(event, cause = error)
+      val bug = IllegalStateException("beforeComplete bug")
+      val writer = writer(scope = failingScope(escaped), beforeComplete = { _, _, _ -> throw bug })
 
       val result = writer.write(T0, event, after = emptyList()).await()
 
       assertEquals(WriteResult.Failed(error), result)
       assertSame(error, escaped.await())
-      assertFalse(beforeCompleteCalled.value)
+      // By message: in debug mode, stack-trace recovery rethrows a copy out of withContext.
+      assertEquals(listOf(bug.message), error.suppressedExceptions.map { it.message })
     }
 
   @Test
-  fun write_scopeCanceledBeforeItStarted_completesFailedWithoutBeforeComplete() =
+  fun write_scopeCanceledBeforeItStarted_completesFailedThroughBeforeComplete() =
     runBlocking<Unit> {
-      val beforeCompleteCalled = MutableStateFlow(false)
-      val writer = writer(beforeComplete = { _, _ -> beforeCompleteCalled.value = true })
+      val beforeCompleteResult = CompletableDeferred<WriteResult>()
+      val writer =
+        writer(beforeComplete = { _, _, result -> beforeCompleteResult.complete(result) })
       parent.cancel()
 
       val result = writer.write(T0, event(), after = emptyList()).await()
 
       assertIs<CancellationException>(assertIs<WriteResult.Failed>(result).cause)
+      assertEquals(result, beforeCompleteResult.await())
       assertTrue(store.attemptedIds.isEmpty())
-      assertFalse(beforeCompleteCalled.value)
+    }
+
+  @Test
+  fun write_scopeCanceledBeforeItStarted_completesOnlyAfterTheWriteItFollows() =
+    runBlocking<Unit> {
+      val release = CompletableDeferred<Unit>()
+      val first = event()
+      val completedIds = MutableStateFlow(emptyList<String>())
+      val writer =
+        writer(
+          beforeComplete = { _, write, _ ->
+            if (write.event.id == first.id) release.await()
+            completedIds.update { it + write.event.id }
+          }
+        )
+      val unusedFirst = writer.write(T0, first, after = emptyList())
+      store.awaitAttempt(first)
+      parent.cancel()
+
+      val second = writer.write(T0, event(), after = emptyList())
+      delay(SETTLE)
+
+      assertFalse(second.isCompleted, "the canceled write completed before the write it follows")
+      release.complete(Unit)
+      assertIs<CancellationException>(assertIs<WriteResult.Failed>(second.await()).cause)
+      assertEquals(listOf(first.id, second.event.id), completedIds.value)
     }
 
   @Test
@@ -266,7 +357,7 @@ class OrderedEventWriterTest {
       val beforeCompleteResult = CompletableDeferred<WriteResult>()
       val writer =
         writer(
-          beforeComplete = { _, result ->
+          beforeComplete = { _, _, result ->
             // Suspending on the canceled job throws unless beforeComplete runs as NonCancellable.
             yield()
             beforeCompleteResult.complete(result)
@@ -291,7 +382,7 @@ class OrderedEventWriterTest {
       val writer =
         writer(
           scope = oneThreadScope,
-          beforeComplete = { write, _ -> completedIds.update { it + write.event.id } },
+          beforeComplete = { _, write, _ -> completedIds.update { it + write.event.id } },
         )
       val first = event()
       val second = event()
@@ -331,20 +422,52 @@ class OrderedEventWriterTest {
     }
 
   @Test
-  fun complete_calledTwice_keepsFirstResult() {
-    val write = OrderedEventWriter.Write(KEY, T0, event())
+  fun write_afterAnotherSessionsWriteStoppedByError_neverReachesStore() =
+    runBlocking<Unit> {
+      val escaped = CompletableDeferred<Throwable>()
+      val failingScope = failingScope(escaped)
+      // Shares the job; Unconfined resumes the follower inside the failed write's completion.
+      val followerScope = failingScope + Dispatchers.Unconfined
+      val failing = event()
+      val error = NotImplementedError("store stub")
+      store.block(failing)
+      store.fail(failing, cause = error)
+      val otherSessionsWrite =
+        writer(OTHER_KEY, scope = failingScope).write(T0, failing, after = emptyList())
+      val mine = event()
+      val write = writer(scope = followerScope).write(T0, mine, after = listOf(otherSessionsWrite))
 
-    write.complete(WriteResult.Persisted)
-    write.complete(WriteResult.Failed(IllegalStateException("late")))
+      store.unblockAll()
 
-    assertEquals(WriteResult.Persisted, write.result)
-  }
+      assertSame(error, escaped.await())
+      assertIs<CancellationException>(assertIs<WriteResult.Failed>(write.await()).cause)
+      assertFalse(mine.id in store.attemptedIds, "a write after the Error reached the store")
+    }
+
+  @Test
+  fun complete_calledTwice_keepsFirstResult() =
+    runBlocking<Unit> {
+      val write = OrderedEventWriter.Write(KEY, T0, event())
+
+      write.complete(WriteResult.Persisted)
+      write.complete(WriteResult.Failed(IllegalStateException("late")))
+
+      assertEquals(WriteResult.Persisted, write.await())
+    }
 
   private fun writer(
     key: SessionKey = KEY,
     scope: CoroutineScope = this.scope,
-    beforeComplete: suspend (OrderedEventWriter.Write, WriteResult) -> Unit = { _, _ -> },
+    beforeComplete: suspend (OrderedEventWriter, OrderedEventWriter.Write, WriteResult) -> Unit =
+      { _, _, _ ->
+      },
   ) = OrderedEventWriter(key, scope, store::persist, beforeComplete)
+
+  /** A scope that hands a failure a write rethrows to [escaped], instead of the global handler. */
+  private fun failingScope(escaped: CompletableDeferred<Throwable>) =
+    CoroutineScope(
+      Dispatchers.Default + Job(parent) + CoroutineExceptionHandler { _, e -> escaped.complete(e) }
+    )
 
   /** Returns once every write launched on [oneThread] so far has started. */
   private suspend fun awaitStarted() = withContext(oneThread) {}

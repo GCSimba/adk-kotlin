@@ -42,7 +42,7 @@ internal class SessionWriteBuffer(
   private val persist: suspend (OrderedEventWriter.Write) -> Unit,
   private val maxUnreportedFailures: Int = MAX_UNREPORTED_FAILURES,
 ) {
-  // A plain Job, so an Error, the one failure a write does not catch, stops every write.
+  // A plain Job, so a failure a write rethrows, such as an Error, stops every write.
   private val coroutineScope = CoroutineScope(context + Job(context[Job]))
 
   // Guards everything below, including each writer; never held while waiting for a write.
@@ -72,7 +72,10 @@ internal class SessionWriteBuffer(
     val snapshot = appended.copy(actions = appended.actions.snapshot())
     val changedScopes = SharedStateScope.changedBy(session.key, snapshot.actions.stateDelta.keys)
     // Only now, so an update that throws leaves no writer behind.
-    val writer = writerBySession.getOrPut(session.key) { newWriter(session.key) }
+    val writer =
+      writerBySession.getOrPut(session.key) {
+        OrderedEventWriter(session.key, coroutineScope, persist, ::beforeComplete)
+      }
     val previousSharedStateWrites = changedScopes.mapNotNull { lastWriteByScope[it] }
     val write = writer.write(expectedUpdateTime, snapshot, after = previousSharedStateWrites)
     for (scope in changedScopes) lastWriteByScope[scope] = write
@@ -113,13 +116,13 @@ internal class SessionWriteBuffer(
 
   /**
    * Waits for every write and runs [beforeReport]. Then it throws a [SessionException] for the
-   * unreported failures, the first as its cause and the rest suppressed, leaving each for its
+   * unreported failures, the oldest as its cause and the rest suppressed, leaving each for its
    * session to report.
    */
   suspend fun flushAll(beforeReport: suspend () -> Unit = {}) {
     awaitWrites { writerBySession.values.mapNotNull { it.lastWrite } }
     beforeReport()
-    val causes = lock.withLock { writerBySession.keys.mapNotNull(::failureOf) }
+    val causes = lock.withLock { failureBySession.values.toList() }
     if (causes.isEmpty()) return
     val failure = SessionException(SESSION_PERSISTENCE_FAILED, causes.first())
     causes.drop(1).forEach(failure::addSuppressed)
@@ -148,21 +151,10 @@ internal class SessionWriteBuffer(
     SharedStateScope.seenBy(appName, userId).mapNotNull { lastWriteByScope[it] }
 
   /**
-   * Creates the session [key]'s writer, which passes itself to [beforeComplete], since a retired
-   * writer's writes still complete after the session has a new one.
-   */
-  private fun newWriter(key: SessionKey): OrderedEventWriter {
-    lateinit var writer: OrderedEventWriter
-    writer =
-      OrderedEventWriter(key, coroutineScope, persist) { write, result ->
-        beforeComplete(writer, write, result)
-      }
-    return writer
-  }
-
-  /**
    * Runs before [write]'s waiters see [result]: forgets the write, then drops [writer] once its
-   * last write is persisted, or records its first failure so the next append reports it at once.
+   * last write is persisted, or records its first failure so the next append reports it at once. It
+   * gets the [writer], since a retired writer's writes still complete after the session has a new
+   * one.
    */
   private suspend fun beforeComplete(
     writer: OrderedEventWriter,
@@ -180,7 +172,10 @@ internal class SessionWriteBuffer(
         is WriteResult.Failed ->
           if (writer.key !in failureBySession) {
             failureBySession[writer.key] = result.cause
-            if (failureBySession.size > maxUnreportedFailures) forgetOldestFailure()
+            // Once stopped, keeps every failure, so the one that stopped the buffer is reported.
+            if (failureBySession.size > maxUnreportedFailures && coroutineScope.isActive) {
+              forgetOldestFailure()
+            }
           }
       }
     }
@@ -189,8 +184,6 @@ internal class SessionWriteBuffer(
   /** Needs [lock]. */
   private fun forgetOldestFailure() {
     retire(failureBySession.keys.first())
-    // Once stopped, every write fails, so a warning per eviction says nothing new.
-    if (!coroutineScope.isActive) return
     // No key: a session id can carry user data.
     logger.warn {
       "Forgot the oldest unreported buffered-write failure; its session will not report it."
@@ -202,19 +195,11 @@ internal class SessionWriteBuffer(
    * [waitedFailure]; a later call reports that failure again only if it waited for it.
    */
   private fun reportFailure(key: SessionKey, waitedFailure: Throwable? = null) {
-    val failure = failureOf(key)
+    val failure = failureBySession[key]
     if (failure != null) retire(key)
     val cause = failure ?: waitedFailure ?: return
     throw SessionException(SESSION_PERSISTENCE_FAILED, cause)
   }
-
-  /**
-   * Needs [lock]. Returns the session [key]'s unreported failure; until it is reported or
-   * forgotten, the session keeps the writer that failed, so no newer writer can be retired.
-   */
-  private fun failureOf(key: SessionKey): Throwable? =
-    // A write canceled before it started, or stopped by an Error, skips beforeComplete.
-    failureBySession[key] ?: writerBySession[key]?.lastWriteFailure
 
   /** Needs [lock]. Drops the session [key]'s failed writer; its next append starts a new one. */
   private fun retire(key: SessionKey) {

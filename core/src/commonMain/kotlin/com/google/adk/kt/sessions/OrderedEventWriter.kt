@@ -19,16 +19,16 @@ package com.google.adk.kt.sessions
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.logging.LoggerFactory
 import kotlin.time.Instant
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 
 /**
  * Writes one session's events to the store in order, one at a time, running each in
@@ -36,15 +36,16 @@ import kotlinx.coroutines.withContext
  * the session's failed one is dropped with the same cause. Not thread-safe: its owner calls it
  * under one lock.
  *
- * @param beforeComplete Sees the result of each write that started and was not stopped by an Error,
- *   before the write's waiters do. It runs even if the write is canceled after it started, and must
- *   return without throwing.
+ * @param beforeComplete Sees this writer and the result of each write, before the write's waiters
+ *   do. It runs for every write, even one canceled or stopped by an Error, and should not throw: a
+ *   failure it throws is rethrown in [coroutineScope] and fails the write, unless an Error already
+ *   did, which then carries it as suppressed.
  */
 internal class OrderedEventWriter(
   val key: SessionKey,
   private val coroutineScope: CoroutineScope,
   private val persist: suspend (Write) -> Unit,
-  private val beforeComplete: suspend (Write, WriteResult) -> Unit,
+  private val beforeComplete: suspend (OrderedEventWriter, Write, WriteResult) -> Unit,
 ) {
   /**
    * An event appended to the live session, on its way to the store.
@@ -55,23 +56,23 @@ internal class OrderedEventWriter(
    *   changes to them by the caller cannot reach the store.
    */
   class Write(val key: SessionKey, val expectedUpdateTime: Instant, val event: Event) {
-    private val _result = MutableStateFlow<WriteResult?>(null)
+    private val result = CompletableDeferred<WriteResult>()
 
-    /** How the write completed, or null while it runs. */
-    val result: WriteResult?
-      get() = _result.value
+    /** Whether the write has completed. */
+    val isCompleted: Boolean
+      get() = result.isCompleted
 
     /** Waits until the write has completed. */
     suspend fun join() {
-      val unused = await()
+      result.join()
     }
 
     /** Waits until the write has completed, and returns how. */
-    suspend fun await(): WriteResult = _result.filterNotNull().first()
+    suspend fun await(): WriteResult = result.await()
 
     /** Completes the write with [result]; later calls change nothing. */
     internal fun complete(result: WriteResult) {
-      _result.compareAndSet(null, result)
+      this.result.complete(result)
     }
   }
 
@@ -84,38 +85,47 @@ internal class OrderedEventWriter(
     data class Failed(val cause: Throwable) : WriteResult
   }
 
-  /**
-   * The session's last write, which completes only after every earlier one unless it or an earlier
-   * write was canceled before it started.
-   */
+  /** The session's last write, which completes only after every earlier one. */
   var lastWrite: Write? = null
     private set
-
-  /** Why the session's last write failed, once that write has completed. */
-  val lastWriteFailure: Throwable?
-    get() = (lastWrite?.result as? WriteResult.Failed)?.cause
 
   /**
    * Starts writing [event] once the session's previous write and [after] have completed; only a
    * failure of the session's previous write drops it. [after] holds the last writes, by any
    * session, to the shared `app:` or `user:` state [event] changes, so changes to shared state
-   * reach the store in the order they were made. A write canceled before it starts completes at
-   * once, without waiting for them or calling [beforeComplete].
+   * reach the store in the order they were made.
    */
-  // The coroutine reads only immutable values, its own copy of after, and thread-safe results.
+  // Shares immutable values, thread-safe results, and this writer, which its owner locks to read.
   @Suppress("UnsafeCoroutineCrossing")
   fun write(expectedUpdateTime: Instant, event: Event, after: Collection<Write>): Write {
     val write = Write(key, expectedUpdateTime, event)
     val previousWrite = lastWrite
     val previousSharedStateWrites = after.toList()
     lastWrite = write
+    // Undispatched, so a write canceled before it starts still runs, to complete like any other.
     coroutineScope
-      .launch {
-        val result = waitThenPersist(write, previousWrite, previousSharedStateWrites)
-        withContext(NonCancellable) { beforeComplete(write, result) }
+      .launch(start = CoroutineStart.UNDISPATCHED) {
+        var fatal: Throwable? = null
+        val result =
+          try {
+            waitThenPersist(write, previousWrite, previousSharedStateWrites)
+          } catch (e: Throwable) {
+            // What waitThenPersist does not turn into a result, such as an Error.
+            fatal = e
+            WriteResult.Failed(e)
+          }
+        try {
+          withContext(NonCancellable) { beforeComplete(this@OrderedEventWriter, write, result) }
+        } catch (e: Throwable) {
+          // Keeps the failure the write must still rethrow.
+          if (fatal == null) throw e
+          fatal.addSuppressed(e)
+        }
+        // A failure completes the write in invokeOnCompletion, after it has reached the scope.
+        if (fatal != null) throw fatal
         write.complete(result)
       }
-      // Completes a write that was canceled before it started, or stopped by an Error.
+      // Runs after a failure has canceled the scope, so no write waiting on this one can persist.
       .invokeOnCompletion { cause -> if (cause != null) write.complete(WriteResult.Failed(cause)) }
     return write
   }
@@ -128,6 +138,8 @@ internal class OrderedEventWriter(
     // Waits even if canceled or dropped, so the last write completes after every earlier one.
     val previousResult =
       withContext(NonCancellable) {
+        // Leaves the caller's thread and lock, unless the dispatcher runs tasks in place.
+        yield()
         for (earlier in previousSharedStateWrites) earlier.join()
         previousWrite?.await()
       }
