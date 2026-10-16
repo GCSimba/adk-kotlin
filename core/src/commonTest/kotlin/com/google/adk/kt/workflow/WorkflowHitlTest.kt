@@ -1912,7 +1912,7 @@ class WorkflowHitlTest {
     // Assert: item 1 replays, item 2 runs again, and item 3 runs for the first time.
     assertEquals(mapOf(1 to 1, 2 to 2, 3 to 1), runs)
     assertEquals(
-      listOf(10, 20, 30),
+      listOf(10L, 20L, 30L),
       events.single { it.nodeInfo?.path == "wf@1/sub@1/items@1" && it.output != null }.output,
     )
   }
@@ -2537,7 +2537,7 @@ class WorkflowHitlTest {
         .failingTurn(userMessage("go"))
 
     // Assert: the caller applies the child's own value-free input check.
-    assertEquals(3, events.single { it.nodeInfo?.path == "wf@1/ok@1" && it.output != null }.output)
+    assertEquals(3L, events.single { it.nodeInfo?.path == "wf@1/ok@1" && it.output != null }.output)
     assertTrue(error is NodeInputValidationException, "expected the node's own check, got $error")
     assertFalse("s3cret" in error.message.orEmpty())
   }

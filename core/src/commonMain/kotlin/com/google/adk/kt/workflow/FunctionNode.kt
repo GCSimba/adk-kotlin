@@ -28,11 +28,15 @@ import com.google.adk.kt.events.Event
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Schema
 import kotlin.reflect.KClass
+import kotlin.reflect.KClassifier
 import kotlin.reflect.KType
 import kotlin.reflect.typeOf
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.flow
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.PolymorphicSerializer
+import kotlinx.serialization.descriptors.nullable
 
 /**
  * A workflow [Node] backed by a suspending function that may emit progress [Event]s and returns an
@@ -44,7 +48,9 @@ import kotlinx.coroutines.flow.flow
  * @param I Expected type of `nodeInput` from predecessor nodes.
  * @param O Type of output value this node returns (`Unit`/`null` emits no output event; [Event]
  *   passes through directly; a [Content] becomes a message event with no node output; any other
- *   value becomes the node's output on an [Event]).
+ *   value becomes the node's output on an [Event] as its JSON form under [O]'s serializer, so a
+ *   node typed `Any?` receives that form). It also types an output emitted on an event or set with
+ *   `Context.setOutput`; a `Unit` node that produces one throws.
  */
 @ExperimentalWorkflowApi
 class FunctionNode<I, O>
@@ -70,8 +76,11 @@ private constructor(
     rerunOnResume = rerunOnResume || itemNode != null,
     waitForOutput = waitForOutput,
     config = config,
-    inputSchema = explicitInputSchema ?: inferredPortSchema(inputCodec),
-    outputSchema = explicitOutputSchema ?: inferredPortSchema(outputCodec),
+    // A parallel node declares no port schemas, as in adk-python; its item node keeps its own.
+    inputSchema =
+      if (itemNode != null) null else explicitInputSchema ?: inferredPortSchema(inputCodec),
+    outputSchema =
+      if (itemNode != null) null else explicitOutputSchema ?: inferredPortSchema(outputCodec),
     stateSchema = stateSchema,
   ) {
 
@@ -157,27 +166,54 @@ private constructor(
     return input
   }
 
-  /** Checks the JSON form of [output] against an explicit [outputSchema] and returns [output]. */
-  override fun validateOutput(output: Any?): Any? {
-    if (explicitOutputSchema != null) {
-      val what = "output of node '$name'"
-      val unused =
-        SchemaUtils.validateValue(outputCodec.schemaForm(output, what), explicitOutputSchema, what)
-          .getOrThrow()
+  /** Encodes [output] as [encodeOutput] does, for a returned output or one on an emitted event. */
+  override fun validateOutput(output: Any?): Any? = encodeOutput(output)
+
+  /**
+   * Returns [output] as successors receive it, whether it was returned, emitted on an event, or set
+   * with [Context.setOutput]:
+   * - a [Content] or [Event], or any output with [O] as `Content` or `Event`, passes as it is;
+   * - any other output becomes its JSON form under [O]'s serializer, so with [O] as `Any` a value
+   *   that is not JSON-native fails here.
+   *
+   * An explicit [outputSchema] then checks the result.
+   */
+  internal fun encodeOutput(output: Any?): Any? {
+    // A parallel node outputs its items' outputs, which each item node already validated.
+    if (itemNode != null) return output
+    // Assigning null produces no output.
+    if (output == null) return null
+    val classifier = outputCodec.kType.classifier
+    require(classifier != Unit::class) {
+      "node '$name' declares no output (Unit) but produced one; declare its output type."
     }
-    return output
+    val what = "output of node '$name'"
+    val json = outputCodec.schemaForm(output, what)
+    if (explicitOutputSchema != null) {
+      val unused = SchemaUtils.validateValue(json, explicitOutputSchema, what).getOrThrow()
+    }
+    return json
   }
 }
 
 /** Types a node handles by their meaning rather than as data. */
 private val FRAMEWORK_TYPES: Set<KClass<*>> = setOf(Content::class, Event::class)
 
+/**
+ * Port types that need no serializer: a framework value passes as it is, `Any` is a JSON value, and
+ * `Unit` carries nothing.
+ */
+private val SERIALIZER_FREE_TYPES: Set<KClass<*>> = FRAMEWORK_TYPES + setOf(Any::class, Unit::class)
+
 /** Infers a port's schema, except for framework types. */
 private fun inferredPortSchema(codec: ValueCodec<*>): Schema? =
   if (codec.kType.classifier in FRAMEWORK_TYPES) null else codec.schema
 
-/** Returns [value] as a schema checks it: a framework value as it is, and anything else as JSON. */
-private fun ValueCodec<*>.schemaForm(value: Any?, what: String): Any? =
+/**
+ * Returns [value] as a node outputs it and a schema checks it: a framework value as it is, and
+ * anything else as JSON.
+ */
+internal fun ValueCodec<*>.schemaForm(value: Any?, what: String): Any? =
   if (kType.classifier in FRAMEWORK_TYPES || value is Content || value is Event) {
     value
   } else {
@@ -188,7 +224,13 @@ private fun ValueCodec<*>.schemaForm(value: Any?, what: String): Any? =
  * Creates a [FunctionNode] that runs [block] on an input of type [I] and returns an output of type
  * [O], emitting progress [Event]s through its [FlowCollector] receiver. Schemas inferred from [I]
  * and [O] describe the node, while an explicit [inputSchema] or [outputSchema] is also enforced on
- * every run.
+ * every run. Unlike adk-python, which dumps only models, an output travels as its JSON form under
+ * [O]'s serializer, whether returned, emitted, or set with `Context.setOutput`, so a successor
+ * typed `Any?` reads a `Long` for an `Int`, and an input decodes from that form, a quoted number
+ * included.
+ *
+ * @throws WorkflowConfigurationException if [I] or [O] has no usable serializer and is not
+ *   `Content`, `Event`, `Any`, or `Unit`.
  */
 @ExperimentalWorkflowApi
 inline fun <reified I, reified O> node(
@@ -201,8 +243,10 @@ inline fun <reified I, reified O> node(
   outputSchema: Schema? = null,
   stateSchema: Schema? = null,
   crossinline block: suspend FlowCollector<Event>.(context: Context, input: I) -> O,
-): FunctionNode<I, O> =
-  FunctionNode(
+): FunctionNode<I, O> {
+  requirePortSerializer(name, "input", typeOf<I>())
+  requirePortSerializer(name, "output", typeOf<O>())
+  return FunctionNode(
     name = name,
     description = description,
     rerunOnResume = rerunOnResume,
@@ -215,6 +259,45 @@ inline fun <reified I, reified O> node(
     outputType = typeOf<O>(),
     body = { context, input -> block(context, input) },
   )
+}
+
+/**
+ * Throws [WorkflowConfigurationException] when node [name]'s [port] type [type], or a type argument
+ * inside it, cannot travel as JSON, so the node fails when it is built rather than on its first
+ * value.
+ */
+@PublishedApi
+internal fun requirePortSerializer(name: String, port: String, type: KType) {
+  val problem = portTypeProblem(type, nested = false) ?: return
+  throw WorkflowConfigurationException("node '$name' has $port type $type, $problem")
+}
+
+/** Returns why [type] or one of its type arguments cannot travel as JSON, or null if it can. */
+private fun portTypeProblem(type: KType, nested: Boolean): String? {
+  val classifier = type.classifier
+  if (classifier in SERIALIZER_FREE_TYPES) return null
+  if (nested && classifier == ByteArray::class) {
+    return "which has a ByteArray type argument; only a top-level ByteArray is supported for now."
+  }
+  val serializer = SchemaUtils.serializerFor(type)
+  if (serializer == null || isOpenPolymorphic(serializer, classifier)) {
+    return "which has no usable serializer. Mark it @Serializable, or use Any for a JSON-native " +
+      "value, such as Map<String, Any?> for Map<String, *>."
+  }
+  return type.arguments.firstNotNullOfOrNull { argument ->
+    argument.type?.let { portTypeProblem(it, nested = true) }
+  }
+}
+
+/**
+ * Whether [serializer] is an interface's polymorphic serializer, nullable or not, which adkJson
+ * cannot use because it registers no subclasses.
+ */
+private fun isOpenPolymorphic(serializer: KSerializer<*>, classifier: KClassifier?): Boolean {
+  if (serializer is PolymorphicSerializer<*>) return true
+  @Suppress("UNCHECKED_CAST") val kClass = classifier as? KClass<Any> ?: return false
+  return serializer.descriptor == PolymorphicSerializer(kClass).descriptor.nullable
+}
 
 /**
  * Creates a [FunctionNode] that runs [block] concurrently on each item of a list input and returns
@@ -222,10 +305,12 @@ inline fun <reified I, reified O> node(
  * [Content], is read as JSON so a JSON list fans out. Any other non-list input runs as one item.
  *
  * [config], the schemas and [rerunOnResume] apply to each item's run; the fan-out node shares
- * [waitForOutput] and [stateSchema], has no retry or timeout, and always reruns on resume.
+ * [waitForOutput] and [stateSchema], declares no input or output schema, has no retry or timeout,
+ * and always reruns on resume.
  *
  * @param maxParallelWorkers Maximum number of items run at a time, or `null` for no limit.
- * @throws WorkflowConfigurationException if [maxParallelWorkers] is less than 1.
+ * @throws WorkflowConfigurationException if [maxParallelWorkers] is less than 1, or if [I] or [O]
+ *   has no serializer, as in [node].
  */
 @ExperimentalWorkflowApi
 inline fun <reified I, reified O> parallelNode(
@@ -258,7 +343,8 @@ inline fun <reified I, reified O> parallelNode(
 
 /**
  * Wraps [node] so it runs concurrently on each item of a list input and returns the results in
- * input order. [node]'s configuration applies to each item's run.
+ * input order. [node]'s configuration and schemas apply to each item's run; the fan-out node
+ * declares no input or output schema.
  *
  * @param maxParallelWorkers Maximum number of items run at a time, or `null` for no limit.
  * @throws WorkflowConfigurationException if [maxParallelWorkers] is less than 1.
