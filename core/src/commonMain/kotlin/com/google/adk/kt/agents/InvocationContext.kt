@@ -153,7 +153,10 @@ data class InvocationContext(
   val agentStates: MutableMap<String, TypedData> = concurrentMutableMapOf(),
   /** The end of agent status for each agent in this invocation. */
   val endOfAgents: MutableMap<String, Boolean> = concurrentMutableMapOf(),
-  /** Extra tools injected dynamically during invocation (e.g., by SequentialAgent). */
+  /**
+   * Tools that each [LlmAgent] run under this context offers in addition to its own
+   * [LlmAgent.tools]. Contexts copied for sub-agents share this map, so its tools reach them too.
+   */
   val extraTools: MutableMap<String, BaseTool> = concurrentMutableMapOf(),
   /**
    * Framework-internal per-invocation data (see [ContextFrameworkData]). Kept as a dedicated holder
@@ -274,6 +277,16 @@ data class InvocationContext(
    */
   internal fun forAgent(childAgent: BaseAgent): InvocationContext =
     this.copy(agent = childAgent, node = null)
+
+  /**
+   * Returns a context for [childAgent] taking over a live conversation from this one.
+   *
+   * The session and [liveRequestQueue] carry over, but the run config's resumption handle does not:
+   * it names this agent's live session, and the child would resume into it. ADK Python clears it on
+   * transfer too.
+   */
+  internal fun forLiveChild(childAgent: BaseAgent): InvocationContext =
+    forAgent(childAgent).copy(runConfig = runConfig?.forNewLiveSession())
 
   /**
    * Creates a new InvocationContext for a child agent, derived from this context. Appends the given

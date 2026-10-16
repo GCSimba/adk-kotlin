@@ -41,6 +41,7 @@ import com.google.adk.kt.processors.createFinalModelResponseEvent
 import com.google.adk.kt.processors.findTransferTargets
 import com.google.adk.kt.processors.generateRequestConfirmationEvent
 import com.google.adk.kt.processors.getStructuredModelResponse
+import com.google.adk.kt.processors.liveTransferTargets
 import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.telemetry.EMPTY_JSON
 import com.google.adk.kt.telemetry.Span
@@ -54,6 +55,7 @@ import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.tools.GoogleSearchAgentTool
 import com.google.adk.kt.tools.GoogleSearchTool
 import com.google.adk.kt.tools.ToolContext
+import com.google.adk.kt.tools.TransferToAgentTool.Companion.TRANSFER_TO_AGENT_TOOL_NAME
 import com.google.adk.kt.tools.VertexAiSearchAgentTool
 import com.google.adk.kt.tools.VertexAiSearchTool
 import com.google.adk.kt.tools.createGoogleSearchAgent
@@ -96,6 +98,7 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.flow.transform
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -132,10 +135,14 @@ internal class LlmAgentTurn(
   /**
    * The newest session resumption handle, or null when there is none; a reconnect resumes from it.
    *
-   * Held on this turn and never persisted, so a restart begins with a new turn and no handle.
-   * Without a handle, a dropped connection fails rather than silently starting a new conversation.
+   * Held on this turn and never persisted, so a restart or a transfer begins with a new turn and no
+   * handle. Without a handle, a dropped connection fails rather than silently starting a new
+   * conversation.
    */
   private val resumptionHandle = AtomicReference<String?>(null)
+
+  /** The transfer the model asked for, kept so that a drop before the handover does not lose it. */
+  private val pendingTransfer = AtomicReference<PendingTransfer?>(null)
 
   /**
    * A callback's reply to a blocked input, held until the collector confirms delivery so a drop
@@ -277,7 +284,8 @@ internal class LlmAgentTurn(
    *
    * A connection that drops or retires resumes from the resumption handle when there is one;
    * without one, a server go-away continues in a fresh session and a drop fails the run. A blocked
-   * turn always continues in a fresh session.
+   * turn always continues in a fresh session, and a transfer hands the conversation to another
+   * agent that can run live.
    */
   fun executeLive(): Flow<Event> = flow {
     var turn = this@LlmAgentTurn
@@ -369,6 +377,7 @@ internal class LlmAgentTurn(
             collector.emit(event)
             // Delivered, so a blocked reply no longer needs re-emitting after the attempt.
             if (event === pendingBlockedReply.load()) pendingBlockedReply.store(null)
+            pendingTransfer.load()?.recordDelivery(event)
           } catch (t: Throwable) {
             // Flow.trace's flowOn runs emit in the caller's context; only the caller throws here.
             collectorFailed = true
@@ -385,7 +394,7 @@ internal class LlmAgentTurn(
         if (collectorFailed || !dropped) throw e
         droppedBy = e
       } finally {
-        // The one teardown per connection, and it precedes any restart or reconnect.
+        // The one teardown per connection, and it precedes any restart, transfer or reconnect.
         val unused = close()
       }
       // The teardown is uninterruptible, so re-check before opening any further connection.
@@ -405,6 +414,30 @@ internal class LlmAgentTurn(
       if (result.closedByCaller || (!goAway && queue.isClosed)) {
         failure?.let { throw it }
         break
+      }
+
+      // The handover the model asked for, even when a drop ended the attempt before it.
+      val transferTo =
+        pendingTransfer.exchange(null)?.let { transfer ->
+          // A drop may have cut its emit short; the caller still sees it before the target runs.
+          if (!transfer.delivered) collector.emit(transfer.event)
+          // Likewise its held speech; a callback that blocks it cannot stop the transfer.
+          transfer.input?.let { input ->
+            val unused = handleLiveResponse(attemptRequest, input, "", queue, collector::emit)
+          }
+          transfer.agentName
+        }
+      // Transfer before the drop rethrow, so a drop during the handover still hands over.
+      transferTo?.let { agentName ->
+        val target =
+          if (agentName == agent.name) agent
+          else
+            liveTransferTargets(agent).firstOrNull { it.name == agentName }
+              ?: throw IllegalArgumentException(
+                "Agent '${agent.name}' is not allowed to transfer to the requested agent."
+              )
+        collector.emitAll(target.runLive(context.forLiveChild(target)))
+        return false
       }
 
       // Without a handle a drop fails the run; a go-away continues in a fresh session below.
@@ -454,9 +487,9 @@ internal class LlmAgentTurn(
 
   /**
    * Pumps the caller's queue into [connection] while reading turns back out of it, until the caller
-   * closes the queue, the connection ends or retires, or a callback blocks the model's output or
-   * spoken input. Records how it stopped in [result]; the flow completes only once the sender has
-   * stopped.
+   * closes the queue, the connection ends or retires, a transfer starts, or a callback blocks the
+   * model's output or spoken input. Records how it stopped in [result]; the flow completes only
+   * once the sender has stopped.
    */
   // Only the sender writes the connection; the turn and its caller append under one shared lock.
   @Suppress("UnsafeCoroutineCrossing")
@@ -543,6 +576,10 @@ internal class LlmAgentTurn(
   ) {
     // The model's output transcription so far in this turn, which the after-model callbacks screen.
     var spoken = ""
+    // The user's speech in this turn that the connection has not yet marked finished.
+    var unfinishedInput = ""
+    // Speech stored ahead of a transfer call, so the connection's own finished copy is skipped.
+    var storedInput: String? = null
     while (true) {
       var sawResponse = false
       var end: LiveTurnsEnd? = null
@@ -562,11 +599,49 @@ internal class LlmAgentTurn(
           if (response.turnComplete == true) {
             result.completedATurn = true
           }
-          spoken = spokenSoFar(spoken, response)
-          if (handleLiveResponse(request, response, spoken, queue, emitEvent)) {
-            end = LiveTurnsEnd.BLOCKED
-            return@takeWhile false
+          storedInput?.let { stored ->
+            val rest = response.finishedInputAfter(stored) ?: return@let
+            storedInput = null
+            unfinishedInput = ""
+            // No handover followed the stored speech, so keep only what the user said after it.
+            if (
+              rest.isNotEmpty() &&
+                emitAsFinishedInput(request, rest, response, spoken, queue, emitEvent)
+            ) {
+              end = LiveTurnsEnd.BLOCKED
+              return@takeWhile false
+            }
+            return@takeWhile true
           }
+          if (response.turnComplete == true || response.interrupted) storedInput = null
+          spoken = spokenSoFar(spoken, response)
+          unfinishedInput = unfinishedInputSoFar(unfinishedInput, response)
+          // The connection closes at a handover before the speech is finished: store it first.
+          if (unfinishedInput.isNotEmpty() && response.callsTransferToAgent()) {
+            val speech = unfinishedInput
+            unfinishedInput = ""
+            // A blocked question ends the turn before the call, as ADK Python's restart does.
+            if (emitAsFinishedInput(request, speech, response, spoken, queue, emitEvent)) {
+              end = LiveTurnsEnd.BLOCKED
+              return@takeWhile false
+            }
+            storedInput = storedInput.orEmpty() + speech
+          }
+          val blocked =
+            handleLiveResponse(request, response, spoken, queue, emitEvent, unfinishedInput)
+          pendingTransfer.load()?.let { transfer ->
+            // A custom tool that asks for the transfer leaves the speech for after its call.
+            if (unfinishedInput.isNotEmpty()) {
+              // The tool has run, so a callback that blocks this speech does not stop the transfer.
+              val unused =
+                emitAsFinishedInput(request, unfinishedInput, response, spoken, queue, emitEvent)
+              unfinishedInput = ""
+            }
+            handOverConnection(transfer, queue)
+            end = LiveTurnsEnd.TRANSFER
+          }
+          // A transfer beats a blocked input in the same response: any answer is already queued.
+          if (blocked && end == null) end = LiveTurnsEnd.BLOCKED
           end == null
         }
         .collect()
@@ -582,6 +657,31 @@ internal class LlmAgentTurn(
     }
   }
 
+  /**
+   * Emits the user's [speech] as the finished transcription the connection has not sent yet.
+   *
+   * @return whether a callback blocked it.
+   */
+  private suspend fun emitAsFinishedInput(
+    request: LlmRequest,
+    speech: String,
+    response: LlmResponse,
+    spoken: String,
+    queue: LiveRequestQueue,
+    emitEvent: suspend (Event) -> Unit,
+  ): Boolean =
+    handleLiveResponse(request, response.asFinishedInput(speech), spoken, queue, emitEvent)
+
+  /** The user's unfinished speech in this turn, [unfinished], updated with [response]. */
+  private fun unfinishedInputSoFar(unfinished: String, response: LlmResponse): String {
+    val input = response.inputTranscription
+    return when {
+      input?.finished == true || response.turnComplete == true || response.interrupted -> ""
+      input != null -> unfinished + input.text.orEmpty()
+      else -> unfinished
+    }
+  }
+
   /** The turn's output transcription so far, [spoken], updated with [response]. */
   private fun spokenSoFar(spoken: String, response: LlmResponse): String {
     val turnSoFar = if (response.turnComplete == true || response.interrupted) "" else spoken
@@ -590,7 +690,9 @@ internal class LlmAgentTurn(
   }
 
   /**
-   * Screens and emits one live [response], answering its tool calls through [queue].
+   * Screens and emits one live [response], answering its tool calls through [queue]. A transfer it
+   * asks for keeps [unfinishedInput], the user's speech still to emit after it, so a drop cannot
+   * lose it.
    *
    * @return whether a callback blocked the model's output or the user's spoken input.
    */
@@ -600,6 +702,7 @@ internal class LlmAgentTurn(
     spoken: String,
     queue: LiveRequestQueue,
     emitEvent: suspend (Event) -> Unit,
+    unfinishedInput: String = "",
   ): Boolean {
     val callbackContext = CallbackContext(context)
     if (response.outputTranscription != null && spoken.isNotEmpty()) {
@@ -610,6 +713,18 @@ internal class LlmAgentTurn(
       }
     }
     emitLiveResponse(request, response, callbackContext) { event ->
+      event.actions.transferToAgent?.let { name ->
+        // Kept before the emit, so a drop mid-emit cannot lose it; runLiveSession emits it if lost.
+        pendingTransfer.store(
+          PendingTransfer(
+            name,
+            // An answer to wait for only when there is one; a non-tool transfer has none.
+            event.content?.takeIf { c -> c.parts.any { it.functionResponse != null } },
+            event,
+            unfinishedInput.takeIf { it.isNotEmpty() }?.let { response.asFinishedInput(it) },
+          )
+        )
+      }
       emitEvent(event)
       sendToolResponse(queue, event)
     }
@@ -637,6 +752,31 @@ internal class LlmAgentTurn(
   private fun restartedTurn(): LlmAgentTurn {
     val restartContext = context.copy(runConfig = context.runConfig?.forNewLiveSession())
     return LlmAgentTurn(agent, restartContext, requestProcessors, responseProcessors)
+  }
+
+  /**
+   * Gives the model's turn time to finish before another agent takes the conversation over.
+   *
+   * The `transfer_to_agent` answer queues behind whatever the caller sent first, so this waits up
+   * to [TRANSFER_ANSWER_TIMEOUT] for the sender to write it to this connection rather than leave it
+   * for the child's, then pauses for [TRANSFER_HANDOVER_DELAY] as ADK Python does. Both waits end
+   * early if the caller closes the queue, since no transfer follows a hang-up.
+   */
+  // The queue is only ever awaited here, never written, so the cross-coroutine read is safe.
+  @Suppress("UnsafeCoroutineCrossing")
+  private suspend fun handOverConnection(transfer: PendingTransfer, queue: LiveRequestQueue) {
+    if (transfer.answer != null) {
+      val wrote =
+        withTimeoutOrNull(TRANSFER_ANSWER_TIMEOUT) {
+          select {
+            transfer.written.onAwait { true }
+            queue.closed.onAwait { false }
+          }
+        }
+      if (wrote == null) logger.warn { "The transfer answer was not sent before the handover." }
+    }
+    // The pause lets the model's turn settle, unless the caller has already hung up.
+    withTimeoutOrNull(TRANSFER_HANDOVER_DELAY) { queue.closed.await() }
   }
 
   /**
@@ -801,6 +941,10 @@ internal class LlmAgentTurn(
               }
           }
         sendingToConnection { connection.sendContent(toSend, input.partial) }
+        val transfer = pendingTransfer.load()
+        if (transfer?.answer == sent) {
+          val unused = transfer.written.complete(Unit)
+        }
       }
       null -> {}
     }
@@ -1297,13 +1441,8 @@ internal class LlmAgentTurn(
 
     // If a tool requested a transfer to another agent, execute that agent's loop.
     functionResponseEvent?.actions?.transferToAgent?.let { agentName ->
-      // Live transfer is not supported on this path; a live run must not run the target turn-based.
-      if (context.liveRequestQueue != null) {
-        logger.warn {
-          "A live run can't transfer to another agent yet, so it stays with ${agent.name}."
-        }
-        return@let
-      }
+      // Live runs hand over to the target in `runLiveSession`, so they skip this path.
+      if (context.liveRequestQueue != null) return@let
       require(agentName != agent.name) { "Agent '${agent.name}' cannot transfer to itself." }
       // Declared targets only, so the model cannot reach any other agent in the tree.
       val targetAgent =
@@ -1366,12 +1505,14 @@ private val SESSION_APPEND_TIMEOUT = 10.seconds
 
 /**
  * How the receive loop of one connection stopped: the connection or the caller closed it, a
- * callback blocked the model's output or spoken input, or the server announced a go-away.
+ * callback blocked the model's output or spoken input, the server announced a go-away, or the model
+ * handed the conversation to another agent.
  */
 private enum class LiveTurnsEnd {
   CLOSED,
   BLOCKED,
   GO_AWAY,
+  TRANSFER,
 }
 
 /**
@@ -1416,6 +1557,73 @@ private data class PendingSend(
   val screened: Content?,
   val storedTurn: Boolean = false,
 )
+
+/**
+ * A handover to [agentName], with its `transfer_to_agent` [answer], the [event] that asked for it,
+ * and the signal the sender completes once it has written that answer.
+ *
+ * @property input the user's speech still to emit after [event], as a finished transcription; null
+ *   when there is none or it has reached the caller.
+ */
+private class PendingTransfer(
+  val agentName: String,
+  val answer: Content?,
+  val event: Event,
+  @Volatile var input: LlmResponse?,
+) {
+  val written = CompletableDeferred<Unit>()
+
+  /** Whether [event] reached the caller; if not, it is emitted before the handover. */
+  @Volatile var delivered = false
+
+  /** Records that [emitted] reached the caller, so the handover does not emit it again. */
+  fun recordDelivery(emitted: Event) {
+    if (emitted === event) delivered = true
+    if (emitted.inputTranscription == input?.inputTranscription) input = null
+  }
+}
+
+/**
+ * How long a handover waits for the `transfer_to_agent` answer to reach this connection.
+ *
+ * The answer queues behind the caller's earlier input, so a backlog of audio can delay it; past the
+ * bound the handover goes ahead anyway and the answer goes to the next connection, whereas ADK
+ * Python never waits for the answer.
+ */
+private val TRANSFER_ANSWER_TIMEOUT = 5.seconds
+
+/**
+ * How long the old connection stays open after the handover answer, the figure ADK Python holds in
+ * `DEFAULT_TRANSFER_AGENT_DELAY`.
+ *
+ * Nothing is read from it meanwhile, so anything the model streams during the pause is dropped with
+ * the connection, as in ADK Python.
+ */
+private val TRANSFER_HANDOVER_DELAY = 1.seconds
+
+/** Whether this response calls `transfer_to_agent`. */
+private fun LlmResponse.callsTransferToAgent(): Boolean =
+  content?.parts.orEmpty().any { it.functionCall?.name == TRANSFER_TO_AGENT_TOOL_NAME }
+
+/**
+ * The rest of a finished transcription that starts with the already stored [speech], or null when
+ * this response is not one; the connection sends such a transcription on its own.
+ */
+private fun LlmResponse.finishedInputAfter(speech: String): String? {
+  val text = inputTranscription?.takeIf { it.finished == true }?.text ?: return null
+  val alone =
+    copy(inputTranscription = null, partial = false, modelVersion = null, liveSessionId = null) ==
+      LlmResponse()
+  return if (alone && text.startsWith(speech)) text.removePrefix(speech).trimStart() else null
+}
+
+/** The user's [speech] as a finished transcription on a response of its own, from this session. */
+private fun LlmResponse.asFinishedInput(speech: String): LlmResponse =
+  LlmResponse(
+    inputTranscription = Transcription(text = speech, finished = true),
+    modelVersion = modelVersion,
+    liveSessionId = liveSessionId,
+  )
 
 /**
  * Span over the history a live run sends at connect, which no `call_llm` span covers; named as in
