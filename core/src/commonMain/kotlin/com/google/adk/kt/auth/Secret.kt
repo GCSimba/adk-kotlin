@@ -20,6 +20,7 @@ import com.google.adk.kt.annotations.ExperimentalAuthApi
 import com.google.adk.kt.annotations.SecretAccess
 import kotlin.jvm.Transient
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.descriptors.PrimitiveKind
 import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
 import kotlinx.serialization.descriptors.SerialDescriptor
@@ -65,3 +66,10 @@ internal object SecretSerializer : KSerializer<Secret> {
 
   override fun deserialize(decoder: Decoder): Secret = Secret(decoder.decodeString())
 }
+
+/**
+ * A [Secret] that ADK's own serializers read and write as its plain string value, through
+ * [SecretSerializer].
+ */
+@OptIn(ExperimentalAuthApi::class)
+internal typealias JsonSecret = @Serializable(with = SecretSerializer::class) Secret
