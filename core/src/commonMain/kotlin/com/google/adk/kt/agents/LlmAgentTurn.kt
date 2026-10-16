@@ -42,6 +42,7 @@ import com.google.adk.kt.processors.findTransferTargets
 import com.google.adk.kt.processors.generateRequestConfirmationEvent
 import com.google.adk.kt.processors.getStructuredModelResponse
 import com.google.adk.kt.processors.liveTransferTargets
+import com.google.adk.kt.processors.offersTaskCompletedTool
 import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.telemetry.EMPTY_JSON
 import com.google.adk.kt.telemetry.Span
@@ -54,6 +55,7 @@ import com.google.adk.kt.telemetry.withSpan
 import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.tools.GoogleSearchAgentTool
 import com.google.adk.kt.tools.GoogleSearchTool
+import com.google.adk.kt.tools.TaskCompletedTool.Companion.TASK_COMPLETED_TOOL_NAME
 import com.google.adk.kt.tools.ToolContext
 import com.google.adk.kt.tools.VertexAiSearchAgentTool
 import com.google.adk.kt.tools.VertexAiSearchTool
@@ -140,8 +142,11 @@ internal class LlmAgentTurn(
    */
   private val resumptionHandle = AtomicReference<String?>(null)
 
-  /** The transfer the model asked for, kept so that a drop before the handover does not lose it. */
-  private val pendingTransfer = AtomicReference<PendingTransfer?>(null)
+  /**
+   * The transfer or `task_completed` the model asked for, kept so that a drop before the handover
+   * does not lose it.
+   */
+  private val pendingHandover = AtomicReference<PendingHandover?>(null)
 
   /**
    * A callback's reply to a blocked input, held until the collector confirms delivery so a drop
@@ -261,7 +266,9 @@ internal class LlmAgentTurn(
    */
   private val canonicalDirectTools: List<BaseTool> by lazy {
     val tools = agent.tools + context.extraTools.values
-    if (tools.size + agent.toolsets.size <= 1) {
+    // The injected task_completed tool counts toward the limit too, as Python's len(tools) > 1.
+    val injectedToolCount = if (offersTaskCompletedTool(context)) 1 else 0
+    if (tools.size + agent.toolsets.size + injectedToolCount <= 1) {
       tools
     } else {
       tools.map { tool ->
@@ -376,7 +383,7 @@ internal class LlmAgentTurn(
             collector.emit(event)
             // Delivered, so a blocked reply no longer needs re-emitting after the attempt.
             if (event === pendingBlockedReply.load()) pendingBlockedReply.store(null)
-            pendingTransfer.load()?.recordDelivery(event)
+            pendingHandover.load()?.recordDelivery(event)
           } catch (t: Throwable) {
             // Flow.trace's flowOn runs emit in the caller's context; only the caller throws here.
             collectorFailed = true
@@ -416,16 +423,16 @@ internal class LlmAgentTurn(
       }
 
       // The handover the model asked for, even when a drop ended the attempt before it.
-      val transferTo =
-        pendingTransfer.exchange(null)?.let { transfer ->
-          // A drop may have cut its emit short; the caller still sees it before the target runs.
-          if (!transfer.delivered) collector.emit(transfer.event)
-          // Likewise its held speech; a callback that blocks it cannot stop the transfer.
-          transfer.input?.let { input ->
+      val handover =
+        pendingHandover.exchange(null)?.also { lost ->
+          // A drop may have cut its emit short; the caller still sees it before the handover.
+          if (!lost.delivered) collector.emit(lost.event)
+          // Likewise its held speech; a callback that blocks it cannot stop the handover.
+          lost.input?.let { input ->
             val unused = handleLiveResponse(attemptRequest, input, "", queue, collector::emit)
           }
-          transfer.agentName
         }
+      val transferTo = handover?.transferTo
       // Transfer before the drop rethrow, so a drop during the handover still hands over.
       transferTo?.let { agentName ->
         val target =
@@ -438,6 +445,9 @@ internal class LlmAgentTurn(
         collector.emitAll(target.runLive(context.forLiveChild(target)))
         return false
       }
+
+      // Any other handover is a task_completed, which ends its run (in a sequence, the step).
+      if (handover != null) return false
 
       // Without a handle a drop fails the run; a go-away continues in a fresh session below.
       if (droppedBy != null && !goAway && resumptionHandle.load() == null) throw droppedBy
@@ -486,7 +496,7 @@ internal class LlmAgentTurn(
 
   /**
    * Pumps the caller's queue into [connection] while reading turns back out of it, until the caller
-   * closes the queue, the connection ends or retires, a transfer starts, or a callback blocks the
+   * closes the queue, the connection ends or retires, a handover starts, or a callback blocks the
    * model's output or spoken input. Records how it stopped in [result]; the flow completes only
    * once the sender has stopped.
    */
@@ -631,7 +641,7 @@ internal class LlmAgentTurn(
           }
           val blocked =
             handleLiveResponse(request, response, spoken, queue, emitEvent, unfinishedInput)
-          pendingTransfer.load()?.let { transfer ->
+          pendingHandover.load()?.let { handover ->
             // Only a transfer set without a tool call still has unstored speech here.
             if (unfinishedInput.isNotEmpty()) {
               // The transfer already reached the caller, so blocking this speech cannot stop it.
@@ -639,10 +649,12 @@ internal class LlmAgentTurn(
                 emitAsFinishedInput(request, unfinishedInput, response, spoken, queue, emitEvent)
               unfinishedInput = ""
             }
-            handOverConnection(transfer, queue)
-            end = LiveTurnsEnd.TRANSFER
+            handOverConnection(handover, queue)
+            end =
+              if (handover.transferTo != null) LiveTurnsEnd.TRANSFER
+              else LiveTurnsEnd.TASK_COMPLETED
           }
-          // A transfer beats a blocked input in the same response: any answer is already queued.
+          // A handover beats a blocked input in the same response: any answer is already queued.
           if (blocked && end == null) end = LiveTurnsEnd.BLOCKED
           end == null
         }
@@ -692,7 +704,7 @@ internal class LlmAgentTurn(
   }
 
   /**
-   * Screens and emits one live [response], answering its tool calls through [queue]. A transfer it
+   * Screens and emits one live [response], answering its tool calls through [queue]. A handover it
    * asks for keeps [unfinishedInput], the user's speech still to emit after it, so a drop cannot
    * lose it.
    *
@@ -715,14 +727,22 @@ internal class LlmAgentTurn(
       }
     }
     emitLiveResponse(request, response, callbackContext) { event ->
-      event.actions.transferToAgent?.let { name ->
+      val transferTo = event.actions.transferToAgent
+      // A transfer from any event of the response wins, so a task_completed never replaces it.
+      if (
+        transferTo != null ||
+          (event.signalsTaskCompleted() &&
+            pendingHandover.load()?.transferTo == null &&
+            // A tool-not-found answer to an unoffered task_completed call does not count.
+            TASK_COMPLETED_TOOL_NAME in getToolMap(request))
+      ) {
         // Kept before the emit, so a drop mid-emit cannot lose it; runLiveSession emits it if lost.
-        pendingTransfer.store(
-          PendingTransfer(
-            name,
+        pendingHandover.store(
+          PendingHandover(
             // An answer to wait for only when there is one; a non-tool transfer has none.
             event.content?.takeIf { c -> c.parts.any { it.functionResponse != null } },
             event,
+            transferTo,
             unfinishedInput.takeIf { it.isNotEmpty() }?.let { response.asFinishedInput(it) },
           )
         )
@@ -757,28 +777,31 @@ internal class LlmAgentTurn(
   }
 
   /**
-   * Gives the model's turn time to finish before another agent takes the conversation over.
+   * Gives the model's turn time to finish before the connection is handed over, on a transfer or a
+   * `task_completed` end.
    *
-   * The `transfer_to_agent` answer queues behind whatever the caller sent first, so this waits up
-   * to [TRANSFER_ANSWER_TIMEOUT] for the sender to write it to this connection rather than leave it
-   * for the child's, then pauses for [TRANSFER_HANDOVER_DELAY] as ADK Python does. Both waits end
-   * early if the caller closes the queue, since no transfer follows a hang-up.
+   * The [handover]'s tool answer queues behind whatever the caller sent first, so this waits up to
+   * [TRANSFER_ANSWER_TIMEOUT] for the sender to write it to this connection rather than leave it
+   * for the next one, then pauses for [TRANSFER_HANDOVER_DELAY] or [TASK_COMPLETION_DELAY] as ADK
+   * Python does. Both waits end early if the caller closes the queue, since nothing follows a
+   * hang-up.
    */
   // The queue is only ever awaited here, never written, so the cross-coroutine read is safe.
   @Suppress("UnsafeCoroutineCrossing")
-  private suspend fun handOverConnection(transfer: PendingTransfer, queue: LiveRequestQueue) {
-    if (transfer.answer != null) {
+  private suspend fun handOverConnection(handover: PendingHandover, queue: LiveRequestQueue) {
+    if (handover.answer != null) {
       val wrote =
         withTimeoutOrNull(TRANSFER_ANSWER_TIMEOUT) {
           select {
-            transfer.written.onAwait { true }
+            handover.written.onAwait { true }
             queue.closed.onAwait { false }
           }
         }
-      if (wrote == null) logger.warn { "The transfer answer was not sent before the handover." }
+      if (wrote == null) logger.warn { "The tool answer was not sent before the handover." }
     }
+    val pause = if (handover.transferTo != null) TRANSFER_HANDOVER_DELAY else TASK_COMPLETION_DELAY
     // The pause lets the model's turn settle, unless the caller has already hung up.
-    withTimeoutOrNull(TRANSFER_HANDOVER_DELAY) { queue.closed.await() }
+    withTimeoutOrNull(pause) { queue.closed.await() }
   }
 
   /**
@@ -943,9 +966,9 @@ internal class LlmAgentTurn(
               }
           }
         sendingToConnection { connection.sendContent(toSend, input.partial) }
-        val transfer = pendingTransfer.load()
-        if (transfer?.answer == sent) {
-          val unused = transfer.written.complete(Unit)
+        val handover = pendingHandover.load()
+        if (handover?.answer == sent) {
+          val unused = handover.written.complete(Unit)
         }
       }
       null -> {}
@@ -1507,14 +1530,15 @@ private val SESSION_APPEND_TIMEOUT = 10.seconds
 
 /**
  * How the receive loop of one connection stopped: the connection or the caller closed it, a
- * callback blocked the model's output or spoken input, the server announced a go-away, or the model
- * handed the conversation to another agent.
+ * callback blocked the model's output or spoken input, the server announced a go-away, the model
+ * handed the conversation to another agent, or a `task_completed` tool answered.
  */
 private enum class LiveTurnsEnd {
   CLOSED,
   BLOCKED,
   GO_AWAY,
   TRANSFER,
+  TASK_COMPLETED,
 }
 
 /**
@@ -1561,16 +1585,18 @@ private data class PendingSend(
 )
 
 /**
- * A handover to [agentName], with its `transfer_to_agent` [answer], the [event] that asked for it,
- * and the signal the sender completes once it has written that answer.
+ * A handover the model asked for: a transfer to [transferTo], or, when that is null, the answer of
+ * a `task_completed` tool the agent has, which ends its live run (in a sequence, the step). It
+ * holds the tool's [answer], the [event] that carries it, and the signal the sender completes once
+ * it has written that answer.
  *
  * @property input the user's speech still to emit after [event], as a finished transcription; null
  *   when there is none or it has reached the caller.
  */
-private class PendingTransfer(
-  val agentName: String,
+private class PendingHandover(
   val answer: Content?,
   val event: Event,
+  val transferTo: String?,
   @Volatile var input: LlmResponse?,
 ) {
   val written = CompletableDeferred<Unit>()
@@ -1586,7 +1612,8 @@ private class PendingTransfer(
 }
 
 /**
- * How long a handover waits for the `transfer_to_agent` answer to reach this connection.
+ * How long a handover waits for its `transfer_to_agent` or `task_completed` answer to reach this
+ * connection.
  *
  * The answer queues behind the caller's earlier input, so a backlog of audio can delay it; past the
  * bound the handover goes ahead anyway and the answer goes to the next connection, whereas ADK
@@ -1595,13 +1622,28 @@ private class PendingTransfer(
 private val TRANSFER_ANSWER_TIMEOUT = 5.seconds
 
 /**
- * How long the old connection stays open after the handover answer, the figure ADK Python holds in
+ * How long the old connection stays open after a transfer's answer, the figure ADK Python holds in
  * `DEFAULT_TRANSFER_AGENT_DELAY`.
  *
  * Nothing is read from it meanwhile, so anything the model streams during the pause is dropped with
  * the connection, as in ADK Python.
  */
 private val TRANSFER_HANDOVER_DELAY = 1.seconds
+
+/**
+ * How long a live agent's connection stays open after a `task_completed` answer, the figure ADK
+ * Python holds in `DEFAULT_TASK_COMPLETION_DELAY`; as after a transfer, anything the model streams
+ * meanwhile is dropped.
+ */
+private val TASK_COMPLETION_DELAY = 1.seconds
+
+/**
+ * Whether this event carries a `task_completed` function response. The model may call it alongside
+ * other tools, whose responses merge into one event, so every response is scanned, not just the
+ * first (parity with ADK Python).
+ */
+private fun Event.signalsTaskCompleted(): Boolean =
+  functionResponses().any { it.name == TASK_COMPLETED_TOOL_NAME }
 
 /**
  * The rest of a finished transcription that starts with the already stored [speech], or null when

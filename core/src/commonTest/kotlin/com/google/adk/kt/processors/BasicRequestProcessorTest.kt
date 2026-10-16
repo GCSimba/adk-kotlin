@@ -19,6 +19,7 @@ package com.google.adk.kt.processors
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.LiveRequestQueue
 import com.google.adk.kt.agents.LlmAgent
+import com.google.adk.kt.agents.LoopAgent
 import com.google.adk.kt.agents.RunConfig
 import com.google.adk.kt.agents.SequentialAgent
 import com.google.adk.kt.annotations.ExperimentalLiveApi
@@ -166,7 +167,7 @@ class BasicRequestProcessorTest {
   @OptIn(ExperimentalLiveApi::class)
   @Test
   fun run_withOutputSchemaAndAWorkflowSubAgentOnALiveRun_setsResponseSchema() = runBlocking {
-    // A workflow sub-agent is not offered live, so the schema applies directly without a tool.
+    // A LoopAgent has no live run, so it is not offered and the schema applies directly.
     val agent =
       LlmAgent(
         name = "parent",
@@ -174,7 +175,7 @@ class BasicRequestProcessorTest {
         outputSchema = outputSchema,
         subAgents =
           listOf(
-            SequentialAgent(
+            LoopAgent(
               name = "workflow",
               subAgents = listOf(LlmAgent(name = "step", model = DummyModel("gemini-2.0-flash"))),
             )
@@ -189,6 +190,24 @@ class BasicRequestProcessorTest {
 
     assertEquals(outputSchema, request.config.responseSchema)
     assertEquals("application/json", request.config.responseMimeType)
+  }
+
+  @OptIn(ExperimentalLiveApi::class)
+  @Test
+  fun run_withOutputSchemaOnALiveSequentialStep_doesNotSetResponseSchema() = runBlocking {
+    // A live step is offered task_completed, which Gemini 2.x can't combine with a response schema.
+    val step =
+      LlmAgent(name = "step", model = DummyModel("gemini-2.0-flash"), outputSchema = outputSchema)
+    val unused = SequentialAgent(name = "workflow", subAgents = listOf(step))
+    val context =
+      InvocationContext(session = testSession(), runConfig = null, agent = step).apply {
+        frameworkData.liveRequestQueue = LiveRequestQueue()
+      }
+
+    val request = BasicRequestProcessor().process(context, LlmRequest())
+
+    assertNull(request.config.responseSchema)
+    assertNull(request.config.responseMimeType)
   }
 
   @Test

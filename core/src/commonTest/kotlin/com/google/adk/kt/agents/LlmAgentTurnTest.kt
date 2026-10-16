@@ -54,6 +54,7 @@ import com.google.adk.kt.testing.handleUpdate
 import com.google.adk.kt.testing.inputTranscription
 import com.google.adk.kt.testing.modelFunctionCallResponse
 import com.google.adk.kt.testing.modelMessage
+import com.google.adk.kt.testing.modelParallelFunctionCallsResponse
 import com.google.adk.kt.testing.modelTransferToAgentResponse
 import com.google.adk.kt.testing.outputTranscription
 import com.google.adk.kt.testing.simplifyEvents
@@ -61,7 +62,10 @@ import com.google.adk.kt.testing.transferToAgentCallPart
 import com.google.adk.kt.testing.turnComplete
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.tools.FunctionTool
+import com.google.adk.kt.tools.GoogleSearchTool
+import com.google.adk.kt.tools.TaskCompletedTool.Companion.TASK_COMPLETED_TOOL_NAME
 import com.google.adk.kt.tools.ToolContext
+import com.google.adk.kt.tools.Toolset
 import com.google.adk.kt.tools.TransferToAgentTool.Companion.TRANSFER_TO_AGENT_TOOL_NAME
 import com.google.adk.kt.types.Blob
 import com.google.adk.kt.types.Content
@@ -105,6 +109,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
@@ -4885,8 +4890,867 @@ class LlmAgentTurnTest {
     assertTrue(events.none { it.content?.parts?.singleOrNull()?.text == "leaked" })
   }
 
+  /** A model response whose single function call is `task_completed`. */
+  private fun taskCompletedCall(id: String = "tc") =
+    modelFunctionCallResponse(TASK_COMPLETED_TOOL_NAME, id = id)
+
+  /** A one-turn script that calls `task_completed`, which ends a live sequential step. */
+  private fun taskCompletedTurn(id: String = "tc"): List<LlmResponse> =
+    listOf(taskCompletedCall(id))
+
+  /** An LlmAgent named [name] that runs on [model], to use as a step of a SequentialAgent. */
+  private fun sequentialStep(name: String, model: RecordingLiveModel) =
+    LlmAgent(name = name, description = "A sequential step.", model = model)
+
+  /** The names of the function tools [model] was offered on its only connect. */
+  private fun offeredToolNames(model: RecordingLiveModel): List<String> =
+    model.connectedRequests
+      .single()
+      .config
+      .tools
+      .orEmpty()
+      .flatMap { it.functionDeclarations.orEmpty() }
+      .map { it.name }
+
   @Test
-  fun runLive_transferToAWorkflowAgent_failsWithoutRunningIt() = runTest {
+  fun runLive_unofferedTaskCompletedCall_doesNotEndTheRun() = runTest {
+    val queue = LiveRequestQueue()
+    // The agent has no task_completed tool, so the call gets a tool-not-found answer.
+    val connection =
+      ScriptedConn("c") {
+        emit(taskCompletedCall("tc1"))
+        emit(LlmResponse(content = modelMessage("still here"), turnComplete = true))
+        queue.close()
+        it.closed.await()
+      }
+    val model = RecordingLiveModel(connection)
+    val agent = LlmAgent(name = "agent", model = model)
+
+    val events = agent.runLive(liveContextFor(agent, queue)).toList()
+
+    assertTrue(
+      events.any { it.content?.parts?.singleOrNull()?.text == "still here" },
+      "a tool-not-found task_completed answer ended the run",
+    )
+    assertEquals(1, model.connectCalls)
+  }
+
+  @Test
+  fun runLive_taskCompletedToolFromAToolset_endsTheRunOnItsAnswer() = runTest {
+    val toolsetTool = DummyTool(TASK_COMPLETED_TOOL_NAME, onRun = { _, _ -> "done" })
+    val toolset =
+      object : Toolset {
+        override suspend fun getTools(readonlyContext: ReadonlyContext?) = listOf(toolsetTool)
+      }
+    // Open until closed, and the queue never closes, so only the tool's answer can end the run.
+    val connection = RecordingLiveConnection(taskCompletedTurn("tc1"), untilClosed = true)
+    val model = RecordingLiveModel(connection)
+    val agent = LlmAgent(name = "agent", model = model, toolsets = listOf(toolset))
+
+    agent.runLive(liveContextFor(agent)).toList()
+
+    assertEquals(1, model.connectCalls)
+    val answer = connection.sentContent.flatMap { it.parts }.firstNotNullOf { it.functionResponse }
+    assertEquals(mapOf("result" to "done"), answer.response)
+  }
+
+  @Test
+  fun runLive_plainAgentWithItsOwnTaskCompletedTool_endsTheRunOnItsAnswer() = runTest {
+    val ownTool = DummyTool(TASK_COMPLETED_TOOL_NAME, onRun = { _, _ -> "done" })
+    // Open until closed, and the queue never closes, so only the tool's answer can end the run.
+    val connection = RecordingLiveConnection(taskCompletedTurn("tc1"), untilClosed = true)
+    val model = RecordingLiveModel(connection)
+    val agent = LlmAgent(name = "agent", model = model, tools = listOf(ownTool))
+
+    agent.runLive(liveContextFor(agent)).toList()
+
+    assertEquals(1, model.connectCalls)
+    val answer = connection.sentContent.flatMap { it.parts }.firstNotNullOf { it.functionResponse }
+    assertEquals(mapOf("result" to "done"), answer.response)
+  }
+
+  @Test
+  fun runLive_sequentialAgent_runsEachStepOnItsOwnConnectionInOrderWithoutAHandle() = runTest {
+    val order = mutableListOf<String>()
+    val step1Connection = RecordingLiveConnection(taskCompletedTurn("tc1"))
+    val step1Model = RecordingLiveModel(step1Connection, onConnect = { order += "step1" })
+    val step2Model =
+      RecordingLiveModel(
+        RecordingLiveConnection(taskCompletedTurn("tc2")),
+        onConnect = { order += "step2" },
+      )
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+    // The caller's handle names the caller's own session, so no step may resume from it.
+    val runConfig = RunConfig(sessionResumption = SessionResumptionConfig(handle = "h-caller"))
+
+    sequence.runLive(liveContextFor(sequence, runConfig = runConfig)).toList()
+
+    assertEquals(listOf("step1", "step2"), order)
+    assertNull(step1Model.connectedRequests.single().liveConnectConfig.sessionResumption?.handle)
+    assertNull(step2Model.connectedRequests.single().liveConnectConfig.sessionResumption?.handle)
+    val answer =
+      step1Connection.sentContent.flatMap { it.parts }.firstNotNullOf { it.functionResponse }
+    assertEquals(mapOf("result" to "Task completion signaled."), answer.response)
+  }
+
+  @Test
+  fun runLive_sequentialAgent_laterStepConnectsWithTheSessionHistory() = runTest {
+    val step1Conn = RecordingLiveConnection(taskCompletedTurn("tc1"))
+    val step2Conn = RecordingLiveConnection(taskCompletedTurn("tc2"))
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents =
+          listOf(
+            sequentialStep("step1", RecordingLiveModel(step1Conn)),
+            sequentialStep("step2", RecordingLiveModel(step2Conn)),
+          ),
+      )
+
+    sequence.runLive(liveContextFor(sequence, session = sessionWithEarlierMessage())).toList()
+
+    assertTrue(
+      "earlier" in step2Conn.sentHistory.flatMap { it.parts }.mapNotNull { it.text },
+      "the later step's connection was not seeded with the session history",
+    )
+  }
+
+  @Test
+  fun runLive_sequentialAgent_offersTaskCompletedToEachStep() = runTest {
+    val step1Model = RecordingLiveModel(RecordingLiveConnection(taskCompletedTurn("tc1")))
+    val step2Model = RecordingLiveModel(RecordingLiveConnection(taskCompletedTurn("tc2")))
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+
+    sequence.runLive(liveContextFor(sequence)).toList()
+
+    assertEquals(listOf("task_completed"), offeredToolNames(step1Model))
+    assertEquals(listOf("task_completed"), offeredToolNames(step2Model))
+  }
+
+  @Test
+  fun runLive_sequentialStep_pausesBeforeEndingTheStep() = runTest {
+    var step2AtMs = -1L
+    val step1Model = RecordingLiveModel(RecordingLiveConnection(taskCompletedTurn("tc1")))
+    val step2Model =
+      RecordingLiveModel(
+        RecordingLiveConnection(taskCompletedTurn("tc2")),
+        onConnect = { step2AtMs = testScheduler.currentTime },
+      )
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+
+    sequence.runLive(liveContextFor(sequence)).toList()
+
+    assertEquals(1, step2Model.connectCalls)
+    assertTrue(
+      step2AtMs >= 1_000,
+      "no handover pause before the next step connected (${step2AtMs}ms)",
+    )
+    assertTrue(
+      step2AtMs < 5_000,
+      "waited the answer bound though the answer was written (${step2AtMs}ms)",
+    )
+  }
+
+  @Test
+  fun runLive_sequentialStep_taskCompletedAmongParallelCalls_endsTheStep() = runTest {
+    val queue = LiveRequestQueue()
+    val otherTool = DummyTool("other", onRun = { _, _ -> mapOf("ok" to true) })
+    // Never closes on its own, so only task_completed, the second answer, can end the step.
+    val step1Conn =
+      ScriptedConn("s1") {
+        emit(
+          modelParallelFunctionCallsResponse(
+            FunctionCall("other", id = "o1"),
+            FunctionCall("task_completed", id = "tc1"),
+          )
+        )
+        it.closed.await()
+      }
+    val step2Model = RecordingLiveModel(ScriptedConn("s2") { it.closed.await() })
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents =
+          listOf(
+            LlmAgent(
+              name = "step1",
+              description = "A sequential step.",
+              model = RecordingLiveModel(step1Conn),
+              tools = listOf(otherTool),
+            ),
+            sequentialStep("step2", step2Model),
+          ),
+      )
+
+    val job = launch { sequence.runLive(liveContextFor(sequence, queue)).toList() }
+    advanceUntilIdle()
+
+    assertEquals(
+      "task_completed among parallel calls did not end the step",
+      1,
+      step2Model.connectCalls,
+    )
+    queue.close()
+    job.join()
+  }
+
+  @Test
+  fun runLive_sequentialStep_withoutATaskCompletedCall_runsUntilTheCallerCloses() = runTest {
+    val queue = LiveRequestQueue()
+    val connection = RecordingLiveConnection(untilClosed = true)
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", RecordingLiveModel(connection))),
+      )
+
+    val job = launch { sequence.runLive(liveContextFor(sequence, queue)).toList() }
+    runCurrent()
+    // No task_completed call, so the step keeps its connection open.
+    assertEquals(0, connection.closeCalls)
+    queue.close()
+    job.join()
+    assertEquals(1, connection.closeCalls)
+  }
+
+  @Test
+  fun runLive_emptySequentialAgent_emitsNothing() = runBlocking {
+    val sequence = SequentialAgent(name = "sequence")
+
+    val events = sequence.runLive(liveContextFor(sequence)).toList()
+
+    assertTrue(events.isEmpty(), "an empty SequentialAgent emitted events")
+  }
+
+  @Test
+  fun runLive_transferIntoASequentialAgent_runsItsStepsThenEnds() = runTest {
+    val step1Model = RecordingLiveModel(RecordingLiveConnection(taskCompletedTurn("tc1")))
+    val step2Model = RecordingLiveModel(RecordingLiveConnection(taskCompletedTurn("tc2")))
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        description = "Runs its steps.",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+    val root =
+      LlmAgent(
+        name = "root",
+        model =
+          RecordingLiveModel(
+            ScriptedConn("root") {
+              emit(modelTransferToAgentResponse("sequence"))
+              it.closed.await()
+            }
+          ),
+        subAgents = listOf(sequence),
+      )
+
+    root.runLive(liveContextFor(root)).toList()
+
+    assertEquals(1, step1Model.connectCalls)
+    assertEquals(1, step2Model.connectCalls)
+  }
+
+  @Test
+  fun runLive_nestedSequentialAgent_runsTheInnerSteps() = runTest {
+    val outerStepModel = RecordingLiveModel(RecordingLiveConnection(taskCompletedTurn("tc-out")))
+    val innerStepModel = RecordingLiveModel(RecordingLiveConnection(taskCompletedTurn("tc-in")))
+    val inner =
+      SequentialAgent(
+        name = "inner",
+        subAgents = listOf(sequentialStep("inner_step", innerStepModel)),
+      )
+    val outer =
+      SequentialAgent(
+        name = "outer",
+        subAgents = listOf(sequentialStep("outer_step", outerStepModel), inner),
+      )
+
+    outer.runLive(liveContextFor(outer)).toList()
+
+    assertEquals(1, outerStepModel.connectCalls)
+    assertEquals(1, innerStepModel.connectCalls)
+  }
+
+  @Test
+  fun runLive_callerHangsUpMidSequence_opensNoFurtherConnection() = runBlocking {
+    val queue = LiveRequestQueue()
+    // step1 never signals completion; it ends only when the caller closes the queue.
+    val step1Model =
+      RecordingLiveModel(RecordingLiveConnection(untilClosed = true), onConnect = { queue.close() })
+    val step2Model = RecordingLiveModel(RecordingLiveConnection(untilClosed = true))
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+
+    sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    assertEquals(1, step1Model.connectCalls)
+    assertEquals("a later step opened after the caller hung up", 0, step2Model.connectCalls)
+  }
+
+  @Test
+  fun runLive_callerSendsAndHangsUpBeforeTheRun_firstStepStillSendsTheInput() = runBlocking {
+    val queue = LiveRequestQueue()
+    queue.sendContent(userMessage("hi"))
+    queue.close()
+    val step1Connection = RecordingLiveConnection(untilClosed = true)
+    val step1Model = RecordingLiveModel(step1Connection)
+    val step2Model = RecordingLiveModel(RecordingLiveConnection(untilClosed = true))
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+
+    sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    // Like a bare LlmAgent, the first step drains what the caller sent before hanging up.
+    assertEquals(listOf("hi"), step1Connection.sentTexts())
+    assertEquals("a later step opened after the caller hung up", 0, step2Model.connectCalls)
+  }
+
+  @Test
+  fun runLive_dropDuringAStepWithAHandle_resumesTheSameStep() = runTest {
+    val queue = LiveRequestQueue()
+    val step1First =
+      ScriptedConn("s1a") {
+        emit(handleUpdate("h-1"))
+        throw connectionDrop()
+      }
+    val step1Second =
+      ScriptedConn("s1b") {
+        emit(taskCompletedCall("tc1"))
+        it.closed.await()
+      }
+    val step1Model = RecordingLiveModel(step1First, step1Second)
+    val step2Model =
+      RecordingLiveModel(
+        ScriptedConn("s2") {
+          emit(taskCompletedCall("tc2"))
+          queue.close()
+          it.closed.await()
+        }
+      )
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+
+    sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    assertEquals(
+      "the dropped step did not resume on its own connection",
+      2,
+      step1Model.connectCalls,
+    )
+    assertEquals(1, step2Model.connectCalls)
+  }
+
+  @Test
+  fun runLive_dropWhileWritingTheTaskCompletedAnswer_stillCompletesTheStep() = runTest {
+    // With no handle, a drop while writing the answer still ends the step; the next step runs.
+    val (_, step2Connects) = dropWhileWritingTheTaskCompletedAnswer(withHandle = false)
+
+    assertEquals(1, step2Connects)
+  }
+
+  @Test
+  fun runLive_dropWritingTaskCompletedWithAHandle_completesWithoutResuming() = runTest {
+    // With a handle, a recorded task_completed still ends the step instead of resuming it.
+    val (step1Connects, step2Connects) = dropWhileWritingTheTaskCompletedAnswer(withHandle = true)
+
+    assertEquals("the step resumed instead of completing on task_completed", 1, step1Connects)
+    assertEquals(1, step2Connects)
+  }
+
+  /**
+   * Runs a sequence whose step1 drops while writing its `task_completed` answer; returns step1's
+   * and step2's connect counts.
+   */
+  private suspend fun dropWhileWritingTheTaskCompletedAnswer(withHandle: Boolean): Pair<Int, Int> {
+    val queue = LiveRequestQueue()
+    val step1Conn =
+      ScriptedConn("s1") {
+        if (withHandle) emit(handleUpdate("h-1"))
+        emit(taskCompletedCall("tc1"))
+        it.closed.await()
+      }
+    step1Conn.onSendContent = { content ->
+      if (content.parts.any { it.functionResponse != null }) {
+        throw connectionDrop()
+      }
+    }
+    val step1Model = RecordingLiveModel(step1Conn)
+    val step2Model =
+      RecordingLiveModel(
+        ScriptedConn("s2") {
+          emit(taskCompletedCall("tc2"))
+          queue.close()
+          it.closed.await()
+        }
+      )
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+
+    sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    return step1Model.connectCalls to step2Model.connectCalls
+  }
+
+  /** How many of [events] carry the `task_completed` answer. */
+  private fun taskCompletedAnswers(events: List<Event>): Int = events.count { e ->
+    e.functionResponses().any { it.name == "task_completed" }
+  }
+
+  @Test
+  fun runLive_dropBeforeTheTaskCompletedEventReachesTheCaller_deliversItOnceAndEndsTheStep() =
+    runTest {
+      // The caller is busy with a blocked reply when the drop lands, so the answer event waits.
+      val queue = LiveRequestQueue()
+      val callerBusy = CompletableDeferred<Unit>()
+      val step1Conn =
+        ScriptedConn("s1") {
+          emitAll(
+            channelFlow {
+              send(handleUpdate("h-1"))
+              send(taskCompletedCall("tc1"))
+              callerBusy.await()
+              delay(60)
+              throw connectionDrop()
+            }
+          )
+        }
+      val step1Model =
+        RecordingLiveModel(step1Conn, ScriptedConn("s1-resumed") { it.closed.await() }) { n ->
+          if (n == 2) queue.close()
+        }
+      val step2Model =
+        RecordingLiveModel(ScriptedConn("s2") { it.closed.await() }, onConnect = { queue.close() })
+      val blockTypedHi = BeforeModelCallback { _, request ->
+        val typedHi = request.contents.any { c -> c.parts.any { it.text == "hi" } }
+        if (typedHi) CallbackChoice.Break(LlmResponse(content = modelMessage("no")))
+        else CallbackChoice.Continue(request)
+      }
+      val step1 =
+        LlmAgent(
+          name = "step1",
+          description = "s",
+          model = step1Model,
+          beforeModelCallbacks = listOf(blockTypedHi),
+          // Holds the tool, so the sender's blocked reply reaches the caller before the answer.
+          beforeToolCallbacks =
+            listOf(
+              BeforeToolCallback { _, _, args ->
+                delay(50)
+                CallbackChoice.Continue(args)
+              }
+            ),
+        )
+      val sequence =
+        SequentialAgent(
+          name = "sequence",
+          subAgents = listOf(step1, sequentialStep("step2", step2Model)),
+        )
+
+      val events = mutableListOf<Event>()
+      sequence.runLive(liveContextFor(sequence, queue)).collect { event ->
+        events += event
+        if (event.content?.parts.orEmpty().any { it.functionCall != null }) {
+          queue.sendContent(userMessage("hi"))
+        }
+        if (event.content?.parts.orEmpty().any { it.text == "no" }) {
+          callerBusy.complete(Unit)
+          delay(100)
+        }
+      }
+
+      assertEquals(1 to 1, step1Model.connectCalls to step2Model.connectCalls)
+      assertEquals(1, taskCompletedAnswers(events))
+    }
+
+  /** A `task_completed` call in the same response as the caller's finished speech. */
+  private fun taskCompletedWithHeardInput(): LlmResponse =
+    taskCompletedCall("tc1").copy(inputTranscription = Transcription(text = "hi", finished = true))
+
+  @Test
+  fun runLive_dropBeforeTheTaskCompletedIsRecorded_stillEndsTheStep() = runTest {
+    val (_, step2Connects, answers) = dropBeforeTheTaskCompletedIsRecorded(withHandle = false)
+
+    assertEquals(1, step2Connects)
+    assertEquals(1, answers)
+  }
+
+  @Test
+  fun runLive_dropBeforeTheTaskCompletedIsRecordedWithAHandle_endsTheStepWithoutResuming() =
+    runTest {
+      val (step1Connects, step2Connects, answers) =
+        dropBeforeTheTaskCompletedIsRecorded(withHandle = true)
+
+      assertEquals(1 to 1, step1Connects to step2Connects)
+      assertEquals(1, answers)
+    }
+
+  /**
+   * Runs a sequence whose step1's answer write drops while the same response's input is still
+   * screened; returns the two steps' connects and how many `task_completed` answers were emitted.
+   */
+  private suspend fun dropBeforeTheTaskCompletedIsRecorded(
+    withHandle: Boolean
+  ): Triple<Int, Int, Int> {
+    val queue = LiveRequestQueue()
+    val first =
+      ScriptedConn("s1a") {
+        if (withHandle) emit(handleUpdate("h-1"))
+        emit(taskCompletedWithHeardInput())
+        it.closed.await()
+      }
+    first.onSendContent = { content ->
+      if (content.parts.any { it.functionResponse != null }) {
+        throw connectionDrop()
+      }
+    }
+    // A resume hangs up, so a step that resumes instead of ending runs no next step.
+    val step1Model =
+      RecordingLiveModel(first, ScriptedConn("s1b") { it.closed.await() }) { n ->
+        if (n == 2) queue.close()
+      }
+    val step2Model =
+      RecordingLiveModel(ScriptedConn("s2") { it.closed.await() }, onConnect = { queue.close() })
+    val step1 =
+      LlmAgent(
+        name = "step1",
+        description = "s",
+        model = step1Model,
+        beforeModelCallbacks = listOf(slowScreening()),
+      )
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(step1, sequentialStep("step2", step2Model)),
+      )
+
+    val events = sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    return Triple(step1Model.connectCalls, step2Model.connectCalls, taskCompletedAnswers(events))
+  }
+
+  @Test
+  fun runLive_stepTransferringToItsOwnSubAgent_doesNotOfferTheSubAgentTaskCompleted() = runTest {
+    val queue = LiveRequestQueue()
+    val childModel =
+      RecordingLiveModel(
+        ScriptedConn("child") {
+          emit(LlmResponse(content = modelMessage("hi"), turnComplete = true))
+          queue.close()
+          it.closed.await()
+        }
+      )
+    val child = LlmAgent(name = "child", description = "c", model = childModel)
+    val step1 =
+      LlmAgent(
+        name = "step1",
+        description = "s",
+        model =
+          RecordingLiveModel(
+            ScriptedConn("s1") {
+              emit(modelTransferToAgentResponse("child"))
+              it.closed.await()
+            }
+          ),
+        subAgents = listOf(child),
+      )
+    val sequence = SequentialAgent(name = "sequence", subAgents = listOf(step1))
+
+    sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    assertEquals(1, childModel.connectCalls)
+    assertTrue(
+      "task_completed" !in offeredToolNames(childModel),
+      "a transfer target of a step must not be offered task_completed",
+    )
+  }
+
+  @Test
+  fun runLive_transferAndTaskCompletedInOneResponse_transfersThenEndsTheStep() = runTest {
+    val order = mutableListOf<String>()
+    // Ends on its own after one turn, so the sequence can go on once the transfer is over.
+    val childConn =
+      ScriptedConn("child") { emit(LlmResponse(content = modelMessage("hi"), turnComplete = true)) }
+    childConn.onClose = { order += "child closed" }
+    val childModel = RecordingLiveModel(childConn, onConnect = { order += "child" })
+    val child = LlmAgent(name = "child", description = "c", model = childModel)
+    val step1Conn =
+      ScriptedConn("s1") {
+        emit(
+          LlmResponse(
+            content =
+              Content(
+                Role.MODEL,
+                listOf(
+                  transferToAgentCallPart("child"),
+                  Part(functionCall = FunctionCall("task_completed", id = "tc1")),
+                ),
+              )
+          )
+        )
+        it.closed.await()
+      }
+    val step1 =
+      LlmAgent(
+        name = "step1",
+        description = "s",
+        model = RecordingLiveModel(step1Conn),
+        subAgents = listOf(child),
+      )
+    val step2Model =
+      RecordingLiveModel(
+        RecordingLiveConnection(taskCompletedTurn("tc2")),
+        onConnect = { order += "step2" },
+      )
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(step1, sequentialStep("step2", step2Model)),
+      )
+
+    sequence.runLive(liveContextFor(sequence)).toList()
+
+    // The task_completed never replaces the transfer, and step1 ends only once the target has.
+    assertEquals(listOf("child", "child closed", "step2"), order)
+  }
+
+  @Test
+  fun runLive_callbackTransferAndTaskCompletedOnSeparateEvents_transfersThenEndsTheStep() =
+    runTest {
+      val order = mutableListOf<String>()
+      val childConn =
+        ScriptedConn("child") {
+          emit(LlmResponse(content = modelMessage("hi"), turnComplete = true))
+        }
+      childConn.onClose = { order += "child closed" }
+      val childModel = RecordingLiveModel(childConn, onConnect = { order += "child" })
+      val child = LlmAgent(name = "child", description = "c", model = childModel)
+      // The words run the after-model callback, so the transfer and the answer are separate events.
+      val step1Conn =
+        ScriptedConn("s1") {
+          emit(
+            taskCompletedCall("tc1")
+              .copy(outputTranscription = Transcription(text = "Over to you", finished = false))
+          )
+          it.closed.await()
+        }
+      val step1 =
+        LlmAgent(
+          name = "step1",
+          description = "s",
+          model = RecordingLiveModel(step1Conn),
+          subAgents = listOf(child),
+          afterModelCallbacks =
+            listOf(
+              AfterModelCallback { ctx, response ->
+                ctx.actions.transferToAgent = "child"
+                response
+              }
+            ),
+        )
+      val step2Model =
+        RecordingLiveModel(
+          RecordingLiveConnection(taskCompletedTurn("tc2")),
+          onConnect = { order += "step2" },
+        )
+      val sequence =
+        SequentialAgent(
+          name = "sequence",
+          subAgents = listOf(step1, sequentialStep("step2", step2Model)),
+        )
+
+      sequence.runLive(liveContextFor(sequence)).toList()
+
+      assertEquals(listOf("child", "child closed", "step2"), order)
+    }
+
+  @Test
+  fun runLive_hangUpDuringTheCompletionPause_opensNoNextStep() = runBlocking {
+    val queue = LiveRequestQueue()
+    val step1Conn =
+      ScriptedConn("s1") {
+        emit(taskCompletedCall("tc1"))
+        it.closed.await()
+      }
+    // The caller hangs up once the answer is written, i.e. during the 1 s completion pause.
+    step1Conn.onSendContent = { content ->
+      if (content.parts.any { it.functionResponse != null }) queue.close()
+    }
+    val step1Model = RecordingLiveModel(step1Conn)
+    val step2Model = RecordingLiveModel(ScriptedConn("s2") { it.closed.await() })
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+
+    sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    assertEquals(1, step1Model.connectCalls)
+    assertEquals("a next step opened after a hang-up during the pause", 0, step2Model.connectCalls)
+  }
+
+  @Test
+  fun runLive_unfinishedSpeechBeforeTaskCompleted_storedAsOneFinishedTranscriptionBeforeTheCall() =
+    runTest {
+      // Gemini 3.x audio sends the words, the call, then the finished marker: store words first.
+      val queue = LiveRequestQueue()
+      val step1Conn =
+        ScriptedConn("s1") {
+          emit(inputTranscription("Can you ", finished = false))
+          emit(inputTranscription("finish up?", finished = false))
+          emit(taskCompletedCall("tc1"))
+          it.closed.await()
+        }
+      val step2Conn =
+        ScriptedConn("s2") {
+          emit(taskCompletedCall("tc2"))
+          queue.close()
+          it.closed.await()
+        }
+      val step1Model = RecordingLiveModel(step1Conn)
+      val step2Model = RecordingLiveModel(step2Conn)
+      val sequence =
+        SequentialAgent(
+          name = "sequence",
+          subAgents =
+            listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+        )
+
+      val events = sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+      val finished = events.filter { it.inputTranscription?.finished == true }
+      assertEquals(listOf("Can you finish up?"), finished.map { it.inputTranscription?.text })
+      assertEquals("user", finished.single().author)
+      assertEquals(false, finished.single().partial)
+      // Before the task_completed call event, so the next step reads it as the question.
+      val callIndex = events.indexOfFirst { e ->
+        e.content?.parts.orEmpty().any { it.functionCall?.name == "task_completed" }
+      }
+      assertTrue(callIndex >= 0, "no task_completed call event was emitted")
+      assertTrue(events.indexOf(finished.single()) < callIndex)
+      assertEquals(1, step2Model.connectCalls)
+    }
+
+  @Test
+  fun runLive_taskCompletedAfterFinishedSpeech_addsNoSecondTranscription() = runTest {
+    // When the connection sends its own finished copy, the words are not stored a second time.
+    val queue = LiveRequestQueue()
+    val step1Conn =
+      ScriptedConn("s1") {
+        emit(inputTranscription("Can you finish up?", finished = false))
+        emit(inputTranscription("Can you finish up?", finished = true))
+        emit(taskCompletedCall("tc1"))
+        it.closed.await()
+      }
+    val step2Model =
+      RecordingLiveModel(
+        ScriptedConn("s2") {
+          emit(taskCompletedCall("tc2"))
+          queue.close()
+          it.closed.await()
+        }
+      )
+    val step1Model = RecordingLiveModel(step1Conn)
+    val sequence =
+      SequentialAgent(
+        name = "sequence",
+        subAgents = listOf(sequentialStep("step1", step1Model), sequentialStep("step2", step2Model)),
+      )
+
+    val events = sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    assertEquals(1, events.count { it.inputTranscription?.finished == true })
+    assertEquals(1, step2Model.connectCalls)
+  }
+
+  @Test
+  fun runLive_sequentialStepWithASingleBypassingSearchTool_swapsItForTheAgentTool() = runTest {
+    // task_completed is a second tool, so an opted-in search tool becomes the agent-tool form.
+    val queue = LiveRequestQueue()
+    val step1Model =
+      RecordingLiveModel(
+        ScriptedConn("s1") {
+          emit(taskCompletedCall("tc1"))
+          queue.close()
+          it.closed.await()
+        }
+      )
+    val step1 =
+      LlmAgent(
+        name = "step1",
+        description = "s",
+        model = step1Model,
+        tools = listOf(GoogleSearchTool(bypassMultiToolsLimit = true)),
+      )
+    val sequence = SequentialAgent(name = "sequence", subAgents = listOf(step1))
+
+    sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    assertTrue(
+      "google_search_agent" in offeredToolNames(step1Model),
+      "the search tool was not swapped despite the injected task_completed tool",
+    )
+  }
+
+  @Test
+  fun runLive_unfinishedSpeechBlockedBeforeTaskCompleted_restartsWithoutCompleting() = runTest {
+    // A blocked question restarts the step before the call, so the next step never runs.
+    val queue = LiveRequestQueue()
+    val step1Conn =
+      ScriptedConn("s1") {
+        emit(inputTranscription("hi", finished = false))
+        emit(taskCompletedCall("tc1"))
+        it.closed.await()
+      }
+    val step1Model =
+      RecordingLiveModel(step1Conn, ScriptedConn("s1-restart") { it.closed.await() }) { n ->
+        if (n == 2) queue.close()
+      }
+    val step2Model = RecordingLiveModel(ScriptedConn("s2") { it.closed.await() })
+    val step1 =
+      LlmAgent(
+        name = "step1",
+        description = "s",
+        model = step1Model,
+        beforeModelCallbacks = listOf(slowScreening(block = true)),
+      )
+    val step2 = sequentialStep("step2", step2Model)
+    val sequence = SequentialAgent(name = "sequence", subAgents = listOf(step1, step2))
+
+    sequence.runLive(liveContextFor(sequence, queue)).toList()
+
+    assertEquals("the blocked step did not restart", 2, step1Model.connectCalls)
+    assertEquals("a later step ran though the step never completed", 0, step2Model.connectCalls)
+  }
+
+  @Test
+  fun runLive_transferToALoopAgent_failsWithoutRunningIt() = runTest {
+    // A LoopAgent has no live run (nor in ADK Python), so it is not an allowed live target.
     // The live sibling is there so transfer_to_agent is offered at all.
     val stepModel = RecordingLiveModel(RecordingLiveConnection(untilClosed = true))
     val liveSib =
@@ -4896,7 +5760,7 @@ class LlmAgentTurnTest {
         model = RecordingLiveModel(RecordingLiveConnection(untilClosed = true)),
       )
     val workflow =
-      SequentialAgent(
+      LoopAgent(
         name = "workflow",
         subAgents = listOf(LlmAgent(name = "step", description = "s", model = stepModel)),
       )
