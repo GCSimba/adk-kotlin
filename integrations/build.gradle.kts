@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+// Meta module: no code, only `api` dependencies on every integration module. Kept multiplatform
+// with a single JVM target so its `-jvm` artifact, which Maven users depend on, still publishes.
 plugins {
   kotlin("multiplatform")
   id("maven-publish")
@@ -23,30 +25,12 @@ kotlin {
   jvm()
 
   sourceSets {
-    getByName("commonMain") {
-      dependencies {
-        api(project(":google-adk-kotlin-core"))
-        implementation(libs.kotlinx.coroutines.core)
-      }
-    }
-    getByName("commonTest") {
-      dependencies {
-        implementation(project(":google-adk-kotlin-testing"))
-        implementation(kotlin("test"))
-      }
-    }
     getByName("jvmMain") {
       dependencies {
-        api(libs.google.cloud.bigquery)
-        api(libs.google.auth.oauth2.http)
-      }
-    }
-    getByName("jvmTest") {
-      dependencies {
-        implementation(libs.google.truth)
-        implementation(libs.junit)
-        implementation(libs.kotlin.test.junit)
-        implementation(libs.mockito.kotlin)
+        api(project(":google-adk-kotlin-integrations-anthropic"))
+        api(project(":google-adk-kotlin-integrations-bigquery"))
+        api(project(":google-adk-kotlin-integrations-openai"))
+        api(project(":google-adk-kotlin-integrations-spring"))
       }
     }
   }

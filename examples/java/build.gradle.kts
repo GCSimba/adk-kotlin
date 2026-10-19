@@ -44,8 +44,8 @@ dependencies {
   // The Chat Completions Vertex demo gets its access token from the auth library directly.
   implementation(libs.google.auth.oauth2.http)
   implementation(libs.opentelemetry.sdk)
-  implementation(project(":google-adk-kotlin-integrations"))
   implementation(project(":google-adk-kotlin-integrations-anthropic"))
+  implementation(project(":google-adk-kotlin-integrations-bigquery"))
   implementation(project(":google-adk-kotlin-integrations-openai"))
   implementation(project(":google-adk-kotlin-integrations-spring"))
   implementation(libs.spring.ai.google.genai)

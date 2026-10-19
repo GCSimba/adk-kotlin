@@ -58,6 +58,10 @@ include(":google-adk-kotlin-integrations-openai")
 
 project(":google-adk-kotlin-integrations-openai").projectDir = file("integrations/openai")
 
+include(":google-adk-kotlin-integrations-bigquery")
+
+project(":google-adk-kotlin-integrations-bigquery").projectDir = file("integrations/bigquery")
+
 include(":google-adk-kotlin-a2a")
 
 project(":google-adk-kotlin-a2a").projectDir = file("a2a")

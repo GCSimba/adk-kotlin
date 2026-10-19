@@ -17,7 +17,7 @@ This page gives rules, not version numbers. Current values live in `gradle/libs.
 All artifacts share the group `com.google.adk` and one release version (see the install snippet in `README.md`). Published artifact IDs:
 
 - `google-adk-kotlin-core` for the runtime, and `google-adk-kotlin-processor` for `@Tool` code generation.
-- `google-adk-kotlin-<module>` for the other JVM and multiplatform modules: `webserver`, `integrations`, `integrations-spring`, `integrations-anthropic`, `integrations-openai`, `a2a`, `litertlm`.
+- `google-adk-kotlin-<module>` for the other JVM and multiplatform modules: `webserver`, `integrations` (pulls in every `integrations-*` module), `integrations-spring`, `integrations-anthropic`, `integrations-openai`, `integrations-bigquery`, `a2a`, `litertlm`.
 - The Android-only modules are published with an `-android` suffix: `google-adk-kotlin-firebase-android` and `google-adk-kotlin-mlkit-android`. ML Kit uses a `-beta` version of the shared release.
 
 `testing` and the examples are not published. The `artifactId` in a module's `build.gradle.kts` is authoritative.
