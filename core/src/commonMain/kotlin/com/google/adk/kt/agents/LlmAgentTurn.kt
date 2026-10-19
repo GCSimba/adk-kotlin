@@ -133,15 +133,15 @@ internal class LlmAgentTurn(
 ) {
 
   /**
-   * Keeps the run's audio when `RunConfig.saveLiveBlob` asks for it; null records nothing. It is
-   * also null without an artifact service, which leaves nowhere to save a recording.
+   * Keeps the run's audio when `LiveRunConfig.saveLiveBlob` asks for it; null records nothing. It
+   * is also null without an artifact service, which leaves nowhere to save a recording.
    */
   private val audioCache: AudioCacheManager? by lazy {
     when {
-      context.runConfig?.saveLiveBlob != true -> null
+      context.runConfig?.live?.saveLiveBlob != true -> null
       context.artifactService == null -> {
         logger.warn {
-          "RunConfig.saveLiveBlob is set but the run has no artifact service, so live audio is " +
+          "LiveRunConfig.saveLiveBlob is set but the run has no artifact service, so live audio is " +
             "not recorded."
         }
         null
