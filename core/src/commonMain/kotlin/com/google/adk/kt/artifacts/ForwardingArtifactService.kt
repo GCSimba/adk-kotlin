@@ -41,9 +41,7 @@ internal class ForwardingArtifactService(private val toolContext: ToolContext) :
   ): Part {
     val version = toolContext.saveArtifact(filename, artifact)
     return toolContext.loadArtifact(filename, version)
-      ?: throw IllegalStateException(
-        "Artifact '$filename' (version $version) not found after save."
-      )
+      ?: throw IllegalStateException("Artifact version $version not found after save.")
   }
 
   override suspend fun loadArtifact(
@@ -59,7 +57,7 @@ internal class ForwardingArtifactService(private val toolContext: ToolContext) :
     val service =
       toolContext.invocationContext.artifactService
         ?: throw IllegalStateException(
-          "artifactService not configured on parent invocation; cannot delete artifact '$filename'."
+          "artifactService not configured on parent invocation; cannot delete an artifact."
         )
     service.deleteArtifact(toolContext.invocationContext.session.key, filename)
   }
@@ -69,7 +67,7 @@ internal class ForwardingArtifactService(private val toolContext: ToolContext) :
       toolContext.invocationContext.artifactService
         ?: throw IllegalStateException(
           "artifactService not configured on parent invocation; cannot list versions of " +
-            "artifact '$filename'."
+            "an artifact."
         )
     return service.listVersions(toolContext.invocationContext.session.key, filename)
   }

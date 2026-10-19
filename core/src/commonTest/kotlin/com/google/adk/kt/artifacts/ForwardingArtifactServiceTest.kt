@@ -20,15 +20,18 @@ import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.testing.testInvocationContext
 import com.google.adk.kt.testing.testToolContext
 import com.google.adk.kt.types.Part
+import com.google.common.truth.Truth.assertThat
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 
 class ForwardingArtifactServiceTest {
 
   private val unusedChildSessionKey = SessionKey("ignored_app", "ignored_user", "ignored_session")
+  private val callerFilename = "customer-notes.txt"
 
   @Test
   fun saveArtifact_writesToParentServiceAndRecordsDelta() = runTest {
@@ -119,7 +122,8 @@ class ForwardingArtifactServiceTest {
 
   @Test
   fun saveAndReloadArtifact_returnsTheSavedArtifact() = runTest {
-    val toolContext = testToolContext(testInvocationContext(artifactService = InMemoryArtifactService()))
+    val toolContext =
+      testToolContext(testInvocationContext(artifactService = InMemoryArtifactService()))
     val artifact = Part(text = "round-trip")
     val forwarder = ForwardingArtifactService(toolContext)
 
@@ -134,9 +138,11 @@ class ForwardingArtifactServiceTest {
     val toolContext = testToolContext(testInvocationContext(artifactService = null))
     val forwarder = ForwardingArtifactService(toolContext)
 
-    assertFailsWith<IllegalStateException> {
-      forwarder.saveArtifact(unusedChildSessionKey, "x", Part(text = "y"))
-    }
+    val error =
+      assertFailsWith<IllegalStateException> {
+        forwarder.saveArtifact(unusedChildSessionKey, callerFilename, Part(text = "y"))
+      }
+    assertThat(error).hasMessageThat().doesNotContain(callerFilename)
   }
 
   @Test
@@ -144,7 +150,11 @@ class ForwardingArtifactServiceTest {
     val toolContext = testToolContext(testInvocationContext(artifactService = null))
     val forwarder = ForwardingArtifactService(toolContext)
 
-    assertFailsWith<IllegalStateException> { forwarder.deleteArtifact(unusedChildSessionKey, "x") }
+    val error =
+      assertFailsWith<IllegalStateException> {
+        forwarder.deleteArtifact(unusedChildSessionKey, callerFilename)
+      }
+    assertThat(error).hasMessageThat().doesNotContain(callerFilename)
   }
 
   @Test
@@ -152,6 +162,30 @@ class ForwardingArtifactServiceTest {
     val toolContext = testToolContext(testInvocationContext(artifactService = null))
     val forwarder = ForwardingArtifactService(toolContext)
 
-    assertFailsWith<IllegalStateException> { forwarder.listVersions(unusedChildSessionKey, "x") }
+    val error =
+      assertFailsWith<IllegalStateException> {
+        forwarder.listVersions(unusedChildSessionKey, callerFilename)
+      }
+    assertThat(error).hasMessageThat().doesNotContain(callerFilename)
+  }
+
+  @Test
+  fun saveAndReloadArtifact_throwsWhenTheSavedVersionCannotBeLoaded() = runBlocking {
+    val losesSaves =
+      object : ArtifactService by InMemoryArtifactService() {
+        override suspend fun loadArtifact(
+          sessionKey: SessionKey,
+          filename: String,
+          version: Int?,
+        ): Part? = null
+      }
+    val toolContext = testToolContext(testInvocationContext(artifactService = losesSaves))
+    val forwarder = ForwardingArtifactService(toolContext)
+
+    val error =
+      assertFailsWith<IllegalStateException> {
+        forwarder.saveAndReloadArtifact(unusedChildSessionKey, callerFilename, Part(text = "y"))
+      }
+    assertThat(error).hasMessageThat().doesNotContain(callerFilename)
   }
 }

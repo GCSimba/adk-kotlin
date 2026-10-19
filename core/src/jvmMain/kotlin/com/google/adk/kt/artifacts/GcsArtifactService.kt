@@ -119,7 +119,10 @@ class GcsArtifactService(private val bucketName: String, private val storageClie
       )
     } catch (e: StorageException) {
       if (e.code == 412) {
-        throw IllegalStateException("Concurrent write collision detected for artifact $filename", e)
+        throw IllegalStateException(
+          "Concurrent write collision detected while saving an artifact",
+          e,
+        )
       }
       throw IllegalStateException("Failed to save artifact to GCS", e)
     }

@@ -179,7 +179,7 @@ internal constructor(
     // Backend delete ignores the user id, so enforce ownership first; a missing session is a no-op.
     val sessionDto = client.getSession(engine, sessionId).getOrThrow() ?: return
     if (sessionDto.userId != key.userId) {
-      throw SecurityException("Session $sessionId does not belong to user ${key.userId}.")
+      throw SecurityException("The requested session does not belong to the requesting user.")
     }
     client.deleteSession(engine, sessionId).getOrThrow()
   }

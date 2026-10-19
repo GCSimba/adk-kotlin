@@ -699,9 +699,12 @@ class VertexAiSessionServiceTest {
         onBlocking { deleteSession(any(), any()) } doReturn Result.success(Unit)
       }
 
-    assertFailsWith<SecurityException> {
-      service(client).deleteSession(SessionKey("123", "attacker", "s1"))
-    }
+    val error =
+      assertFailsWith<SecurityException> {
+        service(client).deleteSession(SessionKey("123", "attacker", "s1"))
+      }
+    assertThat(error).hasMessageThat().doesNotContain("attacker")
+    assertThat(error).hasMessageThat().doesNotContain("s1")
     verifyBlocking(client, never()) { deleteSession(any(), any()) }
   }
 

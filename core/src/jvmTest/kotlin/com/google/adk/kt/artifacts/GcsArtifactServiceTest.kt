@@ -168,7 +168,11 @@ class GcsArtifactServiceTest {
         storageException
     }
 
-    assertFailsWith<IllegalStateException> { service.saveArtifact(SESSION_KEY, FILENAME, artifact) }
+    val error =
+      assertFailsWith<IllegalStateException> {
+        service.saveArtifact(SESSION_KEY, FILENAME, artifact)
+      }
+    assertThat(error).hasMessageThat().doesNotContain(FILENAME)
   }
 
   private companion object {

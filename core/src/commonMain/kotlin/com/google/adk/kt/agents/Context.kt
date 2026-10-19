@@ -387,7 +387,7 @@ open class Context(
     val service =
       invocationContext.artifactService
         ?: throw IllegalStateException(
-          "artifactService not configured on invocation; cannot save artifact '$name'."
+          "artifactService not configured on invocation; cannot save an artifact."
         )
     val version = service.saveArtifact(invocationContext.session.key, name, artifact)
     actions.artifactDelta[name] = version
