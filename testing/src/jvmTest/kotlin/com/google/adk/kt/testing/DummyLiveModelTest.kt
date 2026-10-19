@@ -287,6 +287,127 @@ class DummyLiveModelTest {
     assertThat(model.connections).containsExactlyElementsIn(connections).inOrder()
   }
 
+  @Test
+  fun perConnection_eachConnection_playsItsOwnScript(): Unit = runBlocking {
+    val model =
+      DummyLiveModel.perConnection(
+        listOf(
+          listOf(text("a"), DummyLiveStep.EndStream),
+          listOf(text("b"), DummyLiveStep.EndStream),
+        )
+      )
+
+    val first = model.connect(LlmRequest())
+    val second = model.connect(LlmRequest())
+
+    assertThat(first.receive().toList().map { it.firstText() }).containsExactly("a")
+    assertThat(second.receive().toList().map { it.firstText() }).containsExactly("b")
+    assertThat(model.connections).containsExactly(first, second).inOrder()
+  }
+
+  @Test
+  fun perConnection_onConnect_runsWithEachIndexInOrder(): Unit = runBlocking {
+    val opened = mutableListOf<Int>()
+    val model =
+      DummyLiveModel.perConnection(
+        listOf(listOf(DummyLiveStep.EndStream), listOf(DummyLiveStep.EndStream)),
+        onConnect = { index -> opened += index },
+      )
+
+    repeat(2) {
+      val unused = model.connect(LlmRequest())
+    }
+
+    assertThat(opened).containsExactly(0, 1).inOrder()
+  }
+
+  @Test
+  fun perConnection_moreConnectionsThanScripts_failsTheTest(): Unit = runBlocking {
+    val model = DummyLiveModel.perConnection(listOf(listOf(DummyLiveStep.EndStream)))
+    val unused = model.connect(LlmRequest())
+
+    val error = assertFailsWith<AssertionError> { model.connect(LlmRequest()) }
+
+    assertThat(error).hasMessageThat().contains("has 1 script(s), but connection 2 was opened")
+    assertThat(model.connections).hasSize(1)
+  }
+
+  @Test
+  fun perConnection_afterScripts_playForEveryConnectionPastTheEnd(): Unit = runBlocking {
+    val model =
+      DummyLiveModel.perConnection(
+        listOf(listOf(text("a"), DummyLiveStep.EndStream)),
+        afterScripts = listOf(text("z"), DummyLiveStep.EndStream),
+      )
+
+    val texts = List(3) { model.connect(LlmRequest()).receive().toList().map { it.firstText() } }
+
+    assertThat(texts).containsExactly(listOf("a"), listOf("z"), listOf("z")).inOrder()
+    assertThat(model.connections).hasSize(3)
+  }
+
+  @Test
+  fun perConnection_onSend_runsAfterEachSendIsRecorded(): Unit = runBlocking {
+    val seen = mutableListOf<String>()
+    val opened = mutableListOf<DummyLiveConnection>()
+    val model =
+      DummyLiveModel.perConnection(
+        listOf(listOf(DummyLiveStep.EndStream), listOf(DummyLiveStep.EndStream)),
+        onSend = { index, message ->
+          val recorded = opened[index].sent.last() === message
+          seen += "$index:${message::class.simpleName}:$recorded"
+        },
+      )
+    val first = model.connect(LlmRequest()).also { opened += it as DummyLiveConnection }
+    val second = model.connect(LlmRequest()).also { opened += it as DummyLiveConnection }
+
+    first.sendContent(userMessage("hi"), partial = false)
+    second.sendRealtime(RealtimeInput.ActivityStart)
+
+    assertThat(seen).containsExactly("0:ContentInput:true", "1:ActivityStart:true").inOrder()
+  }
+
+  @Test
+  fun perConnection_onSendThrows_failsTheSendAndKeepsItRecorded(): Unit = runBlocking {
+    val model =
+      DummyLiveModel.perConnection(
+        listOf(listOf(DummyLiveStep.EndStream)),
+        onSend = { _, _ -> throw IllegalStateException("write failed") },
+      )
+    val connection = model.connect(LlmRequest())
+
+    val error =
+      assertFailsWith<IllegalStateException> {
+        connection.sendContent(userMessage("hi"), partial = false)
+      }
+
+    assertThat(error).hasMessageThat().isEqualTo("write failed")
+    assertThat(model.connections.single().sent).hasSize(1)
+  }
+
+  @Test
+  fun perConnection_onSend_runsForTheHistoryToo(): Unit = runBlocking {
+    val seen = mutableListOf<Any>()
+    val model =
+      DummyLiveModel.perConnection(
+        listOf(listOf(DummyLiveStep.EndStream)),
+        onSend = { _, message -> seen += message },
+      )
+    val history = listOf(userMessage("earlier"))
+
+    model.connect(LlmRequest()).sendHistory(history)
+
+    assertThat(seen).containsExactly(history)
+  }
+
+  @Test
+  fun perConnection_noScripts_isRejected() {
+    val error =
+      assertFailsWith<IllegalArgumentException> { DummyLiveModel.perConnection(emptyList()) }
+
+    assertThat(error).hasMessageThat().contains("needs at least one script")
+  }
+
   private companion object {
     val TURN_COMPLETE = DummyLiveStep.Respond(LlmResponse(turnComplete = true))
 

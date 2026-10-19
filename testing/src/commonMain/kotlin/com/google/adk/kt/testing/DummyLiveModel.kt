@@ -25,6 +25,7 @@ import com.google.adk.kt.models.Model
 import com.google.adk.kt.models.RealtimeInput
 import com.google.adk.kt.types.Content
 import kotlin.jvm.JvmOverloads
+import kotlin.jvm.JvmStatic
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.flow.Flow
@@ -33,6 +34,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -65,6 +67,8 @@ sealed interface DummyLiveStep {
  *
  * Each call to [connect] records the request and returns a new [DummyLiveConnection] that plays
  * [steps].
+ *
+ * Use [perConnection] to give each connection its own steps, for example to script a reconnect.
  */
 @ExperimentalLiveApi
 class DummyLiveModel
@@ -77,6 +81,12 @@ constructor(
   // One StateFlow keeps requests and connections aligned under concurrent connect() calls.
   private val opened = MutableStateFlow(Opened())
 
+  // Set only by [perConnection]; empty scripts keep every connection on [steps].
+  private var scripts: List<List<DummyLiveStep>> = emptyList()
+  private var afterScripts: List<DummyLiveStep> = emptyList()
+  private var onConnect: (Int) -> Unit = {}
+  private var onSend: suspend (Int, Any) -> Unit = { _, _ -> }
+
   /** Every connection opened so far, oldest first. */
   val connections: List<DummyLiveConnection>
     get() = opened.value.connections
@@ -85,10 +95,42 @@ constructor(
   val connectRequests: List<LlmRequest>
     get() = opened.value.requests
 
+  private constructor(
+    scripts: List<List<DummyLiveStep>>,
+    name: String,
+    afterScripts: List<DummyLiveStep>,
+    onConnect: (Int) -> Unit,
+    onSend: suspend (Int, Any) -> Unit,
+  ) : this(emptyList(), name) {
+    this.scripts = scripts
+    this.afterScripts = afterScripts
+    this.onConnect = onConnect
+    this.onSend = onSend
+  }
+
   override suspend fun connect(request: LlmRequest): LiveConnection {
+    if (scripts.isNotEmpty()) return connectPerConnection(request)
     val connection = DummyLiveConnection(steps)
     opened.update { Opened(it.requests + request, it.connections + connection) }
     return connection
+  }
+
+  /** Opens the next connection of a [perConnection] model. */
+  private suspend fun connectPerConnection(request: LlmRequest): LiveConnection {
+    val all = opened.updateAndGet { current ->
+      val index = current.connections.size
+      val script =
+        scripts.getOrNull(index)
+          ?: afterScripts.ifEmpty { null }
+          ?: throw AssertionError(
+            "DummyLiveModel.perConnection has ${scripts.size} script(s), but connection " +
+              "${index + 1} was opened."
+          )
+      val connection = DummyLiveConnection(script) { message -> onSend(index, message) }
+      Opened(current.requests + request, current.connections + connection)
+    }
+    onConnect(all.connections.lastIndex)
+    return all.connections.last()
   }
 
   /** Returns a flow that throws [AssertionError] when collected; only [connect] is supported. */
@@ -101,6 +143,27 @@ constructor(
     val requests: List<LlmRequest> = emptyList(),
     val connections: List<DummyLiveConnection> = emptyList(),
   )
+
+  companion object {
+    /**
+     * Creates a model whose connection `i` plays `scripts[i]`, and a connection past the last plays
+     * [afterScripts], or fails the test when that is empty. [onConnect] gets each connection's
+     * index once it is recorded. [onSend] runs after each send is recorded and may suspend or throw
+     * to fake a slow or failed write.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun perConnection(
+      scripts: List<List<DummyLiveStep>>,
+      name: String = "dummy-live-model",
+      afterScripts: List<DummyLiveStep> = emptyList(),
+      onConnect: (Int) -> Unit = {},
+      onSend: suspend (connection: Int, message: Any) -> Unit = { _, _ -> },
+    ): DummyLiveModel {
+      require(scripts.isNotEmpty()) { "DummyLiveModel.perConnection needs at least one script." }
+      return DummyLiveModel(scripts, name, afterScripts, onConnect, onSend)
+    }
+  }
 }
 
 /**
@@ -122,12 +185,18 @@ internal constructor(private val steps: List<DummyLiveStep>, private val timeout
    */
   constructor(steps: List<DummyLiveStep>) : this(steps, 5.seconds)
 
+  /** Creates a connection that runs [onSend] after it records each message sent to it. */
+  internal constructor(steps: List<DummyLiveStep>, onSend: suspend (Any) -> Unit) : this(steps) {
+    this.onSend = onSend
+  }
+
   private val sentState = MutableStateFlow<List<Any>>(emptyList())
   private val closedState = MutableStateFlow(false)
   private val collecting = Mutex()
   private var next = 0
   private var matched = 0
   private var failure: Throwable? = null
+  private var onSend: suspend (Any) -> Unit = {}
 
   /**
    * All messages sent to this connection in order: a `List<Content>` from [sendHistory], a
@@ -218,6 +287,26 @@ internal constructor(private val steps: List<DummyLiveStep>, private val timeout
 
   private fun record(message: Any) {
     sentState.update { it + message }
+  }
+
+  // sendHistory, sendContent and sendRealtime resolve to these more specific overloads, so [onSend]
+  // runs after each record. Each passes an Any-typed value so it reaches record(Any), not itself.
+  private suspend fun record(history: List<Content>) {
+    val message: Any = history
+    record(message)
+    onSend(history)
+  }
+
+  private suspend fun record(input: ContentInput) {
+    val message: Any = input
+    record(message)
+    onSend(input)
+  }
+
+  private suspend fun record(input: RealtimeInput) {
+    val message: Any = input
+    record(message)
+    onSend(input)
   }
 
   /** Returns the index of the matching message, or null when the connection closed first. */
