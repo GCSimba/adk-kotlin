@@ -22,6 +22,7 @@ import com.google.adk.kt.callbacks.AfterAgentCallback;
 import com.google.adk.kt.callbacks.BeforeModelCallback;
 import com.google.adk.kt.events.Event;
 import com.google.adk.kt.interop.Choices;
+import com.google.adk.kt.interop.CompletableFutureSessionService;
 import com.google.adk.kt.interop.FutureCallbacks;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.memory.MemoryService;
@@ -29,6 +30,7 @@ import com.google.adk.kt.memory.VertexAiRagMemoryService;
 import com.google.adk.kt.models.Gemini;
 import com.google.adk.kt.models.VertexCredentials;
 import com.google.adk.kt.runners.InMemoryRunner;
+import com.google.adk.kt.sessions.InMemorySessionService;
 import com.google.adk.kt.sessions.Session;
 import com.google.adk.kt.sessions.SessionKey;
 import com.google.adk.kt.tools.PreloadMemoryTool;
@@ -52,8 +54,9 @@ import reactor.core.publisher.Flux;
  * turn, and an after-agent callback calls {@code CallbackContext.addSessionToMemory} to write the
  * conversation back for recall in future sessions.
  *
- * <p>{@code createSession} and {@code addSessionToMemory} are Kotlin suspend functions, so the
- * kotlinx-coroutines-reactor {@code mono} builder calls them.
+ * <p>The example creates its session through a {@link CompletableFutureSessionService} and gives
+ * the runner the service it wraps. {@code addSessionToMemory} is a Kotlin suspend function, so the
+ * kotlinx-coroutines-reactor {@code mono} builder calls it.
  *
  * <p>Authentication uses Application Default Credentials ({@code gcloud auth application-default
  * login}).
@@ -109,51 +112,48 @@ public final class VertexAiRagMemoryServiceExampleJava {
             .afterAgentCallbacks(List.of(storeSessionToMemory()))
             .build();
 
-    InMemoryRunner inMemoryRunner =
-        InMemoryRunner.builder()
-            .agent(agent)
-            .appName(APP_NAME)
-            .memoryService(memoryService)
-            .build();
-    Session created =
-        MonoKt.<Session>mono(
-                Dispatchers.getDefault(),
-                (scope, continuation) ->
-                    inMemoryRunner
-                        .getSessionService()
-                        .createSession(new SessionKey(APP_NAME, USER_ID, null), null, continuation))
-            .block();
-    String sessionId = Objects.requireNonNull(created.getKey().getId());
-    PublisherRunner runner = PublisherRunner.of(inMemoryRunner);
+    try (CompletableFutureSessionService sessionService =
+            CompletableFutureSessionService.of(new InMemorySessionService());
+        PublisherRunner runner =
+            PublisherRunner.of(
+                InMemoryRunner.builder()
+                    .agent(agent)
+                    .appName(APP_NAME)
+                    .sessionService(sessionService.asKotlinSessionService())
+                    .memoryService(memoryService)
+                    .build())) {
+      Session created =
+          sessionService.createSession(new SessionKey(APP_NAME, USER_ID, null)).join();
+      String sessionId = Objects.requireNonNull(created.getKey().getId());
 
-    String message =
-        args.length > 0 && args[0].equalsIgnoreCase("short") ? RECALL_MESSAGE : SEED_MESSAGE;
-    System.out.println("user > " + message);
-    Publisher<Event> events =
-        runner.runAsync(USER_ID, sessionId, null, Content.fromText(Role.USER, message));
-    for (Event event : Flux.from(events).toIterable()) {
-      if (event.getPartial()) {
-        continue;
+      String message =
+          args.length > 0 && args[0].equalsIgnoreCase("short") ? RECALL_MESSAGE : SEED_MESSAGE;
+      System.out.println("user > " + message);
+      Publisher<Event> events =
+          runner.runAsync(USER_ID, sessionId, null, Content.fromText(Role.USER, message));
+      for (Event event : Flux.from(events).toIterable()) {
+        if (event.getPartial()) {
+          continue;
+        }
+        Content content = event.getContent();
+        String text =
+            content == null
+                ? ""
+                : content.getParts().stream()
+                    .map(Part::getText)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.joining(" "));
+        if (!text.isBlank()) {
+          System.out.println(event.getAuthor() + " > " + text);
+        }
       }
-      Content content = event.getContent();
-      String text =
-          content == null
-              ? ""
-              : content.getParts().stream()
-                  .map(Part::getText)
-                  .filter(Objects::nonNull)
-                  .collect(Collectors.joining(" "));
-      if (!text.isBlank()) {
-        System.out.println(event.getAuthor() + " > " + text);
-      }
+
+      System.out.println(
+          "\n"
+              + "The after-agent callback stored this turn to the RAG corpus. Run the example again"
+              + " (after indexing) with the `short` argument to watch PreloadMemoryTool recall it"
+              + " in a new session.");
     }
-
-    System.out.println(
-        "\n"
-            + "The after-agent callback stored this turn to the RAG corpus. Run the example again"
-            + " (after indexing) with the `short` argument to watch PreloadMemoryTool recall it in"
-            + " a new session.");
-    runner.close();
     System.exit(0);
   }
 

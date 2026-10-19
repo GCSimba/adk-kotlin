@@ -31,16 +31,16 @@ import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
 import com.google.adk.kt.examples.longrunning.LongRunningToolDemoSupportJava.ChangeDestinationTool;
 import com.google.adk.kt.examples.longrunning.LongRunningToolDemoSupportJava.ScriptedNavModel;
+import com.google.adk.kt.interop.CompletableFutureSessionService;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.runners.InMemoryRunner;
+import com.google.adk.kt.sessions.InMemorySessionService;
 import com.google.adk.kt.sessions.Session;
 import com.google.adk.kt.sessions.SessionKey;
 import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.FunctionCall;
 import com.google.adk.kt.types.Role;
 import java.util.List;
-import kotlinx.coroutines.Dispatchers;
-import kotlinx.coroutines.reactor.MonoKt;
 import reactor.core.publisher.Flux;
 
 /**
@@ -73,76 +73,70 @@ public final class ResumableValueLongRunningToolDemoAgentJava {
             .rootAgent(agent)
             .resumabilityConfig(new ResumabilityConfig(true))
             .build();
-    InMemoryRunner inMemoryRunner = InMemoryRunner.builder().app(app).build();
-    PublisherRunner runner = PublisherRunner.of(inMemoryRunner);
+    try (CompletableFutureSessionService sessionService =
+            CompletableFutureSessionService.of(new InMemorySessionService());
+        PublisherRunner runner =
+            PublisherRunner.of(
+                InMemoryRunner.builder()
+                    .app(app)
+                    .sessionService(sessionService.asKotlinSessionService())
+                    .build())) {
+      System.out.println("=== Resumable long-running tool demo (value return continues) ===");
+      System.out.println("User > Change my destination to " + REQUESTED_DESTINATION + ".");
 
-    System.out.println("=== Resumable long-running tool demo (value return continues) ===");
-    System.out.println("User > Change my destination to " + REQUESTED_DESTINATION + ".");
+      // Collected, not just streamed: the demo inspects these events afterward (paused call + id).
+      List<Event> turn1 =
+          Flux.from(
+                  runner.runAsync(
+                      DEMO_USER_ID,
+                      DEMO_SESSION_ID,
+                      null,
+                      Content.fromText(
+                          Role.USER, "Change my destination to " + REQUESTED_DESTINATION + ".")))
+              .collectList()
+              .block();
+      printEvents(
+          "turn 1 (value answers the call; the model summarizes, invocation stays live)", turn1);
+      System.out.println(
+          "   model invocations during turn 1: "
+              + model.invocations()
+              + " (the value answered the call, so the model is re-invoked to summarize in the same"
+              + " turn)");
 
-    // Collected, not just streamed: the demo inspects these events afterward (paused call + id).
-    List<Event> turn1 =
-        Flux.from(
-                runner.runAsync(
-                    DEMO_USER_ID,
-                    DEMO_SESSION_ID,
-                    null,
-                    Content.fromText(
-                        Role.USER, "Change my destination to " + REQUESTED_DESTINATION + ".")))
-            .collectList()
-            .block();
-    printEvents(
-        "turn 1 (value answers the call; the model summarizes, invocation stays live)", turn1);
-    System.out.println(
-        "   model invocations during turn 1: "
-            + model.invocations()
-            + " (the value answered the call, so the model is re-invoked to summarize in the same"
-            + " turn)");
+      FunctionCall resumableCall = pausedLongRunningCall(turn1);
+      String invocationId = turn1.isEmpty() ? null : turn1.get(0).getInvocationId();
+      if (resumableCall == null || invocationId == null) {
+        System.out.println("No live long-running call; nothing to resume.");
+        return;
+      }
+      System.out.println(
+          "   summarized but still resumable on "
+              + resumableCall.getName()
+              + " (callId="
+              + resumableCall.getId()
+              + ", invocationId="
+              + invocationId
+              + ")");
 
-    FunctionCall resumableCall = pausedLongRunningCall(turn1);
-    String invocationId = turn1.isEmpty() ? null : turn1.get(0).getInvocationId();
-    if (resumableCall == null || invocationId == null) {
-      System.out.println("No live long-running call; nothing to resume.");
-      runner.close();
-      return;
+      System.out.println(
+          "[app] device applied the destination; delivering the real result to invocation "
+              + invocationId
+              + ".");
+      List<Event> turn2 =
+          Flux.from(
+                  runner.runAsync(
+                      DEMO_USER_ID, DEMO_SESSION_ID, invocationId, deviceResult(resumableCall)))
+              .collectList()
+              .block();
+      printEvents("turn 2 (resumed by invocationId with the device result)", turn2);
+
+      Session session =
+          sessionService.getSession(new SessionKey(APP_NAME, DEMO_USER_ID, DEMO_SESSION_ID)).join();
+      System.out.println(
+          "Stored session now has "
+              + (session == null ? 0 : session.getEvents().size())
+              + " events.");
     }
-    System.out.println(
-        "   summarized but still resumable on "
-            + resumableCall.getName()
-            + " (callId="
-            + resumableCall.getId()
-            + ", invocationId="
-            + invocationId
-            + ")");
-
-    System.out.println(
-        "[app] device applied the destination; delivering the real result to invocation "
-            + invocationId
-            + ".");
-    List<Event> turn2 =
-        Flux.from(
-                runner.runAsync(
-                    DEMO_USER_ID, DEMO_SESSION_ID, invocationId, deviceResult(resumableCall)))
-            .collectList()
-            .block();
-    printEvents("turn 2 (resumed by invocationId with the device result)", turn2);
-
-    // getSession is a Kotlin suspend function; kotlinx-coroutines-reactor's mono builder calls it.
-    Session session =
-        MonoKt.<Session>mono(
-                Dispatchers.getDefault(),
-                (scope, continuation) ->
-                    inMemoryRunner
-                        .getSessionService()
-                        .getSession(
-                            new SessionKey(APP_NAME, DEMO_USER_ID, DEMO_SESSION_ID),
-                            null,
-                            continuation))
-            .block();
-    System.out.println(
-        "Stored session now has "
-            + (session == null ? 0 : session.getEvents().size())
-            + " events.");
-    runner.close();
     System.exit(0);
   }
 

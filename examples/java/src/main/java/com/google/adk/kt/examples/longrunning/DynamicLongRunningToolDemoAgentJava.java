@@ -27,10 +27,12 @@ import com.google.adk.kt.agents.LlmAgent;
 import com.google.adk.kt.events.Event;
 import com.google.adk.kt.interop.BaseFutureTool;
 import com.google.adk.kt.interop.BasePublisherModel;
+import com.google.adk.kt.interop.CompletableFutureSessionService;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.LlmRequest;
 import com.google.adk.kt.models.LlmResponse;
 import com.google.adk.kt.runners.InMemoryRunner;
+import com.google.adk.kt.sessions.InMemorySessionService;
 import com.google.adk.kt.sessions.Session;
 import com.google.adk.kt.sessions.SessionKey;
 import com.google.adk.kt.tools.ToolContext;
@@ -49,8 +51,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import kotlin.Unit;
-import kotlinx.coroutines.Dispatchers;
-import kotlinx.coroutines.reactor.MonoKt;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -86,88 +86,84 @@ public final class DynamicLongRunningToolDemoAgentJava {
             .instruction("Help the driver navigate. Use " + NAVIGATE_TO_TOOL + " to reroute them.")
             .tools(new NavigateToTool())
             .build();
-    InMemoryRunner inMemoryRunner = InMemoryRunner.builder().agent(agent).appName(APP_NAME).build();
-    PublisherRunner runner = PublisherRunner.of(inMemoryRunner);
+    try (CompletableFutureSessionService sessionService =
+            CompletableFutureSessionService.of(new InMemorySessionService());
+        PublisherRunner runner =
+            PublisherRunner.of(
+                InMemoryRunner.builder()
+                    .agent(agent)
+                    .appName(APP_NAME)
+                    .sessionService(sessionService.asKotlinSessionService())
+                    .build())) {
+      System.out.println("=== Dynamic long-running tool demo (non-resumable) ===");
+      System.out.println(
+          "One long-running tool decides per call whether to answer now or defer for the device.");
 
-    System.out.println("=== Dynamic long-running tool demo (non-resumable) ===");
-    System.out.println(
-        "One long-running tool decides per call whether to answer now or defer for the device.");
+      // Scenario A: a cached favorite -- the tool returns a value; the agent answers in one turn.
+      System.out.println();
+      System.out.println("User > Navigate to " + REQUESTED_DESTINATION + ".");
+      List<Event> turnA =
+          Flux.from(
+                  runner.runAsync(
+                      DEMO_USER_ID,
+                      DEMO_SESSION_ID,
+                      null,
+                      Content.fromText(Role.USER, "Navigate to " + REQUESTED_DESTINATION + ".")))
+              .collectList()
+              .block();
+      printEvents("scenario A (cached favorite -> value returned, no pause)", turnA);
+      FunctionCall unresolvedA = unresolvedLongRunningCall(turnA);
+      System.out.println(
+          "   model invocations: "
+              + model.invocations()
+              + " (tool call + summary); unresolved long-running call: "
+              + (unresolvedA == null ? "none" : unresolvedA.getName()));
 
-    // Scenario A: a cached favorite -- the tool returns a value and the agent answers in one turn.
-    System.out.println();
-    System.out.println("User > Navigate to " + REQUESTED_DESTINATION + ".");
-    List<Event> turnA =
-        Flux.from(
-                runner.runAsync(
-                    DEMO_USER_ID,
-                    DEMO_SESSION_ID,
-                    null,
-                    Content.fromText(Role.USER, "Navigate to " + REQUESTED_DESTINATION + ".")))
-            .collectList()
-            .block();
-    printEvents("scenario A (cached favorite -> value returned, no pause)", turnA);
-    FunctionCall unresolvedA = unresolvedLongRunningCall(turnA);
-    System.out.println(
-        "   model invocations: "
-            + model.invocations()
-            + " (tool call + summary); unresolved long-running call: "
-            + (unresolvedA == null ? "none" : unresolvedA.getName()));
+      // Scenario B: an unknown place -- the tool returns Unit, so the turn defers for the device.
+      String unknownDestination = "742 Maple Street";
+      System.out.println();
+      System.out.println("User > Navigate to " + unknownDestination + ".");
+      List<Event> turnB =
+          Flux.from(
+                  runner.runAsync(
+                      DEMO_USER_ID,
+                      DEMO_SESSION_ID,
+                      null,
+                      Content.fromText(Role.USER, "Navigate to " + unknownDestination + ".")))
+              .collectList()
+              .block();
+      printEvents("scenario B (unknown place -> Unit returned, turn defers)", turnB);
 
-    // Scenario B: an unknown place -- the tool returns Unit, so the turn defers for the device.
-    String unknownDestination = "742 Maple Street";
-    System.out.println();
-    System.out.println("User > Navigate to " + unknownDestination + ".");
-    List<Event> turnB =
-        Flux.from(
-                runner.runAsync(
-                    DEMO_USER_ID,
-                    DEMO_SESSION_ID,
-                    null,
-                    Content.fromText(Role.USER, "Navigate to " + unknownDestination + ".")))
-            .collectList()
-            .block();
-    printEvents("scenario B (unknown place -> Unit returned, turn defers)", turnB);
+      FunctionCall pending = unresolvedLongRunningCall(turnB);
+      if (pending == null) {
+        System.out.println("No deferred call was produced; nothing to resume.");
+        return;
+      }
+      System.out.println(
+          "   deferred on "
+              + pending.getName()
+              + " (callId="
+              + pending.getId()
+              + "); waiting for the device.");
 
-    FunctionCall pending = unresolvedLongRunningCall(turnB);
-    if (pending == null) {
-      System.out.println("No deferred call was produced; nothing to resume.");
-      runner.close();
-      return;
+      System.out.println(
+          "[app] device geocoded the address and confirmed; returning the result to the agent.");
+      List<Event> turnC =
+          Flux.from(
+                  runner.runAsync(
+                      DEMO_USER_ID, DEMO_SESSION_ID, null, deviceGeocodeResult(pending)))
+              .collectList()
+              .block();
+      printEvents("scenario B resume (device result delivered)", turnC);
+
+      Session session =
+          sessionService.getSession(new SessionKey(APP_NAME, DEMO_USER_ID, DEMO_SESSION_ID)).join();
+      System.out.println();
+      System.out.println(
+          "Stored session now has "
+              + (session == null ? 0 : session.getEvents().size())
+              + " events.");
     }
-    System.out.println(
-        "   deferred on "
-            + pending.getName()
-            + " (callId="
-            + pending.getId()
-            + "); waiting for the device.");
-
-    System.out.println(
-        "[app] device geocoded the address and confirmed; returning the result to the agent.");
-    List<Event> turnC =
-        Flux.from(
-                runner.runAsync(DEMO_USER_ID, DEMO_SESSION_ID, null, deviceGeocodeResult(pending)))
-            .collectList()
-            .block();
-    printEvents("scenario B resume (device result delivered)", turnC);
-
-    // getSession is a Kotlin suspend function; kotlinx-coroutines-reactor's mono builder calls it.
-    Session session =
-        MonoKt.<Session>mono(
-                Dispatchers.getDefault(),
-                (scope, continuation) ->
-                    inMemoryRunner
-                        .getSessionService()
-                        .getSession(
-                            new SessionKey(APP_NAME, DEMO_USER_ID, DEMO_SESSION_ID),
-                            null,
-                            continuation))
-            .block();
-    System.out.println();
-    System.out.println(
-        "Stored session now has "
-            + (session == null ? 0 : session.getEvents().size())
-            + " events.");
-    runner.close();
     System.exit(0);
   }
 

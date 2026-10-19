@@ -21,12 +21,14 @@ import com.google.adk.kt.apps.App;
 import com.google.adk.kt.events.Event;
 import com.google.adk.kt.events.EventCompaction;
 import com.google.adk.kt.interop.BasePublisherModel;
+import com.google.adk.kt.interop.CompletableFutureSessionService;
 import com.google.adk.kt.interop.PublisherRunner;
 import com.google.adk.kt.models.Gemini;
 import com.google.adk.kt.models.LlmRequest;
 import com.google.adk.kt.models.LlmResponse;
 import com.google.adk.kt.models.Model;
 import com.google.adk.kt.runners.InMemoryRunner;
+import com.google.adk.kt.sessions.InMemorySessionService;
 import com.google.adk.kt.sessions.Session;
 import com.google.adk.kt.sessions.SessionKey;
 import com.google.adk.kt.summarizer.EventsCompactionConfig;
@@ -35,8 +37,6 @@ import com.google.adk.kt.types.Content;
 import com.google.adk.kt.types.Role;
 import java.util.List;
 import java.util.Scanner;
-import kotlinx.coroutines.Dispatchers;
-import kotlinx.coroutines.reactor.MonoKt;
 import kotlinx.coroutines.reactor.ReactorFlowKt;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
@@ -111,8 +111,6 @@ public final class TokenThresholdCompactionDemoAgentJava {
                     .summarizer(new LlmEventSummarizer(summarizerModel))
                     .build())
             .build();
-    InMemoryRunner inMemoryRunner = InMemoryRunner.builder().app(app).build();
-
     System.out.println(
         "Token-threshold compaction demo (threshold="
             + TOKEN_THRESHOLD
@@ -120,7 +118,14 @@ public final class TokenThresholdCompactionDemoAgentJava {
             + EVENT_RETENTION_SIZE
             + " events). Type a message; 'exit' or an empty line quits.");
 
-    try (PublisherRunner runner = PublisherRunner.of(inMemoryRunner);
+    try (CompletableFutureSessionService sessionService =
+            CompletableFutureSessionService.of(new InMemorySessionService());
+        PublisherRunner runner =
+            PublisherRunner.of(
+                InMemoryRunner.builder()
+                    .app(app)
+                    .sessionService(sessionService.asKotlinSessionService())
+                    .build());
         Scanner scanner = new Scanner(System.in)) {
       while (true) {
         System.out.print("\nYou > ");
@@ -144,41 +149,33 @@ public final class TokenThresholdCompactionDemoAgentJava {
           }
         }
       }
-    }
 
-    System.out.println(
-        "\n========== SESSION EVENTS (raw events are kept; summaries are appended) ==========");
-    // getSession is a Kotlin suspend function; kotlinx-coroutines-reactor's mono builder calls it.
-    Session session =
-        MonoKt.<Session>mono(
-                Dispatchers.getDefault(),
-                (scope, continuation) ->
-                    inMemoryRunner
-                        .getSessionService()
-                        .getSession(
-                            new SessionKey(APP_NAME, USER_ID, SESSION_ID), null, continuation))
-            .block();
-    if (session == null) {
-      return;
-    }
-    List<Event> events = session.getEvents();
-    for (int i = 0; i < events.size(); i++) {
-      Event event = events.get(i);
-      EventCompaction compaction = event.getActions().getCompaction();
-      String description;
-      if (compaction != null) {
-        String summary = compaction.getCompactedContent().text(" ");
-        description =
-            "COMPACTION SUMMARY covering ["
-                + compaction.getStartTimestamp()
-                + ".."
-                + compaction.getEndTimestamp()
-                + "]: "
-                + summary;
-      } else {
-        description = event.getAuthor() + ": " + event.contentText(" ");
+      System.out.println(
+          "\n========== SESSION EVENTS (raw events are kept; summaries are appended) ==========");
+      Session session =
+          sessionService.getSession(new SessionKey(APP_NAME, USER_ID, SESSION_ID)).join();
+      if (session == null) {
+        return;
       }
-      System.out.println("  [" + i + "] " + description);
+      List<Event> events = session.getEvents();
+      for (int i = 0; i < events.size(); i++) {
+        Event event = events.get(i);
+        EventCompaction compaction = event.getActions().getCompaction();
+        String description;
+        if (compaction != null) {
+          String summary = compaction.getCompactedContent().text(" ");
+          description =
+              "COMPACTION SUMMARY covering ["
+                  + compaction.getStartTimestamp()
+                  + ".."
+                  + compaction.getEndTimestamp()
+                  + "]: "
+                  + summary;
+        } else {
+          description = event.getAuthor() + ": " + event.contentText(" ");
+        }
+        System.out.println("  [" + i + "] " + description);
+      }
     }
   }
 
