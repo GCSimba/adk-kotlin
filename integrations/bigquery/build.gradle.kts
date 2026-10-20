@@ -50,6 +50,8 @@ dependencies {
   // takes auth `Credentials`.
   api(libs.google.cloud.bigquery)
   api(libs.google.auth.oauth2.http)
+  implementation(libs.jackson.databind)
+  implementation(libs.opentelemetry.api)
 
   testImplementation(project(":google-adk-kotlin-testing"))
   testImplementation(kotlin("test"))
