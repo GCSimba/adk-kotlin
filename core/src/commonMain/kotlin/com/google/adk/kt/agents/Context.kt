@@ -311,7 +311,8 @@ open class Context(
    *
    * @throws IllegalArgumentException if [T] has no serializer or [value] has no JSON form, an
    *   `Event` included.
-   * @throws IllegalStateException if an output was already produced or delegated.
+   * @throws IllegalStateException if an output was already produced or delegated, or if called from
+   *   a `node {}` body, whose return value is its output.
    */
   @ExperimentalWorkflowApi
   // typeOf<T>() is a compiler intrinsic and does not require kotlin-reflect.
@@ -325,8 +326,10 @@ open class Context(
   internal fun setEncodedOutput(value: Any, kType: KType) {
     val ns = requireNodeState()
     val node = ns.node
-    val json = ValueCodec<Any?>(kType).schemaForm(value, "output of node '${node.name}'")
-    val output = if (node is FunctionNode<*, *>) node.encodeOutput(json) else json
+    check(node !is FunctionNode<*, *>) {
+      "node '${node.name}' called setOutput; return the value instead."
+    }
+    val output = ValueCodec<Any?>(kType).schemaForm(value, "output of node '${node.name}'")
     requireJsonForm(output, node.name)
     ns.produceOutput(output)
   }
@@ -500,8 +503,9 @@ open class Context(
 
   /**
    * The node's output value, or `null` if none was produced. Unlike Python's public `ctx.output`
-   * setter, and like Go, node code cannot assign it: a node outputs by returning a value, emitting
-   * one, or calling [setOutput].
+   * setter, and like Go, node code cannot assign it: a `node {}` body outputs by returning a value,
+   * a custom node by emitting one or calling [setOutput], and either can hand it to a child with
+   * [runNode]'s `useAsOutput`.
    */
   @ExperimentalWorkflowApi
   var output: Any?
@@ -548,7 +552,8 @@ open class Context(
    *   produce an output of its own afterwards, even if [node] finishes without one. The claim is
    *   released only if [node] fails before emitting an output, so a caller that catches the failure
    *   may fall back to its own output. Once [node] has emitted, its output is this node's output
-   *   and successors receive it.
+   *   and successors receive it. A `node {}` outputs it encoded under its output type, as if it had
+   *   returned it, and fails if it does not decode.
    * @param useSubBranch When `true`, runs [node] on a sub-branch `<branch>.<node.name>@<runId>`.
    * @param overrideBranch Branch for [node] to run on instead of this node's branch.
    * @param raiseOnWait When `true` and [node] is a [Workflow] or sets [Node.waitForOutput] but
@@ -909,6 +914,20 @@ internal class NodeExecutionState(
   fun adoptReplayedOutput(value: Any) {
     check(outputStateRef.compareAndSet(OutputState.Delegated, OutputState.Produced(value))) {
       "Node '${node.name}' adopted a replayed output without a pending delegation."
+    }
+  }
+
+  /**
+   * Replaces a delegated output, recorded by a `useAsOutput` child or adopted on replay, with
+   * [value], not yet emitted, so [NodeRunner] sends it as this activation's own output.
+   */
+  fun replaceDelegatedOutput(value: Any) {
+    while (true) {
+      val current = outputStateRef.load()
+      check(current is OutputState.DelegateEmitted || current is OutputState.Produced) {
+        "Node '${node.name}' has no delegated output to replace."
+      }
+      if (outputStateRef.compareAndSet(current, OutputState.Produced(value))) return
     }
   }
 

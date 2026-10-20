@@ -40,7 +40,7 @@ import kotlinx.serialization.json.JsonObject
  * Reads a value as a [T] where it enters typed code, such as a node input, and writes a [T] as its
  * JSON form. A value that already is a [T] passes through, converted element by element for a
  * collection or map; anything else is decoded from its JSON form with [kType]'s serializer. A
- * message ([Content]) is not a JSON form, so it reaches only a port typed `Content` or `Any`.
+ * [Content] is not a JSON form, so it reaches only a port typed `Content` or `Any`.
  */
 @OptIn(ExperimentalWorkflowApi::class, FrameworkInternalApi::class)
 internal class ValueCodec<T>(val kType: KType) {

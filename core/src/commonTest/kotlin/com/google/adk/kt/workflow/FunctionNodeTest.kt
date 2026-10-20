@@ -29,6 +29,7 @@ import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.runners.InMemoryRunner
 import com.google.adk.kt.serialization.adkJson
+import com.google.adk.kt.serialization.jsonElementToAny
 import com.google.adk.kt.sessions.Session
 import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.testing.testInvocationContext
@@ -47,6 +48,7 @@ import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration
@@ -329,14 +331,15 @@ class FunctionNodeTest {
     assertEquals(listOf(null, 3L), events.map { it.output })
   }
 
+  /**
+   * Makes a returned [Content] the node's output in its JSON form, which a `Content` port reads.
+   */
   @Test
-  fun node_contentReturn_persistsMessageEventWithoutNodeOutput() {
+  fun node_contentReturn_isTheNodeOutput() {
     // Arrange
-    val produceContent =
-      node<Any?, Content>("produce_content") { _, _ ->
-        Content.fromText(Role.MODEL, "cached answer")
-      }
-    val afterReply = node("after_reply") { _, reply: Content? -> reply?.text() ?: "no input" }
+    val answer = Content.fromText(Role.MODEL, "cached answer")
+    val produceContent = node<Any?, Content>("produce_content") { _, _ -> answer }
+    val afterReply = node("after_reply") { _, reply: Content -> reply.text() }
     val workflow =
       Workflow(
         name = "wf",
@@ -346,20 +349,218 @@ class FunctionNodeTest {
 
     // Act
     val events = runner.runEvents()
-    val messageEvent =
+    val outputEvent =
       runner.session().events.single { it.nodeInfo?.path == "wf@1/produce_content@1" }
-    val roundTripped =
-      adkJson.decodeFromString(
-        Event.serializer(),
-        adkJson.encodeToString(Event.serializer(), messageEvent),
-      )
+    val reloadedOutput = reloaded(outputEvent).output
+    val afterReload = runOutputs(afterReply, reloadedOutput).single()
 
     // Assert
-    assertEquals(Content.fromText(Role.MODEL, "cached answer"), messageEvent.content)
-    assertNull(messageEvent.output)
-    assertFalse(messageEvent.nodeInfo?.messageAsOutput == true)
-    assertEquals(messageEvent.content, roundTripped.content)
-    assertEquals("no input", events.last { it.output != null }.output)
+    assertIs<Map<*, *>>(outputEvent.output)
+    assertEquals(outputEvent.output, reloadedOutput)
+    assertNull(outputEvent.content)
+    assertEquals("cached answer", events.last { it.output != null }.output)
+    assertEquals("cached answer", afterReload)
+  }
+
+  /** Outputs the list of the items' returned [Content]s. */
+  @Test
+  fun parallelNode_contentItems_outputsTheList() {
+    // Arrange
+    val names = node<Any?, List<String>>("names") { _, _ -> listOf("a", "b") }
+    val greet =
+      parallelNode("greet") { _, name: String -> Content.fromText(Role.MODEL, "hi $name") }
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, names), Edge(names, greet)))
+
+    // Act
+    val events = runWorkflowThroughRunner(workflow)
+
+    // Assert
+    val output = events.single { it.nodeInfo?.path == "wf@1/greet@1" && it.output != null }.output
+    assertEquals(
+      listOf(Content.fromText(Role.MODEL, "hi a"), Content.fromText(Role.MODEL, "hi b")),
+      ValueCodec<List<Content>>(typeOf<List<Content>>()).coerce(output, "output"),
+    )
+  }
+
+  /** A child given the node's output with useAsOutput must produce an O, or the node fails. */
+  @Test
+  fun nodeBody_delegatedOutput_mustBeAnO() {
+    // Arrange
+    fun delegatingTo(child: Node) =
+      node<Any?, Int?>("delegate", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(child, useAsOutput = true)
+        null
+      }
+    val word =
+      Workflow("wf", listOf(Edge(Start, delegatingTo(node<Any?, String>("child") { _, _ -> "x" }))))
+    val number =
+      Workflow("wf", listOf(Edge(Start, delegatingTo(node<Any?, Int>("child") { _, _ -> 7 }))))
+    val wordChild = node<Any?, String>("child") { _, _ -> "x" }
+    val intoContent =
+      node<Any?, Content?>("delegate", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(wordChild, useAsOutput = true)
+        null
+      }
+    val intoUnit =
+      node<Any?, Unit>("delegate", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(wordChild, useAsOutput = true)
+      }
+
+    // Act
+    val error = assertFailsWith<Exception> { runWorkflowThroughRunner(word) }
+    val events = runWorkflowThroughRunner(number)
+    val contentError =
+      assertFailsWith<Exception> {
+        runWorkflowThroughRunner(Workflow("wf", listOf(Edge(Start, intoContent))))
+      }
+    val unitError =
+      assertFailsWith<Exception> {
+        runWorkflowThroughRunner(Workflow("wf", listOf(Edge(Start, intoUnit))))
+      }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "output of node 'delegate'")
+    assertEquals(7L, events.last { it.output != null }.output)
+    assertContains(contentError.message.orEmpty(), "output of node 'delegate'")
+    assertContains(unitError.message.orEmpty(), "declares no output (Unit) but gives a child")
+  }
+
+  /** A delegated output is encoded under O, and the node sends it as its own output event. */
+  @Test
+  fun nodeBody_delegatedTextIntoIntOutput_outputsTheNumberOnItsOwnEvent() {
+    // Arrange
+    val asText = node<Any?, String>("as_text") { _, _ -> "42" }
+    val router =
+      node<Any?, Int?>("router", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(asText, useAsOutput = true)
+        null
+      }
+    var received: Any? = null
+    val reply = node<Any?, Unit>("reply") { _, value -> received = value }
+    val workflow = Workflow("wf", listOf(Edge(Start, router), Edge(router, reply)))
+
+    // Act
+    val events = runWorkflowThroughRunner(workflow)
+
+    // Assert
+    val routerOutputs = events.filter { it.nodeInfo?.outputFor?.contains("wf@1/router@1") == true }
+    assertEquals(
+      listOf("wf@1/router@1/as_text@1" to "42", "wf@1/router@1" to 42L),
+      routerOutputs.map { it.nodeInfo?.path to it.output },
+    )
+    assertEquals<Any?>(42L, received)
+  }
+
+  /** A child whose output already is O's JSON form leaves its event the node's only output. */
+  @Test
+  fun nodeBody_delegatedOutputAlreadyEncoded_sendsOnlyTheChildEvent() {
+    // Arrange
+    val asInt = node<Any?, Int>("as_int") { _, _ -> 42 }
+    val router =
+      node<Any?, Int?>("router", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(asInt, useAsOutput = true)
+        null
+      }
+    var received: Any? = null
+    val reply = node<Any?, Unit>("reply") { _, value -> received = value }
+    val workflow = Workflow("wf", listOf(Edge(Start, router), Edge(router, reply)))
+
+    // Act
+    val events = runWorkflowThroughRunner(workflow)
+
+    // Assert
+    val routerOutput = events.single { it.nodeInfo?.outputFor?.contains("wf@1/router@1") == true }
+    assertEquals("wf@1/router@1/as_int@1", routerOutput.nodeInfo?.path)
+    assertEquals<Any?>(42L, received)
+  }
+
+  /** A node typed Event passes a delegated value on as the child produced it. */
+  @Test
+  fun nodeBody_delegatedTextIntoEventOutput_passesTheTextOn() {
+    // Arrange
+    val asText = node<Any?, String>("as_text") { _, _ -> "42" }
+    val router =
+      node<Any?, Event?>("router", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(asText, useAsOutput = true)
+        null
+      }
+    var received: Any? = null
+    val reply = node<Any?, Unit>("reply") { _, value -> received = value }
+    val workflow = Workflow("wf", listOf(Edge(Start, router), Edge(router, reply)))
+
+    // Act
+    val events = runWorkflowThroughRunner(workflow)
+
+    // Assert
+    assertTrue(events.none { it.nodeInfo?.path == "wf@1/router@1" && it.output != null })
+    assertEquals<Any?>("42", received)
+  }
+
+  /** An explicit output schema checks a delegated output's encoded form. */
+  @Test
+  fun nodeBody_delegatedTextWithIntegerOutputSchema_passesTheEncodedNumber() {
+    // Arrange
+    val asText = node<Any?, String>("as_text") { _, _ -> "42" }
+    val router =
+      node<Any?, Int?>(
+        "router",
+        rerunOnResume = true,
+        outputSchema = Schema(type = Type.INTEGER),
+      ) { ctx, _ ->
+        val unused = ctx.runNode(asText, useAsOutput = true)
+        null
+      }
+
+    // Act
+    val events = runWorkflowThroughRunner(Workflow("wf", listOf(Edge(Start, router))))
+
+    // Assert
+    assertEquals(42L, events.single { it.nodeInfo?.path == "wf@1/router@1" }.output)
+  }
+
+  /** An outer node checks the inner node's encoded output, so a number never becomes text. */
+  @Test
+  fun nodeBody_delegationChainTextToIntToString_failsAtTheOuterNode() {
+    // Arrange
+    val asText = node<Any?, String>("as_text") { _, _ -> "42" }
+    val inner =
+      node<Any?, Int?>("inner", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(asText, useAsOutput = true)
+        null
+      }
+    val outer =
+      node<Any?, String?>("outer", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(inner, useAsOutput = true)
+        null
+      }
+    val runner = runnerFor(Workflow("wf", listOf(Edge(Start, outer))))
+
+    // Act
+    val error = assertFailsWith<Exception> { runner.runEvents() }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "output of node 'outer'")
+    val innerEvent = runner.session().events.single { it.nodeInfo?.path == "wf@1/outer@1/inner@1" }
+    assertEquals(42L, innerEvent.output)
+  }
+
+  /** A returned Event keeps its own shape, and a Content on it is written as its JSON form. */
+  @Test
+  fun eventNode_returningAContentOutput_writesItsJsonForm() {
+    // Arrange
+    val reply = Content.fromText(Role.MODEL, "hi")
+    val route = node<Any?, Event>("route") { _, _ -> Event(output = reply) }
+    val read = node("read") { _, content: Content -> content.text() }
+    val workflow = Workflow("wf", listOf(Edge(Start, route), Edge(route, read)))
+
+    // Act
+    val events = runWorkflowThroughRunner(workflow)
+
+    // Assert
+    val routeOutput =
+      events.single { it.nodeInfo?.path == "wf@1/route@1" && it.output != null }.output
+    assertIs<Map<*, *>>(routeOutput)
+    assertEquals("hi", events.last { it.output != null }.output)
   }
 
   @Test
@@ -933,6 +1134,8 @@ class FunctionNodeTest {
   fun typedPorts_supportedTypes_arriveEqualLiveAndAfterAReload() {
     // Arrange
     val order = PortOrder(id = "o1", note = null)
+    val reply = Content.fromText(Role.MODEL, "hi")
+    val replyJson = jsonElementToAny(adkJson.encodeToJsonElement(Content.serializer(), reply))
 
     // Act
     val cases: List<Pair<String, Pair<Any?, Pair<Any?, Any?>>>> =
@@ -948,6 +1151,8 @@ class FunctionNodeTest {
         "Box<Int>" to (PortBox(1) to receivedThroughNodes(PortBox(1))),
         "sealed port" to
           (PortShape.Circle(1.0) to receivedThroughNodes<PortShape>(PortShape.Circle(1.0))),
+        "Content" to (reply to receivedThroughNodes(reply)),
+        "Content into Any?" to (replyJson to receivedThroughNodes<Any?>(reply)),
       )
     val bytes = receivedThroughNodes(byteArrayOf(1, 2, 3))
     val bytesOutput =
@@ -1154,89 +1359,70 @@ class FunctionNodeTest {
   }
 
   @Test
-  fun typedPorts_outputOfAnotherType_failsAtTheNode() {
+  fun nodeBody_emittingAnEventWithAnOutput_failsAtTheNode() {
     // Arrange
-    val wordForInt =
-      node<Any?, Int?>("word_for_int") { _, _ ->
-        emit(Event(output = "forty-two"))
-        null
-      }
-
-    // Act
-    val error = assertFailsWith<IllegalArgumentException> { runOutputs(wordForInt, null) }
-
-    // Assert
-    assertContains(error.message.orEmpty(), "output of node 'word_for_int' does not match")
-  }
-
-  // -- Emitted, set, and untyped outputs --
-
-  /** Runs [node] alone on [input] and returns the output set on its context. */
-  private fun runSetOutput(node: BaseNode, input: Any?): Any? = runBlocking {
-    val context = nodeContext(node)
-    val unused = node.run(context, input).toList()
-    context.output
-  }
-
-  @Test
-  fun outputs_emittedOrSet_areEncodedLikeAReturnedOneWhileAFrameworkValuePasses() {
-    // Arrange
-    val order = PortOrder(id = "o1", note = null)
-    val returns = node<Any?, PortOrder>("returns") { _, _ -> order }
     val emits =
-      node<Any?, PortOrder?>("emits") { _, _ ->
-        emit(Event(output = order))
-        null
+      node<Any?, String>("emits") { _, _ ->
+        emit(Event(output = "x"))
+        "y"
       }
-    val sets =
-      node<Any?, PortOrder?>("sets") { ctx, _ ->
-        ctx.setOutput(order)
-        null
-      }
-    val reply = Content.fromText(Role.MODEL, "hi")
-    val relay =
-      node<Any?, String?>("relay") { _, _ ->
-        emit(Event(output = reply))
-        null
-      }
-    val setsReply =
-      node<Any?, String?>("sets_reply") { ctx, _ ->
-        ctx.setOutput(reply)
-        null
+    val emitsMessageOutput =
+      node<Any?, Unit>("emits_message_output") { _, _ ->
+        val message = Content.fromText(Role.MODEL, "hi")
+        emit(Event(content = message, nodeInfo = NodeInfo(messageAsOutput = true)))
       }
 
     // Act
-    val returned = runOutputs(returns, null).single()
-    val emitted = runOutputs(emits, null).single()
-    val set = runSetOutput(sets, null)
-    val relayed = runOutputs(relay, null).single()
-    val setReply = runSetOutput(setsReply, null)
-
-    // Assert
-    assertEquals(mapOf("id" to "o1", "note" to null, "quantity" to 1L), returned)
-    assertEquals(returned, emitted)
-    assertEquals(returned, set)
-    // A framework value passes through as it is.
-    assertEquals(reply, relayed)
-    assertEquals(reply, setReply)
-  }
-
-  @Test
-  fun unitNode_emittingOrSettingAnOutput_throwsAtTheNode() {
-    // Arrange
-    val emits = node<Any?, Unit>("emits") { _, _ -> emit(Event(output = "x")) }
-    val sets = node<Any?, Unit>("sets") { ctx, _ -> ctx.setOutput("x") }
-
-    // Act
-    val emitError = assertFailsWith<IllegalArgumentException> { runOutputs(emits, null) }
-    val setError = assertFailsWith<IllegalArgumentException> { runSetOutput(sets, null) }
+    val error = assertFailsWith<IllegalArgumentException> { runOutputs(emits, null) }
+    val messageError =
+      assertFailsWith<IllegalArgumentException> { runOutputs(emitsMessageOutput, null) }
 
     // Assert
     assertEquals(
-      "node 'emits' declares no output (Unit) but produced one; declare its output type.",
-      emitError.message,
+      "node 'emits' emitted an Event with an output; return the value instead.",
+      error.message,
     )
-    assertContains(setError.message.orEmpty(), "node 'sets' declares no output (Unit)")
+    assertEquals(
+      "node 'emits_message_output' emitted an Event marked messageAsOutput; return the value " +
+        "instead.",
+      messageError.message,
+    )
+  }
+
+  @Test
+  fun nodeBody_emittingActionsOnly_landsTheStateDeltaAndReturnsTheOutput() {
+    // Arrange
+    val step =
+      node<Any?, String>("step") { _, _ ->
+        emit(Event(actions = EventActions(stateDelta = mutableMapOf("k" to "v"))))
+        "done"
+      }
+    val runner = runnerFor(Workflow("wf", listOf(Edge(Start, step))))
+
+    // Act
+    val events = runner.runEvents()
+
+    // Assert
+    assertEquals("v", runner.session().state["k"])
+    assertEquals("done", events.single { it.output != null }.output)
+  }
+
+  // -- Set and untyped outputs --
+
+  @Test
+  fun nodeBody_settingAnOutput_failsAtTheNode() {
+    // Arrange
+    val sets =
+      node<Any?, String?>("sets") { ctx, _ ->
+        ctx.setOutput("x")
+        null
+      }
+
+    // Act
+    val error = assertFailsWith<IllegalStateException> { runOutputs(sets, null) }
+
+    // Assert
+    assertEquals("node 'sets' called setOutput; return the value instead.", error.message)
   }
 
   @Test

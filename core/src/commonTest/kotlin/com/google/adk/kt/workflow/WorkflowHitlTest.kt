@@ -991,7 +991,7 @@ private fun timeOffWorkflow(days: Int): Workflow {
       }
     }
   val processDecision =
-    node<TimeOffDecision, Content>("process_decision") { ctx, decision ->
+    node<TimeOffDecision, Unit>("process_decision") { ctx, decision ->
       val requested = ((ctx.state["request"] as Map<*, *>)["days"] as Number).toInt()
       val text =
         if (decision.approved) {
@@ -999,7 +999,7 @@ private fun timeOffWorkflow(days: Int): Workflow {
         } else {
           "Time Off Denied."
         }
-      Content.fromText(Role.MODEL, text)
+      emit(Content.fromText(Role.MODEL, text))
     }
   return Workflow(
     name = "wf",
@@ -1479,6 +1479,31 @@ class WorkflowHitlTest {
     )
   }
 
+  /** Replays a [Content] output in its JSON form, which a rerun `Content` successor reads back. */
+  @Test
+  fun resume_contentOutputBeforeTheInterrupt_reachesARerunSuccessorAsContent() {
+    // Arrange: review asks on its first run and reads draft's replayed output when it runs again.
+    val drafted = Content.fromText(Role.MODEL, "hello")
+    val draft = node<Any?, Content>("draft") { _, _ -> drafted }
+    val review =
+      node<Content, String>("review", rerunOnResume = true) { ctx, draftContent ->
+        ctx.resumeInputs["human_review"] ?: requestInput(interruptId = "human_review")
+        draftContent.text()
+      }
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, draft), Edge(draft, review)))
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer("human_review", mapOf("result" to "approve")))
+
+    // Assert
+    assertEquals(
+      "hello",
+      events.firstOrNull { it.nodeInfo?.path == "wf@1/review@1" && it.output != null }?.output,
+    )
+  }
+
   @Test
   fun resume_nodeCompletedBeforeTheInterrupt_isReplayedNotRerun() {
     // Arrange
@@ -1554,6 +1579,68 @@ class WorkflowHitlTest {
     assertTrue(turn2.none { it.nodeInfo?.path == "wf@1/j@1" })
     val joinEvent = turn3.single { it.nodeInfo?.path == "wf@1/j@1" }
     assertEquals(mapOf("ask_a" to mapOf("a" to 1L), "ask_b" to mapOf("b" to 2L)), joinEvent.output)
+  }
+
+  @Test
+  fun resume_replayedDelegatingNode_passesItsEncodedOutputToTheJoin() {
+    // Arrange: `router` finishes on turn 1 while `ask` waits, so turn 2 replays it into `j`.
+    val asText = node<Any?, String>("as_text") { _, _ -> "42" }
+    val router =
+      node<Any?, Int?>("router", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(asText, useAsOutput = true)
+        null
+      }
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "?"))
+    val join = JoinNode("j")
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, router), Edge(Start, ask), Edge(router, join), Edge(ask, join)),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("ok" to true)))
+
+    // Assert: the workflow re-sends the replayed output, encoded, and the join receives it.
+    val resent = events.filter { it.nodeInfo?.path == "wf@1/router@1" && it.output != null }
+    assertEquals(listOf<Any?>(42L), resent.map { it.output })
+    val joinOutput = events.single { it.nodeInfo?.path == "wf@1/j@1" }.output as Map<*, *>
+    assertEquals(42L, joinOutput["router"])
+  }
+
+  @Test
+  fun resume_delegatingNodeRerunAfterItsChild_outputsTheEncodedValue() {
+    // Arrange: `router` delegates, then asks, so turn 2 reruns it and replays its child.
+    val asText = node<Any?, String>("as_text") { _, _ -> "42" }
+    val router =
+      node<Any?, Int?>("router", rerunOnResume = true) { ctx, _ ->
+        val unused = ctx.runNode(asText, useAsOutput = true)
+        if (ctx.resumeInputs["ask_1"] == null) requestInput(interruptId = "ask_1")
+        null
+      }
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, router), Edge(router, CaptureInput("reply"))),
+      )
+    val session = WorkflowSession(workflow)
+    val asked = session.turn(userMessage("go"))
+
+    // Act
+    val answered = session.turn(answer("ask_1", mapOf("ok" to true)))
+
+    // Assert
+    assertTrue(asked.none { it.nodeInfo?.path == "wf@1/reply@1" })
+    assertEquals(
+      42L,
+      answered.single { it.nodeInfo?.path == "wf@1/router@1" && it.output != null }.output,
+    )
+    assertEquals(
+      mapOf("received" to 42L),
+      answered.single { it.nodeInfo?.path == "wf@1/reply@1" }.output,
+    )
   }
 
   @Test

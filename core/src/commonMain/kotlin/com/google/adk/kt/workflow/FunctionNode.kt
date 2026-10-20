@@ -25,6 +25,8 @@ import com.google.adk.kt.agents.Context
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
+import com.google.adk.kt.serialization.adkJson
+import com.google.adk.kt.serialization.jsonElementToAny
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Schema
 import kotlin.reflect.KClass
@@ -46,11 +48,9 @@ import kotlinx.serialization.descriptors.nullable
  * Inline workflow steps use [node] or [parallelNode].
  *
  * @param I Expected type of `nodeInput` from predecessor nodes.
- * @param O Type of output value this node returns (`Unit`/`null` emits no output event; [Event]
- *   passes through directly; a [Content] becomes a message event with no node output; a returned
- *   [RequestInput] fails; any other value becomes the node's output on an [Event] as its JSON form
- *   under [O]'s serializer, so a node typed `Any?` receives that form). It also types an output
- *   emitted on an event or set with `Context.setOutput`; a `Unit` node that produces one throws.
+ * @param O Type of the value the body returns, which is the node's output. `Unit` or `null` is no
+ *   output, an [Event] passes through as it is, and a [RequestInput] fails. Any other value, a
+ *   [Content] included, is output as its JSON form under [O]'s serializer.
  */
 @ExperimentalWorkflowApi
 class FunctionNode<I, O>
@@ -136,14 +136,30 @@ private constructor(
     }
     // A no-op after validateInput, and it covers a direct call.
     val input = inputCodec.coerce(nodeInput, "input of node '$name'")
-    when (val result = body(context, input)) {
-      // As in adk-python and Go, a returned Content is a message and not the node's output.
-      is Content -> emit(Event(content = result))
+    // An emitted event carries messages and actions only; the output is returned or delegated.
+    val events =
+      FlowCollector<Event> { event ->
+        require(event.output == null) {
+          "node '$name' emitted an Event with an output; return the value instead."
+        }
+        require(event.nodeInfo?.messageAsOutput != true) {
+          "node '$name' emitted an Event marked messageAsOutput; return the value instead."
+        }
+        emit(event)
+      }
+    val result = events.body(context, input)
+    val delegated = context.output
+    val encoded = delegated?.let { encodeDelegatedOutput(it) }
+    when (result) {
       is RequestInput ->
         throw IllegalArgumentException(
           "node '$name' returned a RequestInput; call requestInput(...) to ask for input."
         )
       else -> emit(result)
+    }
+    // A delegated output that encoding changed goes out again as this node's own output event.
+    if (encoded != null && encoded != delegated) {
+      context.requireNodeState().replaceDelegatedOutput(encoded)
     }
   }
 
@@ -170,35 +186,49 @@ private constructor(
     return input
   }
 
-  /** Encodes [output] as [encodeOutput] does, for a returned output or one on an emitted event. */
-  override fun validateOutput(output: Any?): Any? = encodeOutput(output)
+  /**
+   * Returns [value], the output of a child this node gave its output to with `useAsOutput`, as if
+   * this node had returned it. Throws [IllegalArgumentException] if it is not an [O].
+   */
+  private fun encodeDelegatedOutput(value: Any): Any? {
+    val classifier = outputCodec.kType.classifier
+    require(classifier != Unit::class) {
+      "node '$name' declares no output (Unit) but gives a child its output; declare its output type."
+    }
+    // A node typed Event passes the child's value on as it is, since a value is not an Event.
+    if (classifier == Event::class) return validateOutput(value)
+    val output =
+      try {
+        outputCodec.coerce(value, "output of node '$name'")
+      } catch (e: NodeInputValidationException) {
+        throw IllegalArgumentException(e.message, e)
+      }
+    return validateOutput(output)
+  }
 
   /**
-   * Returns [output] as successors receive it, whether it was returned, emitted on an event, or set
-   * with [Context.setOutput]:
-   * - a [Content] or [Event], or any output with [O] as `Content` or `Event`, passes as it is;
-   * - any other output becomes its JSON form under [O]'s serializer, so with [O] as `Any` a value
-   *   that is not JSON-native fails here.
-   *
-   * An explicit [outputSchema] then checks the result.
+   * Returns a returned value, or a returned event's output, as successors receive it: a [Content]
+   * as its JSON form, an [Event] as it is, and any other value as its JSON form under [O]'s
+   * serializer. An explicit [outputSchema] then checks the result.
    */
-  internal fun encodeOutput(output: Any?): Any? {
+  override fun validateOutput(output: Any?): Any? {
     // A parallel node outputs its items' outputs, which each item node already validated.
     if (itemNode != null) return output
     // Assigning null produces no output.
     if (output == null) return null
-    val classifier = outputCodec.kType.classifier
-    require(classifier != Unit::class) {
-      "node '$name' declares no output (Unit) but produced one; declare its output type."
-    }
     val what = "output of node '$name'"
-    val json = outputCodec.schemaForm(output, what)
+    // Only a node whose O is Content, Event or Any returns a Content, which has one JSON form.
+    val json = if (output is Content) contentJson(output) else outputCodec.schemaForm(output, what)
     if (explicitOutputSchema != null) {
       val unused = SchemaUtils.validateValue(json, explicitOutputSchema, what).getOrThrow()
     }
     return json
   }
 }
+
+/** The JSON form of [content], as a session saves it. */
+private fun contentJson(content: Content): Any? =
+  jsonElementToAny(adkJson.encodeToJsonElement(Content.serializer(), content))
 
 /** Types a node handles by their meaning rather than as data. */
 private val FRAMEWORK_TYPES: Set<KClass<*>> = setOf(Content::class, Event::class)
@@ -229,11 +259,12 @@ internal fun ValueCodec<*>.schemaForm(value: Any?, what: String): Any? =
  * [O], emitting progress [Event]s through its [FlowCollector] receiver. Schemas inferred from [I]
  * and [O] describe the node, while an explicit [inputSchema] or [outputSchema] is also enforced on
  * every run. Unlike adk-python, which dumps only models, an output travels as its JSON form under
- * [O]'s serializer, whether returned, emitted, or set with `Context.setOutput`, so a successor
- * typed `Any?` reads a `Long` for an `Int`, and an input decodes from that form, a quoted number
- * included.
+ * [O]'s serializer, so a successor typed `Any?` reads a `Long` for an `Int`, and an input decodes
+ * from that form, a quoted number included.
  *
- * The block asks the user for input with [requestInput].
+ * The block asks the user for input with [requestInput]. Its return value, a [Content] included, is
+ * the node's output; emitting an event with an output or calling `Context.setOutput` fails the
+ * node. A node that talks to an agent node sends the message with `emit(content)`.
  *
  * @throws WorkflowConfigurationException if [I] or [O] has no usable serializer and is not
  *   `Content`, `Event`, `Any`, or `Unit`.
