@@ -109,7 +109,7 @@ internal class ParallelWorker(private val worker: Node, private val maxParallelW
    */
   private fun unwrapContent(content: Content): Any? {
     if (content.parts.isEmpty() || content.parts.any { it.text == null }) return content
-    val itemType = (worker as? FunctionNode<*, *>)?.inputType?.classifier
+    val itemType = (worker as? FunctionNode<*, *>)?.inputCodec?.classifier
     if (itemType == Content::class) return content
     val text = content.text()
     val json =

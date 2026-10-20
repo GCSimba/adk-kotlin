@@ -3460,6 +3460,43 @@ class WorkflowHitlTest {
     assertTrue(events.none { it.nodeInfo?.path == "wf@1/reply@1" })
   }
 
+  @OptIn(AdkJavaInteropApi::class)
+  @Test
+  fun requireConfirmation_toBuilderCopy_stillAsks() {
+    // Arrange
+    var runs = 0
+    val always =
+      node<RemovalTarget, RemovalResult>("remove_file", requireConfirmation = true) { _, _ ->
+        runs += 1
+        RemovalResult(removed = true)
+      }
+    val decided =
+      node<RemovalTarget, RemovalResult>(
+        "remove_file",
+        requireConfirmation = { _, target -> target.path.startsWith("/tmp") },
+      ) { _, _ ->
+        runs += 1
+        RemovalResult(removed = true)
+      }
+
+    // Act
+    val alwaysCopy = always.toBuilder().description("copy").build()
+    val decidedCopy = decided.toBuilder().description("copy").build()
+    val alwaysCalls =
+      WorkflowSession(removalWorkflow(alwaysCopy)).turn(userMessage("go")).flatMap {
+        it.functionCalls()
+      }
+    val decidedCalls =
+      WorkflowSession(removalWorkflow(decidedCopy)).turn(userMessage("go")).flatMap {
+        it.functionCalls()
+      }
+
+    // Assert
+    assertEquals(listOf(REMOVAL_CONFIRMATION_ID), alwaysCalls.map { it.id })
+    assertEquals(listOf(REMOVAL_CONFIRMATION_ID), decidedCalls.map { it.id })
+    assertEquals(0, runs)
+  }
+
   @Test
   fun requireConfirmation_confirmed_runsTheBodyOnceWithTheAnswer() {
     // Arrange

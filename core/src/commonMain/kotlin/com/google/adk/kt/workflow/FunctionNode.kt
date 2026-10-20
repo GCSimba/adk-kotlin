@@ -22,15 +22,20 @@ package com.google.adk.kt.workflow
 
 import com.google.adk.kt.SchemaUtils
 import com.google.adk.kt.agents.Context
+import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.ToolConfirmation
 import com.google.adk.kt.events.parseToolConfirmation
+import com.google.adk.kt.ids.Uuid
 import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.serialization.jsonElementToAny
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Schema
+import kotlin.jvm.JvmOverloads
+import kotlin.jvm.JvmStatic
+import kotlin.jvm.JvmSynthetic
 import kotlin.reflect.KClass
 import kotlin.reflect.KClassifier
 import kotlin.reflect.KType
@@ -47,7 +52,8 @@ import kotlinx.serialization.descriptors.nullable
  * output of type [O]. Its schemas inferred from [I] and [O] only describe it; an explicit schema
  * passed to [node] is also enforced.
  *
- * Inline workflow steps use [node] or [parallelNode].
+ * Inline workflow steps use [node] or [parallelNode], and Java callers use `FunctionNodes`,
+ * [parallelOf] and [toBuilder]; a schema set on a [Builder] is explicit.
  *
  * @param I Expected type of `nodeInput` from predecessor nodes.
  * @param O Type of the value the body returns, which is the node's output. `Unit` or `null` is no
@@ -65,8 +71,8 @@ private constructor(
   private val explicitInputSchema: Schema?,
   private val explicitOutputSchema: Schema?,
   stateSchema: Schema?,
-  internal val inputCodec: ValueCodec<I>,
-  internal val outputCodec: ValueCodec<O>,
+  internal val inputCodec: PortCodec<I>,
+  internal val outputCodec: PortCodec<O>,
   internal val itemNode: FunctionNode<*, *>?,
   /** Maximum number of items a parallel node runs at a time, or `null` for no limit. */
   internal val maxParallelWorkers: Int?,
@@ -125,15 +131,15 @@ private constructor(
     body = body,
   )
 
-  internal val inputType: KType
-    get() = inputCodec.kType
+  internal val inputType: KType?
+    get() = (inputCodec as? ValueCodec<*>)?.kType
 
   /** Whether runs may ask the user to approve them, always or per [confirmationPredicate]. */
   private val asksForConfirmation: Boolean
     get() = requireConfirmation || confirmationPredicate != null
 
-  internal val outputType: KType
-    get() = outputCodec.kType
+  internal val outputType: KType?
+    get() = (outputCodec as? ValueCodec<*>)?.kType
 
   init {
     validateNodeName(name)
@@ -252,7 +258,7 @@ private constructor(
    * this node had returned it. Throws [IllegalArgumentException] if it is not an [O].
    */
   private fun encodeDelegatedOutput(value: Any): Any? {
-    val classifier = outputCodec.kType.classifier
+    val classifier = outputCodec.classifier
     require(classifier != Unit::class) {
       "node '$name' declares no output (Unit) but gives a child its output; declare its output type."
     }
@@ -286,6 +292,258 @@ private constructor(
     }
     return json
   }
+
+  /**
+   * Returns a [Builder] initialized with this instance's properties, primarily for Java callers.
+   * Only explicitly set schemas are copied, not inferred ones, so the copy enforces the same
+   * schemas as this node.
+   */
+  @AdkJavaInteropApi
+  @ExperimentalWorkflowApi
+  fun toBuilder(): Builder<I, O> =
+    Builder.create<I, O>()
+      .name(name)
+      .description(description)
+      .rerunOnResume(rerunOnResume)
+      .waitForOutput(waitForOutput)
+      .config(config)
+      .inputSchema(explicitInputSchema)
+      .outputSchema(explicitOutputSchema)
+      .stateSchema(stateSchema)
+      .inputCodec(inputCodec)
+      .outputCodec(outputCodec)
+      .itemNode(itemNode)
+      .maxParallelWorkers(maxParallelWorkers)
+      .confirmation(requireConfirmation, confirmationPredicate)
+      .flowBody(body)
+
+  /**
+   * Fluent builder for [FunctionNode], provided primarily for Java callers. Any property left unset
+   * falls back to the same default as the constructor. Java gets one from `FunctionNodes.builder`
+   * or [toBuilder], which keep the port types and parallel-worker settings, because a port cannot
+   * decode without a type.
+   */
+  @AdkJavaInteropApi
+  @ExperimentalWorkflowApi
+  @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
+  class Builder<I, O> private constructor() {
+    private var name: String? = null
+    private var description: String = ""
+    private var rerunOnResume: Boolean = false
+    private var waitForOutput: Boolean = false
+    private var config: NodeConfig = NodeConfig()
+    private var inputSchema: Schema? = null
+    private var outputSchema: Schema? = null
+    private var stateSchema: Schema? = null
+    private var inputCodec: PortCodec<*> = ValueCodec<Any?>(typeOf<Any?>())
+    private var outputCodec: PortCodec<*> = ValueCodec<Any?>(typeOf<Any?>())
+    private var itemNode: FunctionNode<*, *>? = null
+    private var maxParallelWorkers: Int? = null
+    private var requireConfirmation: Boolean = false
+    private var confirmationPredicate: (suspend (Context, I) -> Boolean)? = null
+    private var flowBody: (suspend FlowCollector<Event>.(Context, I) -> O)? = null
+    private var bodySetByCaller = false
+
+    internal companion object {
+      // Synthetic, so Java cannot build a node whose port types it has no codec for.
+      @JvmSynthetic fun <I, O> create(): Builder<I, O> = Builder()
+    }
+
+    /** Sets the node's name, unique within its graph. Required. */
+    fun name(name: String): Builder<I, O> = apply { this.name = name }
+
+    /** Sets what the node does, for humans and for a model that may call it. */
+    fun description(description: String): Builder<I, O> = apply { this.description = description }
+
+    /**
+     * Sets whether a resume runs the node again rather than using the resuming answer. A parallel
+     * node always reruns, so [build] rejects `false` for one.
+     */
+    fun rerunOnResume(rerunOnResume: Boolean): Builder<I, O> = apply {
+      this.rerunOnResume = rerunOnResume
+    }
+
+    /** Sets whether the node stays re-triggerable until it produces an output or a route. */
+    fun waitForOutput(waitForOutput: Boolean): Builder<I, O> = apply {
+      this.waitForOutput = waitForOutput
+    }
+
+    /**
+     * Sets the node's retry policy and execution timeout. A parallel node runs its items with the
+     * item node's config, so [build] rejects a non-default config for one.
+     */
+    fun config(config: NodeConfig): Builder<I, O> = apply { this.config = config }
+
+    /** Sets an explicit schema that each input must match before the body runs. */
+    fun inputSchema(inputSchema: Schema?): Builder<I, O> = apply { this.inputSchema = inputSchema }
+
+    /** Sets an explicit schema that each output value must match. */
+    fun outputSchema(outputSchema: Schema?): Builder<I, O> = apply {
+      this.outputSchema = outputSchema
+    }
+
+    /**
+     * Sets the state keys the node uses, which child nodes inherit unless they declare their own.
+     */
+    fun stateSchema(stateSchema: Schema?): Builder<I, O> = apply { this.stateSchema = stateSchema }
+
+    internal fun inputCodec(inputCodec: PortCodec<*>): Builder<I, O> = apply {
+      this.inputCodec = inputCodec
+    }
+
+    internal fun outputCodec(outputCodec: PortCodec<*>): Builder<I, O> = apply {
+      this.outputCodec = outputCodec
+    }
+
+    internal fun confirmation(
+      requireConfirmation: Boolean,
+      confirmationPredicate: (suspend (Context, I) -> Boolean)?,
+    ): Builder<I, O> = apply {
+      this.requireConfirmation = requireConfirmation
+      this.confirmationPredicate = confirmationPredicate
+    }
+
+    internal fun itemNode(itemNode: FunctionNode<*, *>?): Builder<I, O> = apply {
+      this.itemNode = itemNode
+    }
+
+    internal fun maxParallelWorkers(maxParallelWorkers: Int?): Builder<I, O> = apply {
+      this.maxParallelWorkers = maxParallelWorkers
+    }
+
+    /**
+     * Sets the function the node runs on each input. Required, except on a parallel node, which
+     * runs its item node and so [build] rejects a body for one.
+     */
+    fun body(body: NodeBody<I, O>): Builder<I, O> = apply {
+      this.flowBody = { context, input -> body.apply(context, input) }
+      this.bodySetByCaller = true
+    }
+
+    internal fun flowBody(flowBody: suspend FlowCollector<Event>.(Context, I) -> O): Builder<I, O> =
+      apply {
+        this.flowBody = flowBody
+        this.bodySetByCaller = false
+      }
+
+    /**
+     * Builds the [FunctionNode].
+     *
+     * @throws IllegalStateException if [name] or [body] is not set.
+     * @throws WorkflowConfigurationException if a parallel node, such as one from [parallelOf], has
+     *   an input or output schema, `rerunOnResume(false)`, a non-default [config], or a body set
+     *   with [body].
+     */
+    fun build(): FunctionNode<I, O> {
+      val resolvedName = checkNotNull(name) { "FunctionNode.Builder requires name to be set." }
+      val resolvedBody =
+        checkNotNull(flowBody) {
+          "FunctionNode.Builder for '$resolvedName' requires body to be set."
+        }
+      if (itemNode != null) {
+        val rejected = buildList {
+          if (inputSchema != null) add("inputSchema")
+          if (outputSchema != null) add("outputSchema")
+          if (!rerunOnResume) add("rerunOnResume(false)")
+          if (config != NodeConfig()) add("config")
+          if (bodySetByCaller) add("body")
+        }
+        if (rejected.isNotEmpty()) {
+          throw WorkflowConfigurationException(
+            "${rejected.joinToString()} cannot be set on parallel node '$resolvedName'; " +
+              "configure its item node instead."
+          )
+        }
+      }
+      @Suppress("UNCHECKED_CAST")
+      return FunctionNode(
+        name = resolvedName,
+        description = description,
+        rerunOnResume = rerunOnResume,
+        waitForOutput = waitForOutput,
+        config = config,
+        explicitInputSchema = inputSchema,
+        explicitOutputSchema = outputSchema,
+        stateSchema = stateSchema,
+        inputCodec = inputCodec as PortCodec<I>,
+        outputCodec = outputCodec as PortCodec<O>,
+        itemNode = itemNode,
+        maxParallelWorkers = maxParallelWorkers,
+        requireConfirmation = requireConfirmation,
+        confirmationPredicate = confirmationPredicate,
+        body = resolvedBody,
+      )
+    }
+  }
+
+  companion object {
+    /**
+     * Wraps [node] in a parallel-worker [FunctionNode] that runs it on each item of a list input
+     * concurrently (optionally bounded by [maxParallelWorkers]) and outputs the results in input
+     * order, primarily for Java callers. A non-list input runs as one item, and [node] checks each
+     * item against its own schemas.
+     *
+     * @throws WorkflowConfigurationException if [maxParallelWorkers] is less than 1.
+     */
+    @AdkJavaInteropApi
+    @ExperimentalWorkflowApi
+    @JvmStatic
+    @JvmOverloads
+    fun <I, O> parallelOf(
+      node: FunctionNode<I, O>,
+      maxParallelWorkers: Int? = null,
+    ): FunctionNode<List<I>, List<O>> =
+      FunctionNode(
+        name = node.name,
+        description = node.description,
+        rerunOnResume = true,
+        waitForOutput = node.waitForOutput,
+        config = NodeConfig(),
+        inputSchema = null,
+        outputSchema = null,
+        stateSchema = node.stateSchema,
+        inputType = typeOf<List<Any?>>(),
+        outputType = typeOf<List<Any?>>(),
+        itemNode = node,
+        maxParallelWorkers = maxParallelWorkers,
+        body = { _, _ -> error("parallelOf dispatches through itemNode") },
+      )
+  }
+}
+
+/**
+ * The body of a [FunctionNode] set through [FunctionNode.Builder.body]; it runs on the workflow's
+ * coroutine, so it must not block, and asynchronous work belongs in a `BasePublisherNode`. `input`
+ * arrives as the node's input type, in JSON form on an untyped port (a whole number as a `Long`, a
+ * fraction as a `Double`, an object as a `Map`), or as a [Content] message, and may be a
+ * predecessor's own collection, so the body must not mutate it. Return `null` for no output, a
+ * value of the output type, or an [Event] to emit as it is (an `Event` with content sends a
+ * message, and an output goes in the return value, not in the `Event`), and ask the user with
+ * [requestInput].
+ */
+@AdkJavaInteropApi
+@ExperimentalWorkflowApi
+fun interface NodeBody<I, O> {
+  @Throws(Exception::class) fun apply(context: Context, input: I): O
+
+  companion object {
+    /**
+     * Asks the user for input and ends the body's run, so it never returns; the answer becomes the
+     * node's output unless the node reruns on resume. Parameters are as in [RequestInput] (a single
+     * argument is the interrupt id, not the message), and a `catch (Throwable t)` around the call
+     * cancels the request. [payload] must be JSON-native (maps, lists, strings, numbers, booleans);
+     * JVM code uses `FunctionNodes.requestInput`, which also takes a record or POJO.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun <T> requestInput(
+      interruptId: String = Uuid.random(),
+      message: String? = null,
+      payload: Any? = null,
+      responseSchema: Schema? = null,
+    ): T =
+      throw NodeInterruptedException(RequestInput(interruptId, message, payload, responseSchema))
+  }
 }
 
 /** The JSON form of [content], as a session saves it. */
@@ -313,15 +571,15 @@ private val FRAMEWORK_TYPES: Set<KClass<*>> = setOf(Content::class, Event::class
 private val SERIALIZER_FREE_TYPES: Set<KClass<*>> = FRAMEWORK_TYPES + setOf(Any::class, Unit::class)
 
 /** Infers a port's schema, except for framework types. */
-private fun inferredPortSchema(codec: ValueCodec<*>): Schema? =
-  if (codec.kType.classifier in FRAMEWORK_TYPES) null else codec.schema
+private fun inferredPortSchema(codec: PortCodec<*>): Schema? =
+  if (codec.classifier in FRAMEWORK_TYPES) null else codec.schema
 
 /**
  * Returns [value] as a node outputs it and a schema checks it: a framework value as it is, and
  * anything else as JSON.
  */
-internal fun ValueCodec<*>.schemaForm(value: Any?, what: String): Any? =
-  if (kType.classifier in FRAMEWORK_TYPES || value is Content || value is Event) {
+internal fun PortCodec<*>.schemaForm(value: Any?, what: String): Any? =
+  if (classifier in FRAMEWORK_TYPES || value is Content || value is Event) {
     value
   } else {
     encode(value, what)

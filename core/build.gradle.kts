@@ -96,6 +96,9 @@ kotlin {
       dependsOn(commonJvmAndroidMain)
       dependencies {
         implementation(libs.google.gson)
+        // FunctionNodes takes Jackson TypeReferences, so Java callers compile against Jackson.
+        api(libs.jackson.databind)
+        implementation(libs.jackson.datatype.jsr310)
         implementation(libs.google.cloud.storage)
         implementation(libs.mcp)
         implementation(libs.ktor.client.core)

@@ -36,6 +36,27 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 
+/** Reads a port's values as its type [T] and writes their JSON form. */
+internal interface PortCodec<T> {
+  /** The class of the port's type, or null when the type has none. */
+  val classifier: KClass<*>?
+
+  /** The schema the port's type infers, which describes the port without being enforced. */
+  val schema: Schema?
+
+  /**
+   * Returns [value] as a [T], or throws [NodeInputValidationException] that names [what], not
+   * [value].
+   */
+  fun coerce(value: Any?, what: String): T
+
+  /**
+   * Returns the JSON form of [value] as a [T], or throws [IllegalArgumentException] that names
+   * [what], not [value].
+   */
+  fun encode(value: Any?, what: String): Any?
+}
+
 /**
  * Reads a value as a [T] where it enters typed code, such as a node input, and writes a [T] as its
  * JSON form. A value that already is a [T] passes through, converted element by element for a
@@ -43,8 +64,8 @@ import kotlinx.serialization.json.JsonObject
  * [Content] is not a JSON form, so it reaches only a port typed `Content` or `Any`.
  */
 @OptIn(ExperimentalWorkflowApi::class, FrameworkInternalApi::class)
-internal class ValueCodec<T>(val kType: KType) {
-  private val classifier = kType.classifier as? KClass<*>
+internal class ValueCodec<T>(val kType: KType) : PortCodec<T> {
+  override val classifier = kType.classifier as? KClass<*>
 
   @Suppress("UNCHECKED_CAST")
   private val serializer: KSerializer<T>? = SchemaUtils.serializerFor(kType) as KSerializer<T>?
@@ -55,8 +76,7 @@ internal class ValueCodec<T>(val kType: KType) {
     (if (classifier == ByteArray::class) ByteArrayAsBase64Serializer else serializer)
       as KSerializer<Any?>?
 
-  /** The schema of [kType]'s JSON form, which describes a port without being enforced. */
-  val schema: Schema? by lazy { SchemaUtils.inferSchema(kType) }
+  override val schema: Schema? by lazy { SchemaUtils.inferSchema(kType) }
 
   private val elementCodec: ValueCodec<Any?>? =
     kType.arguments.singleOrNull()?.type?.let { ValueCodec(it) }
@@ -69,7 +89,7 @@ internal class ValueCodec<T>(val kType: KType) {
    * [IllegalArgumentException], naming [what] and not [value], when [value] is not a [T] or has no
    * JSON form.
    */
-  fun encode(value: Any?, what: String): Any? {
+  override fun encode(value: Any?, what: String): Any? {
     if (value == null) return null
     val typed =
       try {
@@ -94,11 +114,8 @@ internal class ValueCodec<T>(val kType: KType) {
     return jsonElementToAny(element)
   }
 
-  /**
-   * Returns [value] as a [T], or throws [NodeInputValidationException] that names [what], not
-   * [value].
-   */
-  @Suppress("UNCHECKED_CAST") fun coerce(value: Any?, what: String): T = coerceAny(value, what) as T
+  @Suppress("UNCHECKED_CAST")
+  override fun coerce(value: Any?, what: String): T = coerceAny(value, what) as T
 
   private fun coerceAny(value: Any?, what: String): Any? {
     if (value == null) {

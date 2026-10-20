@@ -22,6 +22,7 @@ package com.google.adk.kt.workflow
 
 import com.google.adk.kt.SchemaUtils
 import com.google.adk.kt.agents.Context
+import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.apps.App
@@ -50,9 +51,11 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -1478,5 +1481,203 @@ class FunctionNodeTest {
     // Assert
     assertContains(emptyNameError.message.orEmpty(), "must not be empty")
     assertContains(slashNameError.message.orEmpty(), "'bad/name'")
+  }
+
+  // -- Java interop Builder and toBuilder() --
+
+  @OptIn(AdkJavaInteropApi::class)
+  @Test
+  fun toBuilder_parallelNode_copiesAllPropertiesAndExecutes() {
+    // Arrange
+    val stateSchema =
+      Schema(type = Type.OBJECT, properties = mapOf("x" to Schema(type = Type.INTEGER)))
+    val innerWorker = node<Int, String>("inner") { _, n -> "v=$n" }
+    val original =
+      parallelNode(innerWorker, maxParallelWorkers = 3)
+        .toBuilder()
+        .description("desc")
+        .waitForOutput(true)
+        .stateSchema(stateSchema)
+        .build()
+
+    // Act
+    val copy = original.toBuilder().build()
+    val copyOutput = runOutputs(copy, listOf(10, 20))
+
+    // Assert
+    assertEquals("inner", copy.name)
+    assertEquals("desc", copy.description)
+    assertTrue(copy.rerunOnResume)
+    assertTrue(copy.waitForOutput)
+    assertEquals(NodeConfig(), copy.config)
+    assertNull(copy.inputSchema)
+    assertNull(copy.outputSchema)
+    assertEquals(stateSchema, copy.stateSchema)
+    assertEquals(typeOf<List<Int>>(), copy.inputType)
+    assertEquals(typeOf<List<String>>(), copy.outputType)
+    assertSame(innerWorker, copy.itemNode)
+    assertEquals(3, copy.maxParallelWorkers)
+    assertEquals(listOf<Any?>(listOf("v=10", "v=20")), copyOutput)
+  }
+
+  @OptIn(AdkJavaInteropApi::class)
+  @Test
+  fun parallelOf_itemNodeSettings_areKeptByTheNodeAndItsCopy() {
+    // Arrange
+    val stateSchema =
+      Schema(type = Type.OBJECT, properties = mapOf("n" to Schema(type = Type.INTEGER)))
+    val item =
+      node<Int, Int>(
+        "double",
+        description = "doubles",
+        waitForOutput = true,
+        stateSchema = stateSchema,
+      ) { _, n ->
+        n * 2
+      }
+
+    // Act
+    val parallel = FunctionNode.parallelOf(item, maxParallelWorkers = 2)
+    val copy = parallel.toBuilder().build()
+    val zeroError =
+      assertFailsWith<WorkflowConfigurationException> {
+        FunctionNode.parallelOf(item, maxParallelWorkers = 0)
+      }
+
+    // Assert
+    for (wrapper in listOf(parallel, copy)) {
+      assertEquals("double", wrapper.name)
+      assertEquals("doubles", wrapper.description)
+      assertTrue(wrapper.waitForOutput)
+      assertEquals(stateSchema, wrapper.stateSchema)
+      assertSame(item, wrapper.itemNode)
+      assertEquals(2, wrapper.maxParallelWorkers)
+    }
+    assertContains(zeroError.message.orEmpty(), "maxParallelWorkers must be at least 1")
+  }
+
+  @OptIn(AdkJavaInteropApi::class)
+  @Test
+  fun toBuilder_inferredAndExplicitSchemas_copyEnforcesOnlyExplicitOnes() {
+    // Arrange
+    // Each copy switches to a List<String> port: an inferred schema follows the new type, while an
+    // explicit one is copied and still enforced.
+    val intList = Schema(type = Type.ARRAY, items = Schema(type = Type.INTEGER))
+    val inferred =
+      node<List<Int>, String>("inferred", rerunOnResume = true) { _, items -> items.joinToString() }
+    val explicit =
+      node<List<Int>, String>("explicit", inputSchema = intList) { _, items ->
+        items.joinToString()
+      }
+    val words = listOf("a", "b")
+
+    // Act
+    val inferredCopy =
+      inferred.toBuilder().inputCodec(ValueCodec<List<String>>(typeOf<List<String>>())).build()
+    val explicitCopy =
+      explicit.toBuilder().inputCodec(ValueCodec<List<String>>(typeOf<List<String>>())).build()
+    val inferredOutputs = runOutputs(inferredCopy, words)
+    val explicitError =
+      assertFailsWith<NodeInputValidationException> { runOutputs(explicitCopy, words) }
+
+    // Assert
+    assertTrue(inferredCopy.rerunOnResume)
+    assertEquals(
+      Schema(type = Type.ARRAY, items = Schema(type = Type.STRING)),
+      inferredCopy.inputSchema,
+    )
+    assertEquals(intList, explicitCopy.inputSchema)
+    assertEquals(listOf<Any?>("a, b"), inferredOutputs)
+    assertContains(explicitError.message.orEmpty(), "'explicit'")
+  }
+
+  @OptIn(AdkJavaInteropApi::class)
+  @Test
+  fun builder_missingNameOrBody_throwsIllegalStateException() {
+    // Act
+    val noName =
+      assertFailsWith<IllegalStateException> {
+        FunctionNode.Builder.create<String, String>().body { _, text -> text }.build()
+      }
+    val noBody =
+      assertFailsWith<IllegalStateException> {
+        FunctionNode.Builder.create<String, String>().name("only_name").build()
+      }
+
+    // Assert
+    assertContains(noName.message.orEmpty(), "requires name")
+    assertContains(noBody.message.orEmpty(), "requires body")
+  }
+
+  @OptIn(AdkJavaInteropApi::class)
+  @Test
+  fun toBuilder_everySetterAndANodeBody_readsBackAndRunsTheNewBody() {
+    // Arrange
+    val inSchema = Schema(type = Type.STRING, description = "in")
+    val outSchema = Schema(type = Type.STRING, description = "out")
+    val stateSchema = Schema(type = Type.OBJECT, properties = mapOf("tag" to inSchema))
+    val config = NodeConfig(timeout = 5.seconds)
+    val original = node<String, String>("format_tag") { _, text -> "tag=$text" }
+
+    // Act
+    val copy =
+      original
+        .toBuilder()
+        .name("format_tag_v2")
+        .description("Formats a tag")
+        .rerunOnResume(true)
+        .waitForOutput(true)
+        .config(config)
+        .inputSchema(inSchema)
+        .outputSchema(outSchema)
+        .stateSchema(stateSchema)
+        .body { _, text -> "v2=$text" }
+        .build()
+    val outputs = runOutputs(copy, "x")
+
+    // Assert
+    assertEquals("format_tag_v2", copy.name)
+    assertEquals("Formats a tag", copy.description)
+    assertTrue(copy.rerunOnResume)
+    assertTrue(copy.waitForOutput)
+    assertEquals(config, copy.config)
+    assertEquals(inSchema, copy.inputSchema)
+    assertEquals(outSchema, copy.outputSchema)
+    assertEquals(stateSchema, copy.stateSchema)
+    assertEquals(listOf<Any?>("v2=x"), outputs)
+  }
+
+  @OptIn(AdkJavaInteropApi::class)
+  @Test
+  fun parallelOf_toBuilder_rejectsSettingsThatBelongOnTheItemNode() {
+    // Arrange
+    val item = node<Int, String>("label") { _, n -> "v=$n" }
+    val parallel = FunctionNode.parallelOf(item)
+    val arraySchema = Schema(type = Type.ARRAY)
+
+    // Act
+    val copy = parallel.toBuilder().description("copied").build()
+    val copyOutputs = runOutputs(copy, listOf(3, 5))
+    val errors =
+      listOf<() -> Any>(
+          { parallel.toBuilder().inputSchema(arraySchema).build() },
+          { parallel.toBuilder().outputSchema(arraySchema).build() },
+          { parallel.toBuilder().rerunOnResume(false).build() },
+          { parallel.toBuilder().config(NodeConfig(timeout = 5.seconds)).build() },
+          { parallel.toBuilder().body { _, _ -> emptyList() }.build() },
+        )
+        .map { build -> assertFailsWith<WorkflowConfigurationException> { build() }.message }
+
+    // Assert
+    assertEquals("copied", copy.description)
+    assertSame(item, copy.itemNode)
+    assertEquals(listOf<Any?>(listOf("v=3", "v=5")), copyOutputs)
+    val suffix = " cannot be set on parallel node 'label'; configure its item node instead."
+    assertEquals(
+      listOf("inputSchema", "outputSchema", "rerunOnResume(false)", "config", "body").map {
+        it + suffix
+      },
+      errors,
+    )
   }
 }
