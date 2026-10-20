@@ -17,6 +17,7 @@
 package com.google.adk.kt.types
 
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import kotlin.jvm.JvmOverloads
 import kotlin.jvm.JvmStatic
 import kotlinx.serialization.Contextual
 import kotlinx.serialization.Serializable
@@ -60,9 +61,15 @@ import kotlinx.serialization.Serializable
  * @property minProperties The fewest allowed properties. Applicable only if `type` is
  *   [Type.OBJECT].
  * @property maxProperties The most allowed properties. Applicable only if `type` is [Type.OBJECT].
+ * @property additionalProperties Whether an object may have properties [properties] does not
+ *   declare: `null` or `true` allows them, `false` rejects them, and a [Schema] must match each.
+ *   Applicable only if `type` is [Type.OBJECT]. Tool and model schemas ignore it, and a [Schema]
+ *   value reads back from JSON as a `Map`.
  */
 @Serializable
-data class Schema(
+data class Schema
+@JvmOverloads
+constructor(
   val type: Type? = null,
   val properties: Map<String, Schema>? = null,
   val items: Schema? = null,
@@ -83,6 +90,7 @@ data class Schema(
   val maxItems: Long? = null,
   val minProperties: Long? = null,
   val maxProperties: Long? = null,
+  val additionalProperties: @Contextual Any? = null,
 ) {
   /**
    * Returns a [Builder] initialized with this instance's properties, primarily for Java callers.
@@ -112,6 +120,7 @@ data class Schema(
       .maxItems(maxItems)
       .minProperties(minProperties)
       .maxProperties(maxProperties)
+      .additionalProperties(additionalProperties)
 
   /**
    * Fluent builder for [Schema], provided primarily for Java callers. Any property left unset falls
@@ -139,6 +148,7 @@ data class Schema(
     private var maxItems: Long? = null
     private var minProperties: Long? = null
     private var maxProperties: Long? = null
+    private var additionalProperties: Any? = null
 
     fun type(type: Type?): Builder = apply { this.type = type }
 
@@ -195,6 +205,10 @@ data class Schema(
 
     fun maxProperties(maxProperties: Long?): Builder = apply { this.maxProperties = maxProperties }
 
+    fun additionalProperties(additionalProperties: Any?): Builder = apply {
+      this.additionalProperties = additionalProperties
+    }
+
     fun build(): Schema =
       Schema(
         type = type,
@@ -217,6 +231,7 @@ data class Schema(
         maxItems = maxItems,
         minProperties = minProperties,
         maxProperties = maxProperties,
+        additionalProperties = additionalProperties,
       )
   }
 

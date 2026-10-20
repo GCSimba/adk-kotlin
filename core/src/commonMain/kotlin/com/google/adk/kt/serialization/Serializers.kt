@@ -19,6 +19,7 @@ package com.google.adk.kt.serialization
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.sessions.State
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.Schema
 import com.google.genai.kotlin.types.ByteArrayAsBase64Serializer
 import com.google.genai.kotlin.types.DurationStringSerializer
 import kotlin.math.roundToLong
@@ -120,6 +121,8 @@ internal fun anyToJsonElement(value: Any?, onUnsupported: (Any) -> Nothing): Jso
     is List<*> -> JsonArray(value.map { anyToJsonElement(it, onUnsupported) })
     // A framework value in workflow outputs, written in its wire form as in Event.content.
     is Content -> adkJson.encodeToJsonElement(Content.serializer(), value)
+    // A schema nested in an `Any` field, such as `Schema.additionalProperties`.
+    is Schema -> adkJson.encodeToJsonElement(Schema.serializer(), value)
     else -> onUnsupported(value)
   }
 

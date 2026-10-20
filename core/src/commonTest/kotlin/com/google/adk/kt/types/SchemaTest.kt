@@ -179,8 +179,8 @@ class SchemaTest {
 
   @Test
   fun adkJson_schemaWithDefault_serializes() {
-    // `default` is the one field typed `Any`, so it needs the contextual serializer that `adkJson`
-    // registers. Schemas are persisted as part of the cached-content metadata.
+    // `default` is typed `Any`, so it needs the contextual serializer that `adkJson` registers.
+    // Schemas are persisted as part of the cached-content metadata.
     val schema = Schema(type = Type.INTEGER, default = 7, title = "Count")
 
     val decoded =
@@ -192,6 +192,27 @@ class SchemaTest {
     assertEquals(Type.INTEGER, decoded.type)
     assertEquals("Count", decoded.title)
     assertEquals(7L, (decoded.default as Number).toLong())
+  }
+
+  @Test
+  fun adkJson_additionalProperties_roundTripsAsBooleanOrJsonObject() {
+    // Arrange
+    val closed = Schema(type = Type.OBJECT, additionalProperties = false)
+    val typedExtras =
+      Schema(type = Type.OBJECT, additionalProperties = Schema(type = Type.STRING, nullable = true))
+
+    // Act
+    val decoded =
+      listOf(closed, typedExtras).map {
+        adkJson.decodeFromString(
+          Schema.serializer(),
+          adkJson.encodeToString(Schema.serializer(), it),
+        )
+      }
+
+    // Assert: an `Any` field reads a nested schema back as its JSON object.
+    assertEquals(false, decoded[0].additionalProperties)
+    assertEquals(mapOf("type" to "STRING", "nullable" to true), decoded[1].additionalProperties)
   }
 
   @OptIn(AdkJavaInteropApi::class)
@@ -219,6 +240,7 @@ class SchemaTest {
         maxItems = 20,
         minProperties = 3,
         maxProperties = 30,
+        additionalProperties = Schema(type = Type.STRING),
       )
 
     assertEquals(schema.copy(), schema.toBuilder().build())
