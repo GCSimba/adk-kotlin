@@ -42,19 +42,16 @@ import com.google.adk.kt.types.ToolConfig
 import com.google.adk.kt.types.ToolType
 import com.google.adk.kt.types.Type
 import com.google.common.truth.Truth.assertThat
-import com.google.firebase.ai.type.BlockReason
 import com.google.firebase.ai.type.Content as FirebaseContent
 import com.google.firebase.ai.type.FileDataPart
 import com.google.firebase.ai.type.FinishReason as FirebaseFinishReason
 import com.google.firebase.ai.type.FunctionCallPart
 import com.google.firebase.ai.type.FunctionResponsePart
-import com.google.firebase.ai.type.GenerateContentResponse
 import com.google.firebase.ai.type.HarmBlockMethod as FirebaseHarmBlockMethod
 import com.google.firebase.ai.type.HarmBlockThreshold as FirebaseHarmBlockThreshold
 import com.google.firebase.ai.type.HarmCategory as FirebaseHarmCategory
 import com.google.firebase.ai.type.InlineDataPart
 import com.google.firebase.ai.type.Part as FirebasePart
-import com.google.firebase.ai.type.PromptFeedback
 import com.google.firebase.ai.type.PublicPreviewAPI
 import com.google.firebase.ai.type.ResponseModality
 import com.google.firebase.ai.type.TextPart
@@ -353,41 +350,6 @@ class ConversionsTest {
   fun toErrorMessage_nonStopWithMessage_returnsMessage() {
     assertThat(Conversions().toErrorMessage(FinishReason.MAX_TOKENS, message = "boom"))
       .isEqualTo("boom")
-  }
-
-  /** An empty response (no candidate) is not flagged as an error. */
-  @OptIn(PublicPreviewAPI::class)
-  @Test
-  fun convertResponse_noCandidate_hasNoError() {
-    val conversions = Conversions()
-    val response =
-      GenerateContentResponse(candidates = emptyList(), promptFeedback = null, usageMetadata = null)
-
-    val llmResponse = conversions.convertResponse(response)
-
-    assertThat(llmResponse.errorCode).isNull()
-    assertThat(llmResponse.errorMessage).isNull()
-  }
-
-  /**
-   * A blocked response with no candidate derives a finish reason and error from the block reason.
-   */
-  @OptIn(PublicPreviewAPI::class)
-  @Test
-  fun convertResponse_blockedNoCandidate_hasError() {
-    val conversions = Conversions()
-    val response =
-      GenerateContentResponse(
-        candidates = emptyList(),
-        promptFeedback = PromptFeedback(BlockReason.SAFETY, emptyList(), "blocked"),
-        usageMetadata = null,
-      )
-
-    val llmResponse = conversions.convertResponse(response)
-
-    assertThat(llmResponse.finishReason).isEqualTo(FinishReason.SAFETY)
-    assertThat(llmResponse.errorCode).isEqualTo(FinishReason.SAFETY.name)
-    assertThat(llmResponse.errorMessage).isEqualTo("blocked")
   }
 
   // History keeps parts carrying only a thought signature. Firebase carries one as an empty text

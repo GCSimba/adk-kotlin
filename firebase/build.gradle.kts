@@ -29,9 +29,9 @@ plugins {
 kotlin { coreLibrariesVersion = rootProject.extra["kotlinCoreLibrariesVersion"] as String }
 
 dependencies {
-  implementation(platform(libs.google.firebase.platform))
+  api(platform(libs.google.firebase.platform))
   implementation(project(":google-adk-kotlin-core"))
-  implementation(libs.google.firebase.ai)
+  api(libs.google.firebase.ai)
   implementation(libs.kotlinx.serialization)
 
   testImplementation(libs.kotlin.test.junit)

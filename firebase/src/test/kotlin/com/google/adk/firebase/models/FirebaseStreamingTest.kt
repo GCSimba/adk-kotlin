@@ -16,14 +16,8 @@
 
 package com.google.adk.firebase.models
 
-import com.google.adk.kt.types.FinishReason
 import com.google.common.truth.Truth.assertThat
-import com.google.firebase.ai.type.BlockReason
-import com.google.firebase.ai.type.GenerateContentResponse
-import com.google.firebase.ai.type.PromptFeedback
-import com.google.firebase.ai.type.PublicPreviewAPI
 import kotlinx.coroutines.flow.emptyFlow
-import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import org.junit.Test
@@ -31,12 +25,11 @@ import org.junit.runner.RunWith
 import org.junit.runners.JUnit4
 
 /**
- * Unit tests for [streamToLlmResponses], fed with canned chunk flows.
+ * Unit tests for [streamToLlmResponses].
  *
- * The Firebase SDK's response and exception types can't be built or mocked here, so the error path
- * (the SDK throws mid-stream) is tested live in `FirebaseIntegrationTest`.
+ * [FirebaseResponseConversionTest] streams mocked chunks, and `FirebaseIntegrationTest` covers the
+ * live error path where the SDK throws mid-stream.
  */
-@OptIn(PublicPreviewAPI::class)
 @RunWith(JUnit4::class)
 class FirebaseStreamingTest {
 
@@ -46,55 +39,5 @@ class FirebaseStreamingTest {
     val responses = runBlocking { streamToLlmResponses(emptyFlow()).toList() }
 
     assertThat(responses).isEmpty()
-  }
-
-  /**
-   * A prompt-block chunk is emitted as a partial, then a terminal response flagged with the error.
-   */
-  @Test
-  fun blockFeedbackChunk_emitsPartialThenErrorTerminal() {
-    val blocked =
-      GenerateContentResponse(
-        emptyList(),
-        PromptFeedback(BlockReason.SAFETY, emptyList(), "blocked"),
-        null,
-      )
-
-    val responses = runBlocking { streamToLlmResponses(flowOf(blocked)).toList() }
-
-    assertThat(responses).hasSize(2)
-
-    // First: the block chunk itself, surfaced as a partial.
-    assertThat(responses[0].partial).isTrue()
-    assertThat(responses[0].errorCode).isEqualTo(FinishReason.SAFETY.name)
-
-    // Then: the aggregated terminal response, carrying the block as a non-partial error.
-    val terminal = responses[1]
-    assertThat(terminal.partial).isFalse()
-    assertThat(terminal.finishReason).isEqualTo(FinishReason.SAFETY)
-    assertThat(terminal.errorCode).isEqualTo(FinishReason.SAFETY.name)
-    assertThat(terminal.errorMessage).isEqualTo("blocked")
-  }
-
-  /** An empty chunk yields an empty partial, then an empty, error-free final response. */
-  @Test
-  fun contentlessChunk_emitsPartialThenEmptyTerminal() {
-    val empty = GenerateContentResponse(emptyList(), null, null)
-
-    val responses = runBlocking { streamToLlmResponses(flowOf(empty)).toList() }
-
-    assertThat(responses).hasSize(2)
-
-    // First: the contentless chunk, surfaced as a partial.
-    assertThat(responses[0].partial).isTrue()
-    assertThat(responses[0].errorCode).isNull()
-
-    // Then: the aggregated non-partial terminal frame — empty and error-free.
-    val terminal = responses[1]
-    assertThat(terminal.partial).isFalse()
-    assertThat(terminal.content).isNull()
-    assertThat(terminal.finishReason).isNull()
-    assertThat(terminal.errorCode).isNull()
-    assertThat(terminal.errorMessage).isNull()
   }
 }

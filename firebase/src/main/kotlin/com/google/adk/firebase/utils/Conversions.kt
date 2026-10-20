@@ -16,9 +16,11 @@
 
 package com.google.adk.firebase.utils
 
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.logging.LoggerFactory
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.models.LlmResponse
+import com.google.adk.kt.models.TrackingHeaders
 import com.google.adk.kt.types.Blob
 import com.google.adk.kt.types.Citation
 import com.google.adk.kt.types.CitationMetadata
@@ -66,6 +68,7 @@ import com.google.firebase.ai.type.InlineDataPart
 import com.google.firebase.ai.type.Part as FirebasePart
 import com.google.firebase.ai.type.PublicPreviewAPI
 import com.google.firebase.ai.type.RequestOptions
+import com.google.firebase.ai.type.RequestOptionsFactory
 import com.google.firebase.ai.type.ResponseModality
 import com.google.firebase.ai.type.SafetySetting as FirebaseSafetySetting
 import com.google.firebase.ai.type.Schema as FirebaseSchema
@@ -897,6 +900,12 @@ internal class Conversions {
     fun systemInstruction(): FirebaseContent? =
       request.config.systemInstruction?.let { toFirebaseContent(it) }
 
-    fun requestOptions(): RequestOptions = RequestOptions()
+    /**
+     * Tags requests with ADK's tracking tag. Firebase appends it to its own `x-goog-api-client`
+     * value, which already names the Kotlin version, and offers no hook for `user-agent`.
+     */
+    @OptIn(FrameworkInternalApi::class)
+    fun requestOptions(): RequestOptions =
+      RequestOptionsFactory.createWithCustomHeader(RequestOptions(), TrackingHeaders.ADK_TAG)
   }
 }
