@@ -18,6 +18,7 @@ package com.google.adk.kt.models
 
 import com.google.adk.kt.VERSION
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.types.Candidate
@@ -53,6 +54,8 @@ import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import mockwebserver3.RecordedRequest
 import okhttp3.Headers
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import org.mockito.kotlin.any
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
@@ -264,6 +267,71 @@ class GeminiJvmTest {
     )
 
     runBlocking { collectGenerateContent(stream = true) }
+
+    assertTrackingHeaders(mockServer.takeRequest(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun generateContent_callerSuppliedClient_attachesAdkTrackingHeaders() {
+    mockServer.enqueue(json(GENERATE_CONTENT_RESPONSE))
+
+    runBlocking { generateWithCallerClient(stream = false) }
+
+    assertTrackingHeaders(mockServer.takeRequest(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun generateContent_callerSuppliedClientStreaming_attachesAdkTrackingHeaders() {
+    mockServer.enqueue(sse(GENERATE_CONTENT_RESPONSE))
+
+    runBlocking { generateWithCallerClient(stream = true) }
+
+    assertTrackingHeaders(mockServer.takeRequest(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun generateContent_callerSuppliedClientUserAgent_isExtendedWithAdkTag() {
+    mockServer.enqueue(json(GENERATE_CONTENT_RESPONSE))
+
+    runBlocking {
+      generateWithCallerClient(stream = false, headers = mapOf("user-agent" to "my-app/1.0"))
+    }
+
+    val request = mockServer.takeRequest(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+    assertTrackingHeaders(request)
+    assertThat(request?.headers?.get("user-agent")).endsWith("my-app/1.0 google-adk/$VERSION")
+  }
+
+  @Test
+  @OptIn(ExperimentalLiveApi::class)
+  fun connect_callerSuppliedClient_sendsTrackingHeadersOnTheWire() {
+    mockServer.enqueue(MockResponse.Builder().webSocketUpgrade(AnswerLiveSetup).build())
+
+    runBlocking {
+      Client(
+          apiKey = "fake-key",
+          httpOptions = HttpOptions(baseUrl = mockServer.url("/").toString()),
+        )
+        .use { client -> Gemini(client, "gemini-live-test").connect(LlmRequest()).closeSession() }
+    }
+
+    assertTrackingHeaders(mockServer.takeRequest(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+  }
+
+  @Test
+  @OptIn(ExperimentalLiveApi::class)
+  fun connect_adkBuiltClient_sendsTrackingHeadersOnTheWire() {
+    mockServer.enqueue(MockResponse.Builder().webSocketUpgrade(AnswerLiveSetup).build())
+
+    runBlocking {
+      Gemini.withBaseUrl(
+          name = "gemini-live-test",
+          apiKey = "fake-key",
+          baseUrl = mockServer.url("/").toString(),
+        )
+        .connect(LlmRequest())
+        .closeSession()
+    }
 
     assertTrackingHeaders(mockServer.takeRequest(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
   }
@@ -567,6 +635,26 @@ class GeminiJvmTest {
   private suspend fun generateThroughMockServer(stream: Boolean): List<LlmResponse> =
     generateContentFlow(stream).toList()
 
+  /** Generates through the public constructor with a client the caller built for the server. */
+  private suspend fun generateWithCallerClient(
+    stream: Boolean,
+    headers: Map<String, String>? = null,
+  ) {
+    Client(
+        apiKey = "fake-key",
+        httpOptions = HttpOptions(baseUrl = mockServer.url("/").toString(), headers = headers),
+      )
+      .use { client ->
+        val unused =
+          Gemini(client, "gemini-3.1-flash-preview")
+            .generateContent(
+              LlmRequest(contents = listOf(userMessage("Hello")), config = GenerateContentConfig()),
+              stream = stream,
+            )
+            .toList()
+      }
+  }
+
   /** Runs [generateThroughMockServer] for tests that check only the requests it sends. */
   private suspend fun collectGenerateContent(stream: Boolean) {
     val unused = generateThroughMockServer(stream)
@@ -643,12 +731,30 @@ class GeminiJvmTest {
     }
   }
 
+  /**
+   * Asserts both tracking headers as received by the server: each starts with the GenAI SDK label,
+   * includes the Kotlin version tag and ADK's tag, and repeats no tag name.
+   */
   private fun assertTrackingHeaders(request: RecordedRequest?) {
     checkNotNull(request) { "Expected the genai SDK to send a request to the mock server." }
-    // The genai SDK may append its own label, so assert our value is present rather than equal.
-    val expected = "google-adk/$VERSION gl-kotlin/${KotlinVersion.CURRENT}"
-    assertThat(request.headers.values("x-goog-api-client").firstOrNull()).contains(expected)
-    assertThat(request.headers.values("user-agent").firstOrNull()).contains(expected)
+    for (name in listOf("x-goog-api-client", "user-agent")) {
+      val tags = request.headers.values(name).single().split(' ')
+      assertThat(tags.first()).startsWith("google-genai-sdk/")
+      assertThat(tags).containsAtLeast("gl-kotlin/${KotlinVersion.CURRENT}", "google-adk/$VERSION")
+      assertThat(tags.map { it.substringBefore('/') }).containsNoDuplicates()
+    }
+  }
+
+  /** Answers the Live setup message, which [Gemini.connect] awaits before returning. */
+  private object AnswerLiveSetup : WebSocketListener() {
+    override fun onMessage(webSocket: WebSocket, text: String) {
+      webSocket.send("""{"setupComplete":{}}""")
+    }
+
+    // Complete the close handshake so the server can shut down after the test.
+    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+      webSocket.close(code, null)
+    }
   }
 
   private class CollectorException : RuntimeException("collector failed")

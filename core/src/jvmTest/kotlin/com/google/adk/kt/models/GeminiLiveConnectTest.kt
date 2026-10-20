@@ -388,6 +388,25 @@ class GeminiLiveConnectTest {
     assertEquals(null, assertNotNull(recorder.connectedWith).sessionResumption?.transparent)
   }
 
+  @Test
+  fun connect_apiKeyConstructor_sendsNoRequestHttpOptions() = runBlocking {
+    // The client this constructor builds already sends ADK's tag; request options would repeat it.
+    val recorder = RecordingLive()
+
+    gemini().apply { live = recorder }.connect(LlmRequest()).closeSession()
+
+    assertNull(assertNotNull(recorder.connectedWith).httpOptions)
+  }
+
+  @Test
+  fun connect_vertexCredentialsConstructor_sendsNoRequestHttpOptions() = runBlocking {
+    val recorder = RecordingLive()
+
+    vertexGemini().apply { live = recorder }.connect(LlmRequest()).closeSession()
+
+    assertNull(assertNotNull(recorder.connectedWith).httpOptions)
+  }
+
   private fun resumeRequest(transparent: Boolean?) =
     LlmRequest(
       liveConnectConfig =

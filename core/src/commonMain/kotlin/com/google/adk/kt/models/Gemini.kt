@@ -15,7 +15,6 @@
  */
 package com.google.adk.kt.models
 
-import com.google.adk.kt.VERSION
 import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
@@ -69,12 +68,18 @@ class Gemini
 internal constructor(
   internal val client: Client,
   override val name: String,
-  private val models: GeminiModels,
   /**
    * The speech config for live sessions opened by this model. When set, it replaces the request's
    * own speech config at connect, as in ADK Python.
    */
   val speechConfig: SpeechConfig? = null,
+  /**
+   * Request options with ADK's tracking tag, set only when the caller built [client]. ADK's own
+   * constructors pass `null` by name to select this constructor over the public three-parameter
+   * one.
+   */
+  private val requestHttpOptions: HttpOptions? = null,
+  private val models: GeminiModels = RealGeminiModels(client.models, requestHttpOptions),
 ) : Model {
 
   /**
@@ -100,19 +105,22 @@ internal constructor(
 
   /**
    * Creates a [Gemini] from a preconfigured GenAI SDK [Client], for callers that need a custom
-   * transport or auth.
+   * transport or auth. Each generate request and live connection appends ADK's tracking tag to the
+   * client's `user-agent` and `x-goog-api-client` headers. The SDK matches these names exactly, so
+   * a client header spelled `User-Agent` replaces the merged value.
    *
    * @param client The [Client] instance from the GenAI SDK used for making API calls.
    * @param name The name of the specific Gemini model to use (e.g.,
    *   "gemini-3.1-flash-lite-preview").
    * @param speechConfig The speech config for live sessions; see [Gemini.speechConfig].
    */
+  @OptIn(FrameworkInternalApi::class)
   @JvmOverloads
   constructor(
     client: Client,
     name: String,
     speechConfig: SpeechConfig? = null,
-  ) : this(client, name, RealGeminiModels(client.models), speechConfig)
+  ) : this(client, name, speechConfig, HttpOptions(headers = TrackingHeaders.GENAI_SDK_HEADERS))
 
   /**
    * Wrapper around the GenAI SDK's generate calls, expressed in ADK types, to allow mocking in
@@ -132,15 +140,17 @@ internal constructor(
     ): GenerateContentResponse
   }
 
-  internal class RealGeminiModels(private val delegate: com.google.genai.kotlin.Models) :
-    GeminiModels {
+  internal class RealGeminiModels(
+    private val delegate: com.google.genai.kotlin.Models,
+    private val requestHttpOptions: HttpOptions?,
+  ) : GeminiModels {
     override fun generateContentStream(
       model: String,
       contents: List<Content>,
       config: GenerateContentConfig,
     ): Flow<GenerateContentResponse> =
       delegate
-        .generateContentStream(model, contents.map { it.toGenaiSdk() }, config.toGenaiSdk())
+        .generateContentStream(model, contents.map { it.toGenaiSdk() }, config.toSdkRequest())
         // Keeps collector exceptions out of the SDK's resume-after-error catch, which would resend.
         .buffer(Channel.RENDEZVOUS)
         .map { it.fromGenaiSdk() }
@@ -151,8 +161,11 @@ internal constructor(
       config: GenerateContentConfig,
     ): GenerateContentResponse =
       delegate
-        .generateContent(model, contents.map { it.toGenaiSdk() }, config.toGenaiSdk())
+        .generateContent(model, contents.map { it.toGenaiSdk() }, config.toSdkRequest())
         .fromGenaiSdk()
+
+    private fun GenerateContentConfig.toSdkRequest() =
+      toGenaiSdk().copy(httpOptions = requestHttpOptions)
   }
 
   /**
@@ -171,7 +184,12 @@ internal constructor(
     name: String,
     apiKey: String? = null,
     speechConfig: SpeechConfig? = null,
-  ) : this(Client(apiKey = apiKey, httpOptions = adkHttpOptions()), name, speechConfig)
+  ) : this(
+    Client(apiKey = apiKey, httpOptions = adkHttpOptions()),
+    name,
+    speechConfig,
+    requestHttpOptions = null,
+  )
 
   /**
    * Creates a [Gemini] instance using Vertex AI credentials for authentication. Its client retries
@@ -198,6 +216,7 @@ internal constructor(
     ),
     name,
     speechConfig,
+    requestHttpOptions = null,
   )
 
   /**
@@ -217,6 +236,7 @@ internal constructor(
         .let { live -> if (client.enterprise) live.resumingTransparently() else live }
         .carryingAgentConfig(request.config)
         .toGenaiSdk()
+        .copy(httpOptions = requestHttpOptions)
     val collector = currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext
     val handle = openHandle(modelName, config, collector)
     val connection =
@@ -406,19 +426,21 @@ internal constructor(
      * make `new Gemini("m", "k", null)` ambiguous.
      */
     internal fun withBaseUrl(name: String, apiKey: String?, baseUrl: String): Gemini =
-      Gemini(Client(apiKey = apiKey, httpOptions = adkHttpOptions(baseUrl)), name)
-
-    // Usage-tracking headers shared across ADK SDKs: "google-adk/<v> gl-<lang>/<ver>".
-    private val TRACKING_HEADERS = run {
-      val frameworkLabel = "google-adk/$VERSION"
-      val languageLabel = "gl-kotlin/${KotlinVersion.CURRENT}"
-      val versionHeaderValue = "$frameworkLabel $languageLabel"
-      mapOf("x-goog-api-client" to versionHeaderValue, "user-agent" to versionHeaderValue)
-    }
+      Gemini(
+        Client(apiKey = apiKey, httpOptions = adkHttpOptions(baseUrl)),
+        name,
+        speechConfig = null,
+        requestHttpOptions = null,
+      )
 
     // The SDK makes one attempt unless retryOptions is set; HttpRetryOptions() uses its defaults.
+    @OptIn(FrameworkInternalApi::class)
     private fun adkHttpOptions(baseUrl: String? = null) =
-      HttpOptions(baseUrl = baseUrl, headers = TRACKING_HEADERS, retryOptions = HttpRetryOptions())
+      HttpOptions(
+        baseUrl = baseUrl,
+        headers = TrackingHeaders.GENAI_SDK_HEADERS,
+        retryOptions = HttpRetryOptions(),
+      )
 
     private val logger = LoggerFactory.getLogger(Gemini::class)
   }
