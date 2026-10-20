@@ -28,6 +28,7 @@ import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.apps.App
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
+import com.google.adk.kt.events.ToolConfirmation
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.runners.InMemoryRunner
@@ -926,6 +927,23 @@ private fun sessionAwaitingAnswer(schema: Schema): WorkflowSession {
   val workflow =
     Workflow(name = "wf", edges = listOf(Edge(Start, ask), Edge(ask, CaptureInput("reply"))))
   return WorkflowSession(workflow).also { it.advance(userMessage("go")) }
+}
+
+@Serializable private data class RemovalTarget(val path: String)
+
+@Serializable private data class RemovalResult(val removed: Boolean)
+
+/** The interrupt id of `remove_file`'s confirmation request in [removalWorkflow]. */
+private const val REMOVAL_CONFIRMATION_ID = "wf_tool_confirmation:wf@1/remove_file@1"
+
+/** A workflow passing `{"path": path}` through [remove] into `reply`. */
+private fun removalWorkflow(remove: Node, path: String = "/tmp/a"): Workflow {
+  val target = Emitter("target", mapOf("path" to path))
+  val reply = CaptureInput("reply")
+  return Workflow(
+    name = "wf",
+    edges = listOf(Edge(Start, target), Edge(target, remove), Edge(remove, reply)),
+  )
 }
 
 /** What the workflow's `reply` node received in this turn. */
@@ -3409,5 +3427,513 @@ class WorkflowHitlTest {
     // Assert: the answer is the output as saved, though the node returns Unit.
     assertEquals("ask_u", asked.flatMap { it.functionCalls() }.single().id)
     assertEquals("yes", answered.single { it.nodeInfo?.path == "wf@1/ask@1" }.output)
+  }
+
+  // -- Confirmation --
+
+  @Test
+  fun requireConfirmation_unanswered_asksWithTheInputAndSkipsTheBody() {
+    // Arrange
+    var runs = 0
+    val remove =
+      node<RemovalTarget, RemovalResult>("remove_file", requireConfirmation = true) { _, _ ->
+        runs += 1
+        RemovalResult(removed = true)
+      }
+
+    // Act
+    val events = WorkflowSession(removalWorkflow(remove)).turn(userMessage("go"))
+
+    // Assert
+    val call = events.flatMap { it.functionCalls() }.single()
+    assertEquals(REMOVAL_CONFIRMATION_ID, call.id)
+    assertEquals(
+      "Please approve or reject the tool call remove_file().",
+      call.args[RequestInput.MESSAGE_KEY],
+    )
+    assertEquals(
+      mapOf("tool_name" to "remove_file", "args" to mapOf("path" to "/tmp/a")),
+      call.args[RequestInput.PAYLOAD_KEY],
+    )
+    assertTrue(call.args[RequestInput.RESPONSE_SCHEMA_KEY] != null)
+    assertEquals(0, runs)
+    assertTrue(events.none { it.nodeInfo?.path == "wf@1/reply@1" })
+  }
+
+  @Test
+  fun requireConfirmation_confirmed_runsTheBodyOnceWithTheAnswer() {
+    // Arrange
+    val seen = mutableListOf<ToolConfirmation?>()
+    val remove =
+      node<RemovalTarget, RemovalResult>("remove_file", requireConfirmation = true) { ctx, _ ->
+        seen += ctx.toolConfirmation
+        RemovalResult(removed = true)
+      }
+    val session = WorkflowSession(removalWorkflow(remove))
+    session.advance(userMessage("go"))
+
+    // Act
+    val events =
+      session.turn(answer(REMOVAL_CONFIRMATION_ID, mapOf("confirmed" to true, "hint" to "ok")))
+
+    // Assert
+    assertEquals(mapOf("removed" to true), events.replyInput())
+    assertEquals(listOf<ToolConfirmation?>(ToolConfirmation(confirmed = true, hint = "ok")), seen)
+  }
+
+  @Test
+  fun requireConfirmation_rejected_outputsTheRejectionWithoutRunningTheBody() {
+    // Arrange
+    var runs = 0
+    val remove =
+      node<RemovalTarget, RemovalResult>("remove_file", requireConfirmation = true) { _, _ ->
+        runs += 1
+        RemovalResult(removed = true)
+      }
+    val session = WorkflowSession(removalWorkflow(remove))
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer(REMOVAL_CONFIRMATION_ID, mapOf("confirmed" to false)))
+
+    // Assert
+    assertEquals(mapOf("error" to "This tool call is rejected."), events.replyInput())
+    assertEquals(0, runs)
+  }
+
+  @Test
+  fun requireConfirmation_confirmedNodeWithNoOutput_isNotRerunWhenALaterNodeResumes() {
+    // Arrange
+    var runs = 0
+    val remove = node<Any?, Unit>("remove_file", requireConfirmation = true) { _, _ -> runs += 1 }
+    val review = Ask("review", RequestInput(interruptId = "review", message = "Review?"))
+    val session =
+      WorkflowSession(
+        Workflow(name = "wf", edges = listOf(Edge(Start, remove), Edge(remove, review)))
+      )
+    session.advance(userMessage("go"))
+    session.advance(answer("wf_tool_confirmation:wf@1/remove_file@1", mapOf("confirmed" to true)))
+
+    // Act
+    session.advance(answer("review", mapOf("ok" to true)))
+
+    // Assert
+    assertEquals(1, runs)
+  }
+
+  @Test
+  fun requireConfirmation_confirmedNodeThatDelegatesItsOutput_writesNoEmptyEventAndIsNotRerun() {
+    // Arrange
+    var runs = 0
+    val child = node<Any?, String>("child") { _, _ -> "child_done" }
+    val parent =
+      node<Any?, String?>("parent", requireConfirmation = true) { ctx, _ ->
+        runs += 1
+        val unused = ctx.runNode(child, useAsOutput = true)
+        null
+      }
+    val review = Ask("review", RequestInput(interruptId = "review", message = "Review?"))
+    val session =
+      WorkflowSession(
+        Workflow(name = "wf", edges = listOf(Edge(Start, parent), Edge(parent, review)))
+      )
+    session.advance(userMessage("go"))
+    val confirmed =
+      session.turn(answer("wf_tool_confirmation:wf@1/parent@1", mapOf("confirmed" to true)))
+
+    // Act
+    session.advance(answer("review", mapOf("ok" to true)))
+
+    // Assert
+    val parentEvents = confirmed.filter { it.nodeInfo?.path?.startsWith("wf@1/parent@1") == true }
+    assertEquals(
+      listOf<Pair<String?, Any?>>("wf@1/parent@1/child@1" to "child_done"),
+      parentEvents.map { it.nodeInfo?.path to it.output },
+    )
+    assertEquals(1, runs)
+  }
+
+  @Test
+  fun requireConfirmation_parallelNode_asksForEachItemAndRunsOnlyTheConfirmedOnes() {
+    // Arrange
+    val runs = mutableListOf<Long>()
+    val worker =
+      parallelNode<Long, String>("worker", requireConfirmation = true) { _, item ->
+        runs += item
+        "done-$item"
+      }
+    val session = WorkflowSession(fanOutWorkflow(worker))
+
+    // Act
+    val asked = session.turn(userMessage("go"))
+    val ids = asked.flatMap { it.functionCalls() }.mapNotNull { it.id }.sorted()
+    check(ids.size == 3) { "expected one request per item" }
+    session.advance(answer(ids[0], mapOf("confirmed" to true)))
+    session.advance(answer(ids[1], mapOf("confirmed" to false)))
+    val answered = session.turn(answer(ids[2], mapOf("confirmed" to true)))
+
+    // Assert
+    assertTrue(ids.all { it.startsWith("wf_tool_confirmation:wf@1/worker@1/") })
+    assertEquals(
+      listOf("done-1", mapOf("error" to "This tool call is rejected."), "done-3"),
+      answered.replyInput(),
+    )
+    assertEquals(listOf(1L, 3L), runs)
+  }
+
+  @Test
+  fun requireConfirmation_nullAnswer_asksAgain() {
+    // Arrange
+    val remove =
+      node<RemovalTarget, RemovalResult>("remove_file", requireConfirmation = true) { _, _ ->
+        RemovalResult(removed = true)
+      }
+    val session = WorkflowSession(removalWorkflow(remove))
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer(REMOVAL_CONFIRMATION_ID, mapOf("result" to null)))
+
+    // Assert
+    assertEquals(
+      listOf(REMOVAL_CONFIRMATION_ID),
+      events.flatMap { it.functionCalls() }.mapNotNull { it.id },
+    )
+    assertTrue(events.none { it.nodeInfo?.path == "wf@1/reply@1" })
+  }
+
+  @Test
+  fun requireConfirmation_dispatchedChild_parentReusesItsApprovalAndTheChildAsksSeparately() {
+    // Arrange
+    val calls = mutableListOf<String>()
+    val child =
+      node<Any?, String>("child", requireConfirmation = true) { _, _ ->
+        calls += "child"
+        "child_done"
+      }
+    val parent =
+      node<Any?, Any?>("parent", requireConfirmation = true) { ctx, _ ->
+        calls += "parent"
+        ctx.runNode(child)
+      }
+    val reply = CaptureInput("reply")
+    val session =
+      WorkflowSession(
+        Workflow(name = "wf", edges = listOf(Edge(Start, parent), Edge(parent, reply)))
+      )
+    session.advance(userMessage("go"))
+    val childAsked =
+      session.turn(answer("wf_tool_confirmation:wf@1/parent@1", mapOf("confirmed" to true)))
+    val childId = childAsked.flatMap { it.functionCalls() }.mapNotNull { it.id }.single()
+
+    // Act
+    val answered = session.turn(answer(childId, mapOf("confirmed" to true)))
+
+    // Assert
+    assertEquals("wf_tool_confirmation:wf@1/parent@1/child@1", childId)
+    assertEquals(listOf("parent", "parent", "child"), calls)
+    assertEquals("child_done", answered.replyInput())
+  }
+
+  @Test
+  fun requireConfirmation_dispatchedChildRejected_parentOutputsTheRejection() {
+    // Arrange
+    val calls = mutableListOf<String>()
+    val child =
+      node<Any?, String>("child", requireConfirmation = true) { _, _ ->
+        calls += "child"
+        "child_done"
+      }
+    val parent =
+      node<Any?, Any?>("parent", requireConfirmation = true) { ctx, _ ->
+        calls += "parent"
+        ctx.runNode(child)
+      }
+    val reply = CaptureInput("reply")
+    val session =
+      WorkflowSession(
+        Workflow(name = "wf", edges = listOf(Edge(Start, parent), Edge(parent, reply)))
+      )
+    session.advance(userMessage("go"))
+    session.advance(answer("wf_tool_confirmation:wf@1/parent@1", mapOf("confirmed" to true)))
+
+    // Act
+    val answered =
+      session.turn(
+        answer("wf_tool_confirmation:wf@1/parent@1/child@1", mapOf("confirmed" to false))
+      )
+
+    // Assert
+    assertEquals(listOf("parent", "parent"), calls)
+    assertEquals(mapOf("error" to "This tool call is rejected."), answered.replyInput())
+  }
+
+  @Test
+  fun requireConfirmation_rejectedNode_isReplayedNotRerunWhenASiblingResumes() {
+    // Arrange
+    var runs = 0
+    val received = mutableListOf<Any?>()
+    val askA = Ask("node_a", RequestInput(interruptId = "ask_a", message = "Input for A?"))
+    val nodeB =
+      node<Any?, String>("node_b", requireConfirmation = true) { _, _ ->
+        runs += 1
+        "result_b"
+      }
+    val downstreamB =
+      node<Any?, String>("downstream_b") { _, input ->
+        received += input
+        "after_b"
+      }
+    val join = JoinNode("node_join")
+    val reply = CaptureInput("reply")
+    val session =
+      WorkflowSession(
+        Workflow(
+          name = "wf",
+          edges =
+            listOf(
+              Edge(Start, askA),
+              Edge(Start, nodeB),
+              Edge(nodeB, downstreamB),
+              Edge(askA, join),
+              Edge(downstreamB, join),
+              Edge(join, reply),
+            ),
+        )
+      )
+    session.advance(userMessage("go"))
+    val rejected =
+      session.turn(answer("wf_tool_confirmation:wf@1/node_b@1", mapOf("confirmed" to false)))
+
+    // Act
+    val resumed = session.turn(answer("ask_a", mapOf("result" to "a_done")))
+
+    // Assert
+    assertEquals(0, runs)
+    assertEquals(listOf<Any?>(mapOf("error" to "This tool call is rejected.")), received)
+    assertTrue(rejected.none { it.nodeInfo?.path == "wf@1/reply@1" })
+    assertEquals(mapOf("node_a" to "a_done", "downstream_b" to "after_b"), resumed.replyInput())
+  }
+
+  @Test
+  fun requireConfirmationPredicate_typedInputMatches_asksOnceAndRunsTheBodyAfterApproval() {
+    // Arrange
+    val checked = mutableListOf<String>()
+    var runs = 0
+    val remove =
+      node<RemovalTarget, RemovalResult>(
+        "remove_file",
+        requireConfirmation = { _, target ->
+          checked += target.path
+          target.path.startsWith("/prod")
+        },
+      ) { _, _ ->
+        runs += 1
+        RemovalResult(removed = true)
+      }
+    val session = WorkflowSession(removalWorkflow(remove, path = "/prod/db"))
+
+    // Act
+    val asked = session.turn(userMessage("go"))
+    val answered = session.turn(answer(REMOVAL_CONFIRMATION_ID, mapOf("confirmed" to true)))
+
+    // Assert
+    assertEquals(
+      listOf(REMOVAL_CONFIRMATION_ID),
+      asked.flatMap { it.functionCalls() }.map { it.id },
+    )
+    assertEquals(mapOf("removed" to true), answered.replyInput())
+    assertEquals(1, runs)
+    // The resumed run uses the answer without calling the predicate.
+    assertEquals(listOf("/prod/db"), checked)
+  }
+
+  @Test
+  fun requireConfirmationPredicate_typedInputDoesNotMatch_runsTheBodyWithoutAsking() {
+    // Arrange
+    val remove =
+      node<RemovalTarget, RemovalResult>(
+        "remove_file",
+        requireConfirmation = { _, target -> target.path.startsWith("/prod") },
+      ) { _, _ ->
+        RemovalResult(removed = true)
+      }
+
+    // Act
+    val events = WorkflowSession(removalWorkflow(remove, path = "/tmp/a")).turn(userMessage("go"))
+
+    // Assert
+    assertTrue(events.flatMap { it.functionCalls() }.isEmpty())
+    assertEquals(mapOf("removed" to true), events.replyInput())
+  }
+
+  @Test
+  fun requireConfirmationPredicate_rejected_outputsTheRejectionWithoutRunningTheBody() {
+    // Arrange
+    var runs = 0
+    val remove =
+      node<RemovalTarget, RemovalResult>("remove_file", requireConfirmation = { _, _ -> true }) {
+        _,
+        _ ->
+        runs += 1
+        RemovalResult(removed = true)
+      }
+    val session = WorkflowSession(removalWorkflow(remove))
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer(REMOVAL_CONFIRMATION_ID, mapOf("confirmed" to false)))
+
+    // Assert
+    assertEquals(mapOf("error" to "This tool call is rejected."), events.replyInput())
+    assertEquals(0, runs)
+  }
+
+  @Test
+  fun requireConfirmationPredicate_nullAnswer_asksAgainWithoutDecidingAgain() {
+    // Arrange
+    var decisions = 0
+    val remove =
+      node<RemovalTarget, RemovalResult>(
+        "remove_file",
+        requireConfirmation = { _, _ -> (++decisions) == 1 },
+      ) { _, _ ->
+        RemovalResult(removed = true)
+      }
+    val session = WorkflowSession(removalWorkflow(remove))
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer(REMOVAL_CONFIRMATION_ID, mapOf("result" to null)))
+
+    // Assert
+    assertEquals(
+      listOf(REMOVAL_CONFIRMATION_ID),
+      events.flatMap { it.functionCalls() }.mapNotNull { it.id },
+    )
+    assertEquals(1, decisions)
+  }
+
+  @Test
+  fun requireConfirmationPredicate_confirmedNodeWithNoOutput_isNotRerunWhenALaterNodeResumes() {
+    // Arrange
+    var runs = 0
+    val remove =
+      node<Any?, Unit>("remove_file", requireConfirmation = { _, _ -> true }) { _, _ -> runs += 1 }
+    val review = Ask("review", RequestInput(interruptId = "review", message = "Review?"))
+    val session =
+      WorkflowSession(
+        Workflow(name = "wf", edges = listOf(Edge(Start, remove), Edge(remove, review)))
+      )
+    session.advance(userMessage("go"))
+    session.advance(answer("wf_tool_confirmation:wf@1/remove_file@1", mapOf("confirmed" to true)))
+
+    // Act
+    session.advance(answer("review", mapOf("ok" to true)))
+
+    // Assert
+    assertEquals(1, runs)
+  }
+
+  @Test
+  fun requireConfirmationPredicate_parallelNode_eachItemDecidesForItself() {
+    // Arrange
+    val runs = mutableListOf<Long>()
+    val worker =
+      parallelNode<Long, String>("worker", requireConfirmation = { _, item -> item > 1L }) { _, item
+        ->
+        runs += item
+        "done-$item"
+      }
+    val session = WorkflowSession(fanOutWorkflow(worker))
+
+    // Act
+    val asked = session.turn(userMessage("go"))
+
+    // Assert
+    assertEquals(2, asked.flatMap { it.functionCalls() }.size)
+    assertEquals(listOf(1L), runs)
+  }
+
+  @Test
+  fun requireConfirmationPredicate_rerunOnResume_defaultsToTrueAndRejectsFalse() {
+    // Act
+    val noRerunError =
+      assertFailsWith<WorkflowConfigurationException> {
+        node<Any?, Any?>(
+          "no_rerun",
+          rerunOnResume = false,
+          requireConfirmation = { _, _ -> true },
+        ) { _, x ->
+          x
+        }
+      }
+    val defaulted =
+      node<Any?, Any?>("defaulted", requireConfirmation = { _, _ -> true }) { _, x -> x }
+
+    // Assert
+    assertContains(noRerunError.message.orEmpty(), "needs rerunOnResume = true")
+    assertTrue(defaulted.rerunOnResume)
+  }
+
+  @Test
+  fun node_noConfirmationArgument_runsWithoutAskingWhileALambdaPicksThePredicateOverload() {
+    // Arrange
+    val plain = node<Any?, String>("plain") { _, _ -> "ran" }
+    val gated =
+      node<Any?, String>("gated", requireConfirmation = { _, _ -> true }) { _, _ -> "ran" }
+    val reply = CaptureInput("reply")
+    val session =
+      WorkflowSession(Workflow(name = "wf", edges = listOf(Edge(Start, plain), Edge(plain, reply))))
+
+    // Act
+    val events = session.turn(userMessage("go"))
+
+    // Assert
+    assertEquals("ran", events.replyInput())
+    assertTrue(events.none { it.functionCalls().isNotEmpty() })
+    assertFalse(plain.rerunOnResume)
+    assertTrue(gated.rerunOnResume)
+  }
+
+  @Test
+  fun requireConfirmation_rerunOnResume_defaultsToTrueAndRejectsFalse() {
+    // Arrange
+    val misconfigured: List<() -> FunctionNode<*, *>> =
+      listOf(
+        { node<Any?, Any?>("a", rerunOnResume = false, requireConfirmation = true) { _, x -> x } },
+        {
+          parallelNode<Long, Long>("b", rerunOnResume = false, requireConfirmation = true) { _, x ->
+            x
+          }
+        },
+      )
+
+    // Act
+    val built = node<Any?, Any?>("remove_file", requireConfirmation = true) { _, input -> input }
+    val errors = misconfigured.map { assertFailsWith<WorkflowConfigurationException> { it() } }
+
+    // Assert
+    assertTrue(built.rerunOnResume)
+    for (error in errors) assertContains(error.message.orEmpty(), "needs rerunOnResume = true")
+  }
+
+  @Test
+  fun requireConfirmation_answerThatIsNotAConfirmation_failsTheTurn() {
+    // Arrange
+    val remove =
+      node<RemovalTarget, RemovalResult>("remove_file", requireConfirmation = true) { _, _ ->
+        RemovalResult(removed = true)
+      }
+    val session = WorkflowSession(removalWorkflow(remove))
+    session.advance(userMessage("go"))
+
+    // Act
+    val (_, error) =
+      session.failingTurn(answer(REMOVAL_CONFIRMATION_ID, mapOf("confirmed" to "yes")))
+
+    // Assert
+    assertTrue(error is IllegalArgumentException, "expected a validation failure, got $error")
+    assertContains(error.message.orEmpty(), REMOVAL_CONFIRMATION_ID)
   }
 }

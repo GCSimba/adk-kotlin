@@ -25,6 +25,8 @@ import com.google.adk.kt.agents.Context
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
+import com.google.adk.kt.events.ToolConfirmation
+import com.google.adk.kt.events.parseToolConfirmation
 import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.serialization.jsonElementToAny
 import com.google.adk.kt.types.Content
@@ -68,6 +70,10 @@ private constructor(
   internal val itemNode: FunctionNode<*, *>?,
   /** Maximum number of items a parallel node runs at a time, or `null` for no limit. */
   internal val maxParallelWorkers: Int?,
+  /** Whether each run asks the user to approve it before the body runs. */
+  internal val requireConfirmation: Boolean,
+  /** Decides per input whether a run asks the user to approve it, or `null` to not decide. */
+  private val confirmationPredicate: (suspend (Context, I) -> Boolean)?,
   private val body: suspend FlowCollector<Event>.(Context, I) -> O,
 ) :
   BaseNode(
@@ -98,6 +104,8 @@ private constructor(
     outputType: KType,
     itemNode: FunctionNode<*, *>? = null,
     maxParallelWorkers: Int? = null,
+    requireConfirmation: Boolean = false,
+    confirmationPredicate: (suspend (Context, I) -> Boolean)? = null,
     body: suspend FlowCollector<Event>.(Context, I) -> O,
   ) : this(
     name = name,
@@ -112,11 +120,17 @@ private constructor(
     outputCodec = ValueCodec(outputType),
     itemNode = itemNode,
     maxParallelWorkers = maxParallelWorkers,
+    requireConfirmation = requireConfirmation,
+    confirmationPredicate = confirmationPredicate,
     body = body,
   )
 
   internal val inputType: KType
     get() = inputCodec.kType
+
+  /** Whether runs may ask the user to approve them, always or per [confirmationPredicate]. */
+  private val asksForConfirmation: Boolean
+    get() = requireConfirmation || confirmationPredicate != null
 
   internal val outputType: KType
     get() = outputCodec.kType
@@ -127,6 +141,12 @@ private constructor(
       "maxParallelWorkers requires an item node."
     }
     checkMaxParallelWorkers(maxParallelWorkers)
+    if (asksForConfirmation && !this.rerunOnResume) {
+      throw WorkflowConfigurationException(
+        "node '$name' requires confirmation, so it needs rerunOnResume = true to run again once " +
+          "the user answers."
+      )
+    }
   }
 
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
@@ -136,6 +156,12 @@ private constructor(
     }
     // A no-op after validateInput, and it covers a direct call.
     val input = inputCodec.coerce(nodeInput, "input of node '$name'")
+    val confirmation = if (asksForConfirmation) confirmation(context, input) else null
+    if (confirmation?.confirmed == false) {
+      // The rejection is the run's output.
+      emit(REJECTED_OUTPUT)
+      return@flow
+    }
     // An emitted event carries messages and actions only; the output is returned or delegated.
     val events =
       FlowCollector<Event> { event ->
@@ -161,6 +187,41 @@ private constructor(
     if (encoded != null && encoded != delegated) {
       context.requireNodeState().replaceDelegatedOutput(encoded)
     }
+    // An event marks a confirmed run that output nothing as finished, so a later resume skips it.
+    if (confirmation != null && delegated == null && (result == null || result == Unit))
+      emit(Event())
+  }
+
+  /**
+   * Returns the user's answer to this run's confirmation request and sets it as the context's
+   * [Context.toolConfirmation], or null when [confirmationPredicate] decides not to ask. Without an
+   * answer yet, asks for one and ends the run.
+   */
+  private suspend fun FlowCollector<Nothing>.confirmation(
+    context: Context,
+    input: I,
+  ): ToolConfirmation? {
+    val interruptId = "$CONFIRMATION_INTERRUPT_PREFIX${context.nodePath}"
+    val answer = context.resumeInputs[interruptId]
+    if (answer == null) {
+      // A present but null answer asks again without deciding again.
+      val decide = interruptId !in context.resumeInputs && !requireConfirmation
+      if (decide && confirmationPredicate?.invoke(context, input) != true) return null
+      requestInput(
+        interruptId = interruptId,
+        message = "Please approve or reject the tool call $name().",
+        payload =
+          mapOf("tool_name" to name, "args" to inputCodec.encode(input, "input of node '$name'")),
+        responseSchema = TOOL_CONFIRMATION_SCHEMA,
+      )
+    }
+    val confirmation =
+      (answer as? Map<*, *>)?.let(::parseToolConfirmation)
+        ?: throw IllegalArgumentException(
+          "node '$name' got an answer to its confirmation request that is not a ToolConfirmation."
+        )
+    context.toolConfirmation = confirmation
+    return confirmation
   }
 
   /**
@@ -214,6 +275,7 @@ private constructor(
   override fun validateOutput(output: Any?): Any? {
     // A parallel node outputs its items' outputs, which each item node already validated.
     if (itemNode != null) return output
+    if (asksForConfirmation && output == REJECTED_OUTPUT) return output
     // Assigning null produces no output.
     if (output == null) return null
     val what = "output of node '$name'"
@@ -229,6 +291,17 @@ private constructor(
 /** The JSON form of [content], as a session saves it. */
 private fun contentJson(content: Content): Any? =
   jsonElementToAny(adkJson.encodeToJsonElement(Content.serializer(), content))
+
+/** The interrupt id prefix of a node run's confirmation request, followed by the node path. */
+private const val CONFIRMATION_INTERRUPT_PREFIX = "wf_tool_confirmation:"
+
+/** The output of a run the user rejected. */
+private val REJECTED_OUTPUT: Map<String, Any?> = mapOf("error" to "This tool call is rejected.")
+
+/** The schema of a confirmation answer. */
+private val TOOL_CONFIRMATION_SCHEMA: Schema? by lazy {
+  SchemaUtils.inferSchema(typeOf<ToolConfirmation>())
+}
 
 /** Types a node handles by their meaning rather than as data. */
 private val FRAMEWORK_TYPES: Set<KClass<*>> = setOf(Content::class, Event::class)
@@ -266,24 +339,30 @@ internal fun ValueCodec<*>.schemaForm(value: Any?, what: String): Any? =
  * the node's output; emitting an event with an output or calling `Context.setOutput` fails the
  * node. A node that talks to an agent node sends the message with `emit(content)`.
  *
+ * @param rerunOnResume Whether a resume runs the node again rather than using the resuming answer;
+ *   unset, it is true when [requireConfirmation] is true.
+ * @param requireConfirmation Whether each run first asks the user to approve it: pass `true`, or a
+ *   predicate that decides for each input. The request carries the input's JSON form as `args`; a
+ *   rejected run skips the block and outputs `{"error": "This tool call is rejected."}`, and the
+ *   answer is available as [Context.toolConfirmation].
  * @throws WorkflowConfigurationException if [I] or [O] has no usable serializer and is not
- *   `Content`, `Event`, `Any`, or `Unit`.
+ *   `Content`, `Event`, `Any`, or `Unit`, or if [requireConfirmation] is true with `rerunOnResume =
+ *   false`.
  */
 @ExperimentalWorkflowApi
 inline fun <reified I, reified O> node(
   name: String,
   description: String = "",
-  rerunOnResume: Boolean = false,
+  rerunOnResume: Boolean? = null,
   waitForOutput: Boolean = false,
   config: NodeConfig = NodeConfig(),
   inputSchema: Schema? = null,
   outputSchema: Schema? = null,
   stateSchema: Schema? = null,
+  requireConfirmation: Boolean = false,
   crossinline block: suspend FlowCollector<Event>.(context: Context, input: I) -> O,
-): FunctionNode<I, O> {
-  requirePortSerializer(name, "input", typeOf<I>())
-  requirePortSerializer(name, "output", typeOf<O>())
-  return FunctionNode(
+): FunctionNode<I, O> =
+  buildFunctionNode(
     name = name,
     description = description,
     rerunOnResume = rerunOnResume,
@@ -292,8 +371,79 @@ inline fun <reified I, reified O> node(
     inputSchema = inputSchema,
     outputSchema = outputSchema,
     stateSchema = stateSchema,
+    requireConfirmation = requireConfirmation,
+    confirmationPredicate = null,
+    block = block,
+  )
+
+/**
+ * Creates a [FunctionNode] as the other [node] overload does, asking the user to approve a run only
+ * when [requireConfirmation] returns true for its decoded input.
+ *
+ * @param rerunOnResume Whether a resume runs the node again rather than using the resuming answer;
+ *   unset, it is true.
+ * @param requireConfirmation Decides for each input whether a run asks the user to approve it; it
+ *   runs on each run that has no answer yet, and once the node has asked, the answer decides.
+ * @throws WorkflowConfigurationException if [I] or [O] has no usable serializer and is not
+ *   `Content`, `Event`, `Any`, or `Unit`, or with `rerunOnResume = false`.
+ */
+@ExperimentalWorkflowApi
+inline fun <reified I, reified O> node(
+  name: String,
+  description: String = "",
+  rerunOnResume: Boolean? = null,
+  waitForOutput: Boolean = false,
+  config: NodeConfig = NodeConfig(),
+  inputSchema: Schema? = null,
+  outputSchema: Schema? = null,
+  stateSchema: Schema? = null,
+  noinline requireConfirmation: suspend (context: Context, input: I) -> Boolean,
+  crossinline block: suspend FlowCollector<Event>.(context: Context, input: I) -> O,
+): FunctionNode<I, O> =
+  buildFunctionNode(
+    name = name,
+    description = description,
+    rerunOnResume = rerunOnResume,
+    waitForOutput = waitForOutput,
+    config = config,
+    inputSchema = inputSchema,
+    outputSchema = outputSchema,
+    stateSchema = stateSchema,
+    requireConfirmation = false,
+    confirmationPredicate = requireConfirmation,
+    block = block,
+  )
+
+/** Builds the [FunctionNode] that both [node] overloads create. */
+@PublishedApi
+internal inline fun <reified I, reified O> buildFunctionNode(
+  name: String,
+  description: String,
+  rerunOnResume: Boolean?,
+  waitForOutput: Boolean,
+  config: NodeConfig,
+  inputSchema: Schema?,
+  outputSchema: Schema?,
+  stateSchema: Schema?,
+  requireConfirmation: Boolean,
+  noinline confirmationPredicate: (suspend (Context, I) -> Boolean)?,
+  crossinline block: suspend FlowCollector<Event>.(context: Context, input: I) -> O,
+): FunctionNode<I, O> {
+  requirePortSerializer(name, "input", typeOf<I>())
+  requirePortSerializer(name, "output", typeOf<O>())
+  return FunctionNode(
+    name = name,
+    description = description,
+    rerunOnResume = rerunOnResume ?: (requireConfirmation || confirmationPredicate != null),
+    waitForOutput = waitForOutput,
+    config = config,
+    inputSchema = inputSchema,
+    outputSchema = outputSchema,
+    stateSchema = stateSchema,
     inputType = typeOf<I>(),
     outputType = typeOf<O>(),
+    requireConfirmation = requireConfirmation,
+    confirmationPredicate = confirmationPredicate,
     body = { context, input -> block(context, input) },
   )
 }
@@ -350,25 +500,27 @@ private fun isOpenPolymorphic(serializer: KSerializer<*>, classifier: KClassifie
  * the results as a [List] of [O] in input order. A text-only [Content] input, unless [I] is
  * [Content], is read as JSON so a JSON list fans out. Any other non-list input runs as one item.
  *
- * [config], the schemas and [rerunOnResume] apply to each item's run; the fan-out node shares
- * [waitForOutput] and [stateSchema], declares no input or output schema, has no retry or timeout,
- * and always reruns on resume.
+ * [config], the schemas, [rerunOnResume] and [requireConfirmation] apply to each item's run, so
+ * each item asks for its own approval; the fan-out node shares [waitForOutput] and [stateSchema],
+ * declares no input or output schema, has no retry or timeout, and always reruns on resume.
  *
  * @param maxParallelWorkers Maximum number of items run at a time, or `null` for no limit.
- * @throws WorkflowConfigurationException if [maxParallelWorkers] is less than 1, or if [I] or [O]
- *   has no serializer, as in [node].
+ * @param requireConfirmation Whether each item's run first asks the user to approve it: pass
+ *   `true`, or a predicate that decides for each item, as in [node].
+ * @throws WorkflowConfigurationException if [maxParallelWorkers] is less than 1, or as in [node].
  */
 @ExperimentalWorkflowApi
 inline fun <reified I, reified O> parallelNode(
   name: String,
   description: String = "",
-  rerunOnResume: Boolean = false,
+  rerunOnResume: Boolean? = null,
   waitForOutput: Boolean = false,
   maxParallelWorkers: Int? = null,
   config: NodeConfig = NodeConfig(),
   inputSchema: Schema? = null,
   outputSchema: Schema? = null,
   stateSchema: Schema? = null,
+  requireConfirmation: Boolean = false,
   crossinline block: suspend FlowCollector<Event>.(context: Context, input: I) -> O,
 ): FunctionNode<List<I>, List<O>> =
   parallelNode(
@@ -382,6 +534,47 @@ inline fun <reified I, reified O> parallelNode(
         inputSchema = inputSchema,
         outputSchema = outputSchema,
         stateSchema = stateSchema,
+        requireConfirmation = requireConfirmation,
+        block = block,
+      ),
+    maxParallelWorkers = maxParallelWorkers,
+  )
+
+/**
+ * Creates a fan-out [FunctionNode] as the other block-form [parallelNode] overload does, asking the
+ * user to approve an item's run only when [requireConfirmation] returns true for that item. The
+ * predicate runs on each item's run that has no answer yet; once the item has asked, the answer
+ * decides.
+ *
+ * @param maxParallelWorkers Maximum number of items run at a time, or `null` for no limit.
+ * @throws WorkflowConfigurationException if [maxParallelWorkers] is less than 1, or as in [node].
+ */
+@ExperimentalWorkflowApi
+inline fun <reified I, reified O> parallelNode(
+  name: String,
+  description: String = "",
+  rerunOnResume: Boolean? = null,
+  waitForOutput: Boolean = false,
+  maxParallelWorkers: Int? = null,
+  config: NodeConfig = NodeConfig(),
+  inputSchema: Schema? = null,
+  outputSchema: Schema? = null,
+  stateSchema: Schema? = null,
+  noinline requireConfirmation: suspend (context: Context, input: I) -> Boolean,
+  crossinline block: suspend FlowCollector<Event>.(context: Context, input: I) -> O,
+): FunctionNode<List<I>, List<O>> =
+  parallelNode(
+    node =
+      node<I, O>(
+        name = name,
+        description = description,
+        rerunOnResume = rerunOnResume,
+        waitForOutput = waitForOutput,
+        config = config,
+        inputSchema = inputSchema,
+        outputSchema = outputSchema,
+        stateSchema = stateSchema,
+        requireConfirmation = requireConfirmation,
         block = block,
       ),
     maxParallelWorkers = maxParallelWorkers,

@@ -87,15 +87,19 @@ import kotlinx.coroutines.withContext
  * callers can reference. Every member is `final` so subclasses only forward constructor arguments
  * without changing behavior.
  *
- * @property toolConfirmation The tool confirmation of the current tool call.
+ * @param toolConfirmation The tool confirmation of the current tool call.
  */
 open class Context(
   val invocationContext: InvocationContext,
   actions: EventActions? = null,
   final override val functionCallId: String? = null,
-  val toolConfirmation: ToolConfirmation? = null,
+  toolConfirmation: ToolConfirmation? = null,
   final override val eventId: String? = null,
 ) : ReadonlyContext, ReadonlyToolContext {
+
+  /** The user's answer to the current tool call's, or node run's, confirmation request. */
+  var toolConfirmation: ToolConfirmation? = toolConfirmation
+    internal set
 
   /**
    * Creates the context of one node activation.

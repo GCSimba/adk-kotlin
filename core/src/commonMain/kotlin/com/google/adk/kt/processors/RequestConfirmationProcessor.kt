@@ -20,16 +20,13 @@ import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.ToolConfirmation
+import com.google.adk.kt.events.parseToolConfirmation
 import com.google.adk.kt.logging.LoggerFactory
 import com.google.adk.kt.models.LlmRequest
-import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
-import kotlinx.serialization.SerializationException
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.decodeFromJsonElement
 
 /**
  * On every turn, looks at the most recent user event for `FunctionResponse`s named
@@ -270,42 +267,7 @@ internal class RequestConfirmationProcessor : LlmRequestProcessor {
     return FunctionCall(name = name, args = args, id = id)
   }
 
-  private fun parseToolConfirmation(response: Map<String, Any?>?): ToolConfirmation? {
-    if (response == null) return null
-    // Wire format A (ADK client/API wrapper): a single "response" key whose value is the
-    // ToolConfirmation encoded as a JSON string. Mirrors the Java/Python decoders.
-    val unwrapped =
-      if (response.size == 1) {
-        (response[WRAPPED_RESPONSE_KEY] as? String)?.let { jsonString ->
-          try {
-            val element = adkJson.parseToJsonElement(jsonString) as? JsonObject ?: return null
-            adkJson.decodeFromJsonElement<ToolConfirmation>(element)
-          } catch (e: SerializationException) {
-            null
-          } catch (e: IllegalArgumentException) {
-            null
-          }
-        }
-      } else {
-        null
-      }
-    if (unwrapped != null) return unwrapped
-    // Wire format B (direct): the response map already IS the ToolConfirmation.
-    val confirmed = response[ToolConfirmation.CONFIRMED_KEY] as? Boolean ?: return null
-    return ToolConfirmation(
-      confirmed = confirmed,
-      payload = response[ToolConfirmation.PAYLOAD_KEY],
-      hint = response[ToolConfirmation.HINT_KEY] as? String,
-    )
-  }
-
   private companion object {
-    /**
-     * The single key the ADK client/API wrapper uses to nest the ToolConfirmation JSON. Matches the
-     * Java/Python decoders' `"response"` key.
-     */
-    const val WRAPPED_RESPONSE_KEY = "response"
-
     private val logger = LoggerFactory.getLogger(RequestConfirmationProcessor::class)
   }
 }
