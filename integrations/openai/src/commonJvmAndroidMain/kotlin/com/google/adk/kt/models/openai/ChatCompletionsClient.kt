@@ -33,7 +33,8 @@ import io.ktor.http.Headers
 import io.ktor.http.HttpMethod
 import io.ktor.http.content.TextContent
 import io.ktor.http.isSuccess
-import io.ktor.utils.io.readUTF8Line
+import io.ktor.utils.io.LineEnding
+import io.ktor.utils.io.readLine
 import java.io.IOException
 import java.net.URI
 import java.time.Instant
@@ -122,9 +123,9 @@ internal fun bearerAuth(key: String?): Map<String, String> =
 
 /**
  * [ChatCompletionsClient] backed by a Ktor [HttpClient] on the OkHttp engine, as the Gemini model's
- * client is. Cancelling the caller closes the HTTP exchange, except, on Ktor 2, a stream whose body
- * has stalled. [headersProvider] is called before each attempt, so it can hand out a refreshed
- * token; tests pass [retryDelay] and [streamReadTimeout].
+ * client is. Cancelling the caller closes the HTTP exchange. [headersProvider] is called before
+ * each attempt, so it can hand out a refreshed token; tests pass [retryDelay] and
+ * [streamReadTimeout].
  */
 internal class KtorChatCompletionsClient(
   private val headersProvider: () -> Map<String, String>,
@@ -157,12 +158,7 @@ internal class KtorChatCompletionsClient(
         // Bounds the whole attempt and closes it, so a retry does not leave it running.
         timeout?.let { limit ->
           // Ktor rejects zero, which a sub-millisecond timeout would round to.
-          val millis = limit.inWholeMilliseconds.coerceAtLeast(1)
-          httpRequest.timeout {
-            requestTimeoutMillis = millis
-            // Ends a stalled body read, which Ktor 2's OkHttp engine does not interrupt on cancel.
-            socketTimeoutMillis = millis
-          }
+          httpRequest.timeout { requestTimeoutMillis = limit.inWholeMilliseconds.coerceAtLeast(1) }
         }
         sharedHttpClient.prepareRequest(httpRequest).execute { response ->
           val text = response.bodyAsText()
@@ -250,8 +246,11 @@ internal class KtorChatCompletionsClient(
         }
         val body = response.bodyAsChannel()
         while (true) {
-          // Deprecated in Ktor 3 for `readLine`, which Ktor 2 lacks.
-          @Suppress("DEPRECATION") val line = body.readUTF8Line()?.trim() ?: break
+          // Lenient, since SSE also ends a line at a lone CR.
+          val rawLine = body.readLine(LineEnding.Lenient)
+          // Ktor can end a failed read as if the body were complete, or with a cut line.
+          body.closedCause?.let { throw it }
+          val line = rawLine?.trim() ?: break
           if (!line.startsWith("data:")) continue
           val payload = line.removePrefix("data:").trim()
           if (payload.isNotEmpty()) emit(payload)
