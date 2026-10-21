@@ -18,6 +18,7 @@ package com.google.adk.kt.plugins
 
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.callbacks.CallbackChoice
 import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.tools.ToolContext
@@ -49,7 +50,8 @@ import kotlinx.serialization.json.JsonPrimitive
  * @property throwExceptionIfRetryExceeded Once the limit is exceeded, whether to stop handling the
  *   error or to answer with guidance telling the model to stop using the tool. When set, a thrown
  *   error is left to the flow as if the plugin were absent, and an error found in a result is
- *   thrown.
+ *   thrown. If another callback answers an error left to the flow, the plugin passes that answer on
+ *   unchanged and keeps the count.
  * @property trackingScope Whether a tool's failures are counted per invocation or across them.
  * @property resultErrorExtractor Finds errors that tools report in their results instead of
  *   throwing; when `null`, no result counts as a failure.
@@ -73,6 +75,7 @@ class ReflectAndRetryToolPlugin(
 
   private val failureCountsLock = Mutex()
   private val failureCounts = mutableMapOf<FailureCountKey, Int>()
+  private val declinedCallsKey = "$name:declined_calls"
 
   override suspend fun afterTool(
     context: ToolContext,
@@ -82,6 +85,8 @@ class ReflectAndRetryToolPlugin(
   ): Map<String, Any?> {
     // The plugin's guidance comes back here; counting it as a success would reset the budget.
     if (result[RESPONSE_TYPE_KEY] == REFLECT_AND_RETRY_RESPONSE_TYPE) return result
+    // So does another callback's answer to a declined call: neither a success nor a new failure.
+    if (failureCountsLock.withLock { declinedCalls(context).remove(context) }) return result
     val error = resultErrorExtractor?.extractErrorFromResult(context, tool, args, result)
     if (error != null) {
       handleToolError(context, tool, args, error)?.let {
@@ -102,10 +107,14 @@ class ReflectAndRetryToolPlugin(
     tool: BaseTool,
     args: Map<String, Any?>,
     error: Throwable,
-  ): CallbackChoice<Unit, Map<String, Any?>> =
+  ): CallbackChoice<Unit, Map<String, Any?>> {
+    handleToolError(context, tool, args, error)?.let {
+      return CallbackChoice.Break(it)
+    }
     // Past the limit, leave the error to the flow: throwing here would log its message.
-    handleToolError(context, tool, args, error)?.let { CallbackChoice.Break(it) }
-      ?: CallbackChoice.Continue(Unit)
+    failureCountsLock.withLock { declinedCalls(context) += context }
+    return CallbackChoice.Continue(Unit)
+  }
 
   override suspend fun afterRun(invocationContext: InvocationContext) =
     forgetInvocation(invocationContext.invocationId)
@@ -117,6 +126,17 @@ class ReflectAndRetryToolPlugin(
   private suspend fun forgetInvocation(invocationId: String) {
     failureCountsLock.withLock { failureCounts.keys.removeAll { it.invocationId == invocationId } }
   }
+
+  /**
+   * Returns the calls in [context]'s invocation that the plugin left to the flow past the limit, as
+   * their own [ToolContext] instances. Keeping the set in the invocation's data means a call that
+   * never reaches [afterTool] leaves nothing behind once the invocation ends. Call it, and use the
+   * set it returns, only while holding `failureCountsLock`.
+   */
+  @OptIn(FrameworkInternalApi::class)
+  private fun declinedCalls(context: ToolContext): MutableSet<ToolContext> =
+    (context.callbackContextData.getOrPut(declinedCallsKey) { DeclinedCalls() } as DeclinedCalls)
+      .contexts
 
   private fun failureCountKey(context: ToolContext, tool: BaseTool): FailureCountKey =
     FailureCountKey(
@@ -278,6 +298,8 @@ ${formatJson(args)}
   }
 
   private data class FailureCountKey(val invocationId: String?, val toolName: String)
+
+  private class DeclinedCalls(val contexts: MutableSet<ToolContext> = mutableSetOf())
 
   /**
    * Fluent builder for [ReflectAndRetryToolPlugin], provided primarily for Java callers. Any

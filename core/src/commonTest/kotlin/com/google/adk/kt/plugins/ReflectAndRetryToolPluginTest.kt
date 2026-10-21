@@ -19,6 +19,7 @@ package com.google.adk.kt.plugins
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.callbacks.CallbackChoice
+import com.google.adk.kt.callbacks.OnToolErrorCallback
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.plugins.ReflectAndRetryToolPlugin.TrackingScope
 import com.google.adk.kt.runners.InMemoryRunner
@@ -372,6 +373,17 @@ class ReflectAndRetryToolPluginTest {
   }
 
   @Test
+  fun afterTool_answerToAnErrorLeftToTheFlow_passesItThroughUnchecked() = runBlocking {
+    val plugin = statusErrorPlugin(maxRetries = 0)
+    val unused = plugin.onToolError(toolContext, tool, args, IllegalStateException("boom"))
+    val errorShapedAnswer = mapOf("status" to "error", "message" to "Handled by another callback")
+
+    val passedThrough = plugin.afterTool(toolContext, tool, args, errorShapedAnswer)
+
+    assertEquals(errorShapedAnswer, passedThrough)
+  }
+
+  @Test
   fun onToolError_nonRetryableError_givesUpWithoutThrowing() = runBlocking {
     val plugin = ReflectAndRetryToolPlugin(retryPredicate = { _, _, _, _ -> false })
 
@@ -635,6 +647,46 @@ class ReflectAndRetryToolPluginTest {
       }
 
     assertEquals("Still failing", thrown.message)
+  }
+
+  @Test
+  fun runAsync_agentCallbackAnswersPastTheLimit_limitHoldsUntilASuccess() = runBlocking {
+    val ok = mapOf("result" to "ok")
+    val flakyTool =
+      DummyTool(name = "flaky_tool") { _, toolArgs ->
+        if (toolArgs["fail"] == true) throw IllegalStateException("Still failing")
+        ok
+      }
+    val model =
+      DummyModel.createSequential(
+        "mock-model",
+        listOf(
+          modelFunctionCallResponse("flaky_tool", mapOf("fail" to true), id = "call_1"),
+          modelFunctionCallResponse("flaky_tool", mapOf("fail" to true), id = "call_2"),
+          modelFunctionCallResponse("flaky_tool", mapOf("fail" to true), id = "call_3"),
+          modelFunctionCallResponse("flaky_tool", mapOf("fail" to false), id = "call_4"),
+          modelFunctionCallResponse("flaky_tool", mapOf("fail" to true), id = "call_5"),
+          LlmResponse(content = modelMessage("Done.")),
+        ),
+      )
+    val handled = mapOf("handled" to true)
+    val agent =
+      LlmAgent(
+        name = "root_agent",
+        model = model,
+        tools = listOf(flakyTool),
+        onToolErrorCallbacks =
+          listOf(OnToolErrorCallback { _, _, _, _ -> CallbackChoice.Break(handled) }),
+      )
+
+    val events =
+      InMemoryRunner(agent = agent, plugins = listOf(ReflectAndRetryToolPlugin(maxRetries = 1)))
+        .runAsync(userId = "user1", sessionId = "session1", newMessage = userMessage("test"))
+        .toList()
+
+    val responses = events.flatMap { it.functionResponses() }.map { it.response }
+    assertEquals(listOf(1, null, null, null, 1), responses.map { it["retry_count"] })
+    assertEquals(listOf(handled, handled, ok), responses.slice(1..3))
   }
 
   private suspend fun ReflectAndRetryToolPlugin.answerError(
