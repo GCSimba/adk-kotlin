@@ -23,6 +23,7 @@ import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.LoopAgent
 import com.google.adk.kt.agents.RunConfig
 import com.google.adk.kt.agents.SequentialAgent
+import com.google.adk.kt.agents.openLiveRun
 import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.testing.DummyModel
@@ -156,7 +157,7 @@ class BasicRequestProcessorTest {
         )
       val context =
         InvocationContext(session = testSession(), runConfig = null, agent = agent).apply {
-          frameworkData.liveRequestQueue = LiveRequestQueue()
+          openLiveRun(LiveRequestQueue())
         }
 
       val request = BasicRequestProcessor().process(context, LlmRequest())
@@ -184,7 +185,7 @@ class BasicRequestProcessorTest {
       )
     val context =
       InvocationContext(session = testSession(), runConfig = null, agent = agent).apply {
-        frameworkData.liveRequestQueue = LiveRequestQueue()
+        openLiveRun(LiveRequestQueue())
       }
 
     val request = BasicRequestProcessor().process(context, LlmRequest())
@@ -202,7 +203,7 @@ class BasicRequestProcessorTest {
     val unused = SequentialAgent(name = "workflow", subAgents = listOf(step))
     val context =
       InvocationContext(session = testSession(), runConfig = null, agent = step).apply {
-        frameworkData.liveRequestQueue = LiveRequestQueue()
+        openLiveRun(LiveRequestQueue())
       }
 
     val request = BasicRequestProcessor().process(context, LlmRequest())

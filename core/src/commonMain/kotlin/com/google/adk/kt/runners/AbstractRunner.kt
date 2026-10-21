@@ -20,13 +20,13 @@ import com.google.adk.kt.agents.BaseAgent
 import com.google.adk.kt.agents.ContextCacheConfig
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.LiveRequestQueue
+import com.google.adk.kt.agents.LiveRun
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.ResumabilityConfig
 import com.google.adk.kt.agents.RunConfig
-import com.google.adk.kt.agents.appendLiveEvent
 import com.google.adk.kt.agents.boundedFlush
 import com.google.adk.kt.agents.findAgent
-import com.google.adk.kt.agents.flushLiveSession
+import com.google.adk.kt.agents.openLiveRun
 import com.google.adk.kt.agents.signalsTaskCompleted
 import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
@@ -275,8 +275,10 @@ abstract class AbstractRunner : Runner {
         val key = SessionKey(appName, userId, sessionId)
         val session = sessionService.getSession(key) ?: sessionService.createSession(key)
         runThenFlush(flush = { sessionService.boundedFlush(session.key) }) {
-          val context = createLiveInvocationContext(session, liveRequestQueue, runConfig)
-          emitAll(runAgentWithPlugins(context, isLiveCall = true).notifyingRunError(context))
+          val context = createLiveInvocationContext(session, runConfig)
+          // Copies share frameworkData by reference, so every context derived later sees the run.
+          val liveRun = context.openLiveRun(liveRequestQueue)
+          emitAll(runAgentWithPlugins(context, liveRun).notifyingRunError(context))
         }
       }
       // ADK Python opens no live invocation span; keep agent spans in the caller's trace.
@@ -290,7 +292,6 @@ abstract class AbstractRunner : Runner {
    */
   private suspend fun createLiveInvocationContext(
     session: Session,
-    liveRequestQueue: LiveRequestQueue,
     runConfig: RunConfig?,
   ): InvocationContext {
     // No run config means the defaults, as in ADK Python, and those transcribe both sides.
@@ -311,8 +312,6 @@ abstract class AbstractRunner : Runner {
         eventsCompactionConfig = eventsCompactionConfig,
         contextCacheConfig = contextCacheConfig,
       )
-    // Copies share frameworkData by reference, so the routed context carries the queue too.
-    context.frameworkData.liveRequestQueue = liveRequestQueue
     return routeToAgentToRun(context)
   }
 
@@ -681,10 +680,10 @@ abstract class AbstractRunner : Runner {
    * @return A [Flow] of [Event]s generated during the execution.
    */
   protected fun runAgentWithPlugins(context: InvocationContext): Flow<Event> =
-    runAgentWithPlugins(context, isLiveCall = false)
+    runAgentWithPlugins(context, liveRun = null)
 
-  /** Runs the resolved root with plugins, live when [isLiveCall]; see [store]. */
-  private fun runAgentWithPlugins(context: InvocationContext, isLiveCall: Boolean): Flow<Event> {
+  /** Runs the resolved root with plugins, live when [liveRun] is set; see [store]. */
+  private fun runAgentWithPlugins(context: InvocationContext, liveRun: LiveRun?): Flow<Event> {
     return flow {
       // 1. Run beforeRun callback
       val beforeResult = runBeforeRunCallbacksPipeline(pluginManager.beforeRunCallbacks, context)
@@ -700,18 +699,17 @@ abstract class AbstractRunner : Runner {
                 content = beforeResult.value,
               ),
             )
-          store(context, earlyExitEvent, isLiveCall)
+          store(context, earlyExitEvent, liveRun)
           emit(earlyExitEvent)
         }
         is CallbackChoice.Continue -> {
           // 2. Dispatch to the resolved root rather than the runner's root `agent`: on a follow-up
           // user turn, `findAgentToRun` may have selected a sub-agent based on the prior turn's
           // history (see `findAgentToRun` below for the selection rules).
-          runRoot(context, isLiveCall).collect { event ->
+          runRoot(context, isLiveCall = liveRun != null).collect { event ->
             // Persist the post-callback event so the session matches what the caller received.
             val finalEvent = processEventWithPluginCallbacks(context, event)
-            store(context, finalEvent, isLiveCall)
-            // Emit outside the lock so a slow caller never stalls the live turn's own appends.
+            store(context, finalEvent, liveRun)
             emit(finalEvent)
           }
         }
@@ -735,19 +733,18 @@ abstract class AbstractRunner : Runner {
 
   /**
    * Appends [event] to the session unless it is partial or a live run's event carries inline audio,
-   * video, or image. [runAsync] flushes a final response; [runLive] flushes only an event that ends
-   * a turn ([endsLiveTurn]). A live run goes through [appendLiveEvent] and [flushLiveSession],
-   * which share the live turn's lock and time out if the session service hangs. Other inline data
-   * and the `fileData` references [com.google.adk.kt.agents.LiveRunConfig.saveLiveBlob] produces
-   * are still stored.
+   * video, or image (other inline data and `fileData` references from
+   * [com.google.adk.kt.agents.LiveRunConfig.saveLiveBlob] are still stored). [runAsync] flushes a
+   * final response; [runLive] flushes only an event that ends a turn ([endsLiveTurn]). A live run
+   * goes through [LiveRun.append] and [LiveRun.flush], which time out if the session service hangs.
    */
-  private suspend fun store(context: InvocationContext, event: Event, isLiveCall: Boolean) {
+  private suspend fun store(context: InvocationContext, event: Event, liveRun: LiveRun?) {
     // A partial event is superseded by its whole, so it is never stored, as in ADK Python.
     if (event.partial) return
-    if (isLiveCall) {
+    if (liveRun != null) {
       // Inline media stays out of the session, but a turn it ends is still flushed.
-      if (!event.hasInlineMedia()) context.appendLiveEvent(event)
-      if (event.endsLiveTurn()) context.flushLiveSession()
+      if (!event.hasInlineMedia()) liveRun.append(event)
+      if (event.endsLiveTurn()) liveRun.flush()
     } else {
       appendAndFlushIfFinal(context, event)
     }

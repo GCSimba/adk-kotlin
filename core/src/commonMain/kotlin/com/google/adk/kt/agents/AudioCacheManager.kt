@@ -42,7 +42,7 @@ internal class RealtimeCacheEntry(
 /**
  * One side's audio since the last flush.
  *
- * It lives on the context, so a restarted turn keeps recording into it; a transfer or a completed
+ * It lives on the [LiveRun], so a restarted turn keeps recording into it; a transfer or a completed
  * step saves it first, so the next agent starts empty. Its state stays private behind [add] and
  * [take], under a lock, because the send and receive coroutines both reach it.
  */
@@ -74,10 +74,12 @@ internal class RealtimeCache {
  * Collects a live run's audio and writes it to the artifact service a turn at a time, as
  * [LiveRunConfig.saveLiveBlob] asks.
  *
- * Chunks accumulate on the context's [RealtimeCache]s. When a turn ends, [flush] joins each side's
+ * Chunks accumulate on the live run's [RealtimeCache]s. When a turn ends, [flush] joins each side's
  * chunks into one artifact and returns an event that references it.
  */
 internal class AudioCacheManager(private val context: InvocationContext) {
+
+  private val liveRun: LiveRun = checkNotNull(context.liveRun) { "only a live run records audio" }
 
   /**
    * Caches a chunk the caller sent; a chunk without a mime type is recorded as
@@ -88,7 +90,7 @@ internal class AudioCacheManager(private val context: InvocationContext) {
     val mimeType = blob.mimeType?.takeIf { it.isNotBlank() } ?: DEFAULT_AUDIO_INPUT_MIME_TYPE
     if (!mimeType.startsWith("audio/")) return
     // A copy, since callers often refill one capture buffer for every chunk.
-    context.frameworkData.inputRealtimeCache.add(
+    liveRun.inputRealtimeCache.add(
       Role.USER,
       blob.copy(mimeType = mimeType, data = blob.data?.copyOf()),
     )
@@ -98,7 +100,7 @@ internal class AudioCacheManager(private val context: InvocationContext) {
   suspend fun cacheOutput(blob: Blob) {
     // Audio only: every downstream step names and joins the cache as one audio file.
     if (blob.mimeType?.startsWith("audio/") != true) return
-    context.frameworkData.outputRealtimeCache.add(Role.MODEL, blob)
+    liveRun.outputRealtimeCache.add(Role.MODEL, blob)
   }
 
   /**
@@ -116,9 +118,8 @@ internal class AudioCacheManager(private val context: InvocationContext) {
   /** Empties the requested caches now, so a turn boundary stays exact while [write] runs later. */
   suspend fun take(flushUserAudio: Boolean, flushModelAudio: Boolean): TakenAudio =
     TakenAudio(
-      input = if (flushUserAudio) context.frameworkData.inputRealtimeCache.take() else emptyList(),
-      output =
-        if (flushModelAudio) context.frameworkData.outputRealtimeCache.take() else emptyList(),
+      input = if (flushUserAudio) liveRun.inputRealtimeCache.take() else emptyList(),
+      output = if (flushModelAudio) liveRun.outputRealtimeCache.take() else emptyList(),
     )
 
   /**

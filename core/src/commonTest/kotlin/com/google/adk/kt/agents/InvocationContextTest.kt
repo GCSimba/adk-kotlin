@@ -16,6 +16,7 @@
 
 package com.google.adk.kt.agents
 
+import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.callbacks.AfterToolCallback
 import com.google.adk.kt.callbacks.BeforeToolCallback
 import com.google.adk.kt.callbacks.CallbackChoice
@@ -46,12 +47,14 @@ import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
+import com.google.common.truth.Truth.assertThat
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -136,6 +139,40 @@ class InvocationContextTest {
     childContext.incrementLlmCallsCount()
 
     assertThrows(LlmCallsLimitExceededException::class.java) { context.incrementLlmCallsCount() }
+  }
+
+  @OptIn(ExperimentalLiveApi::class)
+  @Test
+  fun liveRun_isSharedAcrossDerivedContexts() {
+    // Every context a live run derives shares the run's request queue and audio caches.
+    val context = testInvocationContext()
+    val child = DummyAgent("child-agent")
+    LiveRequestQueue().use { queue ->
+      val liveRun = context.openLiveRun(queue)
+
+      assertSame("copy", liveRun, context.copy(branch = "other").liveRun)
+      assertSame("forAgent", liveRun, context.forAgent(child).liveRun)
+      assertSame("forLiveChild", liveRun, context.forLiveChild(child).liveRun)
+      assertSame("branch", liveRun, context.branch(child).liveRun)
+    }
+  }
+
+  @OptIn(ExperimentalLiveApi::class)
+  @Test
+  fun openLiveRun_whenTheContextAlreadyHasOne_throws() {
+    val context = testInvocationContext()
+    LiveRequestQueue().use { queue ->
+      val liveRun = context.openLiveRun(queue)
+
+      // A derived context shares the run, so it cannot open another one either.
+      val failure =
+        assertThrows(IllegalStateException::class.java) {
+          context.forAgent(DummyAgent("child-agent")).openLiveRun(queue)
+        }
+
+      assertThat(failure).hasMessageThat().isEqualTo("a live run is already open")
+      assertThat(context.liveRun).isSameInstanceAs(liveRun)
+    }
   }
 
   @Test

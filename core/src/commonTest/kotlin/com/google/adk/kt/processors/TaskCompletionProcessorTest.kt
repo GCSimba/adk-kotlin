@@ -19,6 +19,7 @@ package com.google.adk.kt.processors
 import com.google.adk.kt.agents.LiveRequestQueue
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.SequentialAgent
+import com.google.adk.kt.agents.openLiveRun
 import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.testing.DummyModel
@@ -41,9 +42,7 @@ class TaskCompletionProcessorTest {
 
   /** A context that runs [agent] live: one whose run has a live request queue. */
   private fun liveContextFor(agent: LlmAgent) =
-    testInvocationContext(agent = agent).apply {
-      frameworkData.liveRequestQueue = LiveRequestQueue()
-    }
+    testInvocationContext(agent = agent).apply { openLiveRun(LiveRequestQueue()) }
 
   @Test
   fun processRequest_onALiveSequentialStep_offersTheToolAndInstruction() = runBlocking {

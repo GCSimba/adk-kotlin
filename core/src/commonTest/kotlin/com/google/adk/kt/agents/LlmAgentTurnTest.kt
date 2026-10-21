@@ -87,6 +87,7 @@ import com.google.adk.kt.types.TurnCompleteReason
 import com.google.adk.kt.types.UsageMetadata
 import com.google.adk.kt.types.VoiceActivity
 import com.google.adk.kt.types.VoiceActivityType
+import com.google.common.truth.Truth.assertThat
 import com.google.genai.kotlin.GenAiApiException
 import kotlin.random.Random
 import kotlin.test.assertFailsWith
@@ -96,7 +97,6 @@ import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
@@ -110,9 +110,6 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -1686,71 +1683,6 @@ class LlmAgentTurnTest {
   }
 
   @Test
-  fun runLive_sessionAppends_neverOverlapTheCallersAppends() = runBlocking {
-    val agent =
-      liveAgent(
-        RecordingLiveConnection(
-          listOf(LlmResponse(content = modelMessage("hi")), turnComplete()),
-          untilClosed = true,
-        ),
-        beforeModelCallbacks = listOf(writeStateAndContinue("c", "d")),
-      )
-    val sessionService = OverlapCheckingSessionService()
-    val key = SessionKey("app", "user", "append-lock")
-    val session = sessionService.createSession(key)
-    val queue = LiveRequestQueue()
-    queue.send(LiveRequest(stateDelta = mapOf("k" to "v")))
-    queue.sendContent(userMessage("typed"))
-    queue.close()
-    val context = liveContextFor(agent, queue, session = session, sessionService = sessionService)
-
-    // Appends each event under the context's lock, as the runner does.
-    agent.runLive(context).collect { event ->
-      if (!event.partial) {
-        val unused =
-          context.sessionAppendLock.withLock { sessionService.appendEvent(session, event) }
-      }
-    }
-
-    val stored = checkNotNull(sessionService.getSession(key))
-    assertEquals("v", stored.state["k"])
-    assertEquals("d", stored.state["c"])
-    assertTrue(stored.events.any { it.content?.parts?.firstOrNull()?.text == "hi" })
-  }
-
-  @Test
-  fun runLive_callerAppendingUnderTheLock_neverDeadlocksTheTurn() = runBlocking {
-    val agent =
-      liveAgent(
-        RecordingLiveConnection(
-          listOf(LlmResponse(content = modelMessage("hi")), turnComplete()),
-          untilClosed = true,
-        ),
-        beforeModelCallbacks = listOf(writeStateAndContinue("c", "d")),
-      )
-    val sessionService = InMemorySessionService()
-    val key = SessionKey("app", "user", "append-no-deadlock")
-    val session = sessionService.createSession(key)
-    val queue = LiveRequestQueue()
-    queue.send(LiveRequest(stateDelta = mapOf("k" to "v")))
-    queue.sendContent(userMessage("typed"))
-    queue.close()
-    val context = liveContextFor(agent, queue, session = session, sessionService = sessionService)
-
-    // A turn emitting under the lock would deadlock against this caller; the timeout fails it.
-    withTimeout(10.seconds) {
-      agent.runLive(context).collect { event ->
-        val unused =
-          context.sessionAppendLock.withLock { sessionService.appendEvent(session, event) }
-      }
-    }
-
-    val stored = checkNotNull(sessionService.getSession(key))
-    assertEquals("v", stored.state["k"])
-    assertEquals("d", stored.state["c"])
-  }
-
-  @Test
   fun runLive_dropAfterTheUserTurnIsStored_doesNotStoreItTwice() = runTest {
     val committed = CompletableDeferred<Unit>()
     val sessionService = CommitThenYieldSessionService({ it.author == Role.USER }, committed)
@@ -1884,87 +1816,6 @@ class LlmAgentTurnTest {
       )
       assertTrue(failure.message?.contains("hi") != true, "the error echoed the payload")
     }
-
-  @Test
-  fun runLive_appendWaitingForAHeldLock_appendsOnceItIsReleased() = runTest {
-    // Every holder's work is bounded, so a held lock delays the append instead of failing the run.
-    val inner = InMemorySessionService()
-    val key = SessionKey("app", "user", "held-lock")
-    val queue = LiveRequestQueue()
-    queue.sendContent(userMessage("hi"))
-    queue.close()
-    val connection = ScriptedConn("c0") { it.closed.await() }
-    val agent = LlmAgent(name = "live_agent", model = RecordingLiveModel(connection))
-    val context =
-      liveContextFor(agent, queue, session = inner.createSession(key), sessionService = inner)
-    // Another appender holds the lock.
-    context.sessionAppendLock.lock()
-
-    val run = async { agent.runLive(context).toList() }
-    advanceTimeBy(30_000)
-
-    assertTrue(run.isActive, "the run gave up waiting for the held lock")
-    context.sessionAppendLock.unlock()
-    run.await()
-    assertEquals(1, checkNotNull(inner.getSession(key)).events.count { it.author == Role.USER })
-  }
-
-  @Test
-  fun runLive_cancelledWhileWaitingForAHeldLock_stopsWaiting() = runTest {
-    // A user turn's wait for the lock stays cancellable, so cancelling the run does not hang on it.
-    val inner = InMemorySessionService()
-    val key = SessionKey("app", "user", "held-lock-cancel")
-    val queue = LiveRequestQueue()
-    queue.sendContent(userMessage("hi"))
-    val connection = ScriptedConn("c0") { it.closed.await() }
-    val agent = LlmAgent(name = "live_agent", model = RecordingLiveModel(connection))
-    val context =
-      liveContextFor(agent, queue, session = inner.createSession(key), sessionService = inner)
-    context.sessionAppendLock.lock()
-    val run = launch { agent.runLive(context).toList() }
-    runCurrent()
-    assertTrue(run.isActive, "the run should be waiting for the held lock")
-
-    run.cancelAndJoin()
-
-    assertTrue(run.isCancelled)
-    assertTrue(
-      context.sessionAppendLock.isLocked,
-      "the cancelled run released a lock it never held",
-    )
-    assertEquals(0, checkNotNull(inner.getSession(key)).events.count { it.author == Role.USER })
-    context.sessionAppendLock.unlock()
-  }
-
-  @Test
-  fun runLive_cancelledWhileAStateDeltaWaitsForAHeldLock_stopsWaiting() = runTest {
-    // A state-only request's wait for the lock is cancellable too, like a user turn's.
-    val inner = InMemorySessionService()
-    val key = SessionKey("app", "user", "held-lock-delta")
-    val queue = LiveRequestQueue()
-    queue.send(LiveRequest(stateDelta = mapOf("k" to "v")))
-    val connection = ScriptedConn("c0") { it.closed.await() }
-    val agent = LlmAgent(name = "live_agent", model = RecordingLiveModel(connection))
-    val context =
-      liveContextFor(agent, queue, session = inner.createSession(key), sessionService = inner)
-    context.sessionAppendLock.lock()
-    val run = launch { agent.runLive(context).toList() }
-    runCurrent()
-    assertTrue(run.isActive, "the run should still be running before the cancel")
-
-    try {
-      // A wait that ignored the cancel fails here instead of hanging the test.
-      withTimeout(1.seconds) { run.cancelAndJoin() }
-      assertTrue(run.isCancelled)
-      assertTrue(
-        context.sessionAppendLock.isLocked,
-        "the cancelled run released a lock it never held",
-      )
-      assertEquals(0, checkNotNull(inner.getSession(key)).events.count { it.author == Role.USER })
-    } finally {
-      context.sessionAppendLock.unlock()
-    }
-  }
 
   @Test
   fun runLive_stateWrites_addNoEventToTheStream() = runBlocking {
@@ -2274,8 +2125,9 @@ class LlmAgentTurnTest {
     val unused = agent.runLive(context).toList()
 
     // With nowhere to save a recording, neither side's audio is held for one.
-    assertEquals(0, context.frameworkData.inputRealtimeCache.take().size)
-    assertEquals(0, context.frameworkData.outputRealtimeCache.take().size)
+    val liveRun = checkNotNull(context.liveRun)
+    assertEquals(0, liveRun.inputRealtimeCache.take().size)
+    assertEquals(0, liveRun.outputRealtimeCache.take().size)
   }
 
   private fun modelAudio(vararg bytes: Byte) =
@@ -2434,7 +2286,7 @@ class LlmAgentTurnTest {
         sessionService = sessionService,
         artifactService = artifactService,
       )
-      .apply { frameworkData.liveRequestQueue = queue }
+      .apply { openLiveRun(queue) }
 
   /**
    * Commits an append, then suspends, so a drop can cancel the caller after the commit is stored.
@@ -2451,26 +2303,6 @@ class LlmAgentTurnTest {
         yield()
       }
       return stored
-    }
-  }
-
-  /**
-   * Fails an append that starts while another is still running, as `RoomSessionService` rejects one
-   * that read the session before the other committed.
-   */
-  private class OverlapCheckingSessionService(
-    private val inner: InMemorySessionService = InMemorySessionService()
-  ) : SessionService by inner {
-    private val appending = Mutex()
-
-    override suspend fun appendEvent(session: Session, event: Event): Event {
-      check(appending.tryLock()) { "Overlapping appends to one session" }
-      try {
-        delay(50)
-        return inner.appendEvent(session, event)
-      } finally {
-        appending.unlock()
-      }
     }
   }
 
@@ -7450,6 +7282,28 @@ class LlmAgentTurnTest {
   }
 
   @Test
+  fun runLive_unstoredTurnWriteFailsBeforeACleanClose_endsTheRunNormally() = runTest {
+    // Without a session service the turn is never stored, so a failed write is dropped, not raised.
+    LiveRequestQueue().use { queue ->
+      queue.sendContent(userMessage("hello"))
+      val sendFailed = CompletableDeferred<Unit>()
+      val first = ScriptedConn("c0") { sendFailed.await() }
+      first.onSendContent = {
+        sendFailed.complete(Unit)
+        throw IllegalStateException("bad frame")
+      }
+      val model = RecordingLiveModel(first)
+      val agent = LlmAgent(name = "live_agent", model = model)
+
+      val failure =
+        runCatching { agent.runLive(liveContextFor(agent, queue)).toList() }.exceptionOrNull()
+
+      assertThat(failure).isNull()
+      assertThat(model.connectCalls).isEqualTo(1)
+    }
+  }
+
+  @Test
   fun runLive_audioWriteFailsBeforeACleanClose_endsTheRunNormally() = runTest {
     // An audio frame is never stored, so a clean close with no handle ends normally, as in Python.
     val sessionService = InMemorySessionService()
@@ -7821,7 +7675,7 @@ class LlmAgentTurnTest {
           sessionService = sessionService,
           branch = "root.child",
         )
-        .apply { frameworkData.liveRequestQueue = queue }
+        .apply { openLiveRun(queue) }
 
     agent.runLive(context).toList()
 

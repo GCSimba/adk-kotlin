@@ -149,6 +149,10 @@ internal class LlmAgentTurn(
     }
   }
 
+  /** Returns this turn's live run, which the runner opens before any live turn starts. */
+  private fun liveRun(): LiveRun =
+    checkNotNull(context.liveRun) { "a live run needs a live request queue on its context" }
+
   /**
    * The request the send loop has taken off the queue but not yet written.
    *
@@ -345,10 +349,7 @@ internal class LlmAgentTurn(
   private suspend fun runLiveSession(collector: FlowCollector<Event>): Boolean {
     if (context.isEndOfInvocation) return false
 
-    val queue =
-      checkNotNull(context.liveRequestQueue) {
-        "a live run needs a live request queue on its context"
-      }
+    val queue = liveRun().requestQueue
     val request =
       when (val prepared = prepareRequest { collector.emit(it) }) {
         is RequestOrResponse.Request -> prepared.request
@@ -569,7 +570,7 @@ internal class LlmAgentTurn(
    * model's output or spoken input. Records how it stopped in [result]; the flow completes only
    * once the sender has stopped.
    */
-  // Only the sender writes the connection; the turn and its caller append under one shared lock.
+  // Only the sender writes the connection; the session service must accept concurrent appends.
   @Suppress("UnsafeCoroutineCrossing")
   private fun collectLiveTurns(
     request: LlmRequest,
@@ -942,8 +943,9 @@ internal class LlmAgentTurn(
     answersTools: Boolean,
   ): Boolean {
     if (input.partial || answersTools) return false
-    if (context.sessionService == null) return false
-    context.appendLiveEvent(
+    val liveRun = liveRun()
+    if (!liveRun.storesEvents) return false
+    liveRun.append(
       Event(
         invocationId = context.invocationId,
         author = Role.USER,
@@ -964,15 +966,14 @@ internal class LlmAgentTurn(
         author = Role.USER,
         actions = EventActions(stateDelta = delta.toMutableMap()),
       )
-    // Like a user turn, a delta still waiting for the lock is dropped if the run ends or restarts.
-    context.appendLiveEvent(event)
+    liveRun().append(event)
   }
 
   /** Saves a continuing callback's state and artifact writes on an event of their own. */
   private suspend fun saveCallbackWrites(callbackContext: CallbackContext) {
     val actions = callbackContext.eventActions
     if (actions.stateDelta.isEmpty() && actions.artifactDelta.isEmpty()) return
-    context.appendLiveEvent(createModelResponseEvent().copy(actions = actions.snapshot()))
+    liveRun().append(createModelResponseEvent().copy(actions = actions.snapshot()))
   }
 
   /**

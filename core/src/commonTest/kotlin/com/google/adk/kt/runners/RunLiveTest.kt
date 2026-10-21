@@ -21,6 +21,7 @@ package com.google.adk.kt.runners
 import com.google.adk.kt.agents.BaseAgent
 import com.google.adk.kt.agents.Context
 import com.google.adk.kt.agents.InvocationContext
+import com.google.adk.kt.agents.LiveRequest
 import com.google.adk.kt.agents.LiveRequestQueue
 import com.google.adk.kt.agents.LiveRunConfig
 import com.google.adk.kt.agents.LlmAgent
@@ -71,7 +72,6 @@ import kotlin.coroutines.cancellation.CancellationException
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration.Companion.seconds
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -81,7 +81,6 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
 /** Covers the live entry point on the runner and the agent contract underneath it. */
@@ -252,38 +251,6 @@ class RunLiveTest {
     val root = LlmAgent(name = "root", model = model, subAgents = subAgents)
     val unused = runLiveWith(InMemoryRunner(agent = root), runConfig)
     return model.connectRequests.single().liveConnectConfig
-  }
-
-  /**
-   * Rejects an append or flush that starts while another is still running, as a stale-checking
-   * store does.
-   */
-  private class OverlapRejectingSessionService(
-    private val delegate: SessionService = InMemorySessionService()
-  ) : SessionService by delegate {
-    private var busy = false
-    var flushes = 0
-      private set
-
-    override suspend fun appendEvent(session: Session, event: Event): Event = exclusively {
-      delegate.appendEvent(session, event)
-    }
-
-    override suspend fun flush(key: SessionKey?) {
-      exclusively { flushes += 1 }
-    }
-
-    private suspend fun <T> exclusively(call: suspend () -> T): T {
-      check(!busy) { "Stale session: a call overlapped another" }
-      busy = true
-      try {
-        // Holds the call open long enough for an unlocked caller to overlap it.
-        delay(5)
-        return call()
-      } finally {
-        busy = false
-      }
-    }
   }
 
   /**
@@ -760,57 +727,59 @@ class RunLiveTest {
   }
 
   @Test
-  fun runLive_runnerAndTurnAppends_neverOverlap(): Unit = runBlocking {
-    // The session service fails the run if a runner append overlaps a live-turn append.
-    val script = listOf(wholeText("one"), wholeText("two"), wholeText("three"), turnCompleteStep())
-    val runner =
-      InMemoryRunner(
-        agent = LlmAgent(name = "live_agent", model = DummyLiveModel(script)),
-        sessionService = OverlapRejectingSessionService(),
-      )
+  fun runLive_stateDeltaStoredDuringASlowRunnerAppend_storesEveryEventOnce(): Unit = runTest {
+    // The live turn stores a state change while the runner is still storing the reply.
     val queue = LiveRequestQueue()
-    repeat(3) { queue.sendContent(userMessage("hi $it")) }
-
-    val events =
-      withTimeout(10.seconds) {
-        runner.runLive("u", "s", queue).onEach { if (it.turnComplete) queue.close() }.toList()
-      }
-
-    assertThat(events.any { it.turnComplete }).isTrue()
-  }
-
-  @Test
-  fun runLive_flushNeverOverlapsAnAppend(): Unit = runBlocking {
-    // The flush runs inside the append lock, so the turn cannot store a request meanwhile.
-    val script =
-      listOf(
-        wholeText("one"),
-        turnCompleteStep(),
-        wholeText("two"),
-        turnCompleteStep(),
-        wholeText("three"),
-        turnCompleteStep(),
+    val sessionService =
+      AppendRecordingSessionService(
+        beforeAppend = {
+          if (it.content?.parts?.singleOrNull()?.text == "hello") {
+            queue.send(LiveRequest(stateDelta = mapOf("k" to "v")))
+            delay(6.seconds)
+          }
+        },
+        // Each call stays within its own bound, though the append and flush together pass it.
+        beforeFlush = { delay(6.seconds) },
       )
-    val sessionService = OverlapRejectingSessionService()
+    val model =
+      DummyLiveModel(
+        listOf(
+          AwaitSent("the first user turn") { it is ContentInput },
+          wholeText("hello"),
+          turnCompleteStep(),
+        )
+      )
     val runner =
       InMemoryRunner(
-        agent = LlmAgent(name = "live_agent", model = DummyLiveModel(script)),
+        agent = LlmAgent(name = "live_agent", model = model),
         sessionService = sessionService,
       )
-    val queue = LiveRequestQueue()
-    repeat(3) { queue.sendContent(userMessage("hi $it")) }
 
-    var turns = 0
-    val unused =
-      withTimeout(10.seconds) {
-        runner
-          .runLive("u", "s", queue)
-          .onEach { if (it.turnComplete && ++turns == 3) queue.close() }
-          .toList()
-      }
+    queue.use {
+      queue.sendContent(userMessage("first"))
+      val unused =
+        withTimeout(60.seconds) {
+          runner.runLive("u", "s", queue).onEach { if (it.turnComplete) queue.close() }.toList()
+        }
+    }
 
-    // One flush at each turn's end, then one at the run's end.
-    assertThat(sessionService.flushes).isEqualTo(4)
+    // Each event is stored once: the text, the state change, or the turn end it carries.
+    assertThat(
+        runner.storedEvents().map {
+          Triple(
+            it.content?.parts?.singleOrNull()?.text,
+            it.actions.stateDelta["k"],
+            it.turnComplete,
+          )
+        }
+      )
+      .containsExactly(
+        Triple("first", null, false),
+        Triple("hello", null, false),
+        Triple(null, "v", false),
+        Triple(null, null, true),
+      )
+    model.connections.forEach { it.assertAllWaitsMet() }
   }
 
   @Test
@@ -941,45 +910,6 @@ class RunLiveTest {
   }
 
   @Test
-  fun runLive_holderIgnoringCancellation_failsTheRunWithItsAppendBound(): Unit = runTest {
-    // Storing the second message ignores cancellation for 15 s while the runner waits for the lock
-    // with no timeout of its own, so the run fails with the holder's append bound once it lets go.
-    val sessionService =
-      AppendRecordingSessionService(
-        beforeAppend = {
-          if (it.content?.parts?.singleOrNull()?.text == "second") {
-            withContext(NonCancellable) { delay(15.seconds) }
-          }
-        }
-      )
-    val model =
-      DummyLiveModel(
-        listOf(
-          AwaitSent("the first user turn") { it is ContentInput },
-          wholeText("hello"),
-          turnCompleteStep(),
-        )
-      )
-    val runner =
-      InMemoryRunner(
-        agent = LlmAgent(name = "live_agent", model = model),
-        sessionService = sessionService,
-      )
-    val queue = LiveRequestQueue()
-    queue.sendContent(userMessage("first"))
-    queue.sendContent(userMessage("second"))
-
-    val error =
-      assertFailsWith<IllegalStateException> {
-        withTimeout(60.seconds) { runner.runLive("u", "s", queue).toList() }
-      }
-
-    assertThat(error).hasMessageThat().isEqualTo("A live session append did not finish in 10s.")
-    assertThat(testScheduler.currentTime).isEqualTo(15.seconds.inWholeMilliseconds)
-    model.connections.forEach { it.assertAllWaitsMet() }
-  }
-
-  @Test
   fun runLive_flushHangs_failsTheRunAfterTheBound(): Unit = runTest {
     // Every flush hangs, the turn end's and the one after the failure, and the run still ends.
     val sessionService = AppendRecordingSessionService(beforeFlush = { awaitCancellation() })
@@ -1008,48 +938,6 @@ class RunLiveTest {
       assertFailsWith<IllegalStateException> { withTimeout(60.seconds) { runLiveWith(runner) } }
 
     assertThat(error).hasMessageThat().isEqualTo("A live session flush did not finish in 10s.")
-  }
-
-  @Test
-  fun runLive_slowAppendThenSlowFlush_doesNotFailTheTurn(): Unit = runTest {
-    // The append and the flush take the lock separately, so the turn's append can run between.
-    val queue = LiveRequestQueue()
-    val sessionService =
-      AppendRecordingSessionService(
-        beforeAppend = {
-          if (it.content?.parts?.singleOrNull()?.text == "hello") {
-            // The turn now waits for the lock while the runner holds it.
-            queue.sendContent(userMessage("second"))
-            delay(6.seconds)
-          }
-        },
-        beforeFlush = { delay(6.seconds) },
-      )
-    val model =
-      DummyLiveModel(
-        listOf(
-          AwaitSent("the first user turn") { it is ContentInput },
-          wholeText("hello"),
-          turnCompleteStep(),
-        )
-      )
-    val runner =
-      InMemoryRunner(
-        agent = LlmAgent(name = "live_agent", model = model),
-        sessionService = sessionService,
-      )
-    queue.sendContent(userMessage("first"))
-
-    val unused =
-      withTimeout(60.seconds) {
-        runner.runLive("u", "s", queue).onEach { if (it.turnComplete) queue.close() }.toList()
-      }
-
-    val storedTexts = sessionService.appended.mapNotNull { it.content?.parts?.singleOrNull()?.text }
-    assertWithMessage("the turn's append should have gone through")
-      .that(storedTexts)
-      .contains("second")
-    model.connections.forEach { it.assertAllWaitsMet() }
   }
 
   @Test

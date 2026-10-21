@@ -18,6 +18,7 @@ package com.google.adk.kt.processors
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.LiveRequestQueue
 import com.google.adk.kt.agents.LlmAgent
+import com.google.adk.kt.agents.openLiveRun
 import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.LlmRequest
@@ -159,7 +160,7 @@ class OutputSchemaProcessorTest {
           outputSchema = outputSchema,
           subAgents = listOf(LlmAgent(name = "child", model = DummyModel("gemini-2.0-flash"))),
         )
-      val context = contextFor(agent).apply { frameworkData.liveRequestQueue = LiveRequestQueue() }
+      val context = contextFor(agent).apply { openLiveRun(LiveRequestQueue()) }
 
       val result = OutputSchemaProcessor().process(context, LlmRequest())
 

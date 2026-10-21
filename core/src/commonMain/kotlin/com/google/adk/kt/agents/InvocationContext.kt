@@ -57,7 +57,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.serialization.json.JsonElement
 
 /**
@@ -242,13 +241,13 @@ data class InvocationContext(
     require(agent !is NodeViewAgent || node != null) { "A node-view agent requires its node." }
   }
 
-  /** The user's input on a live run, or `null` on a turn-based one; see [ContextFrameworkData]. */
-  internal val liveRequestQueue: LiveRequestQueue?
-    get() = frameworkData.liveRequestQueue
+  /** The live run this invocation belongs to, or `null` on a turn-based one; see [LiveRun]. */
+  internal val liveRun: LiveRun?
+    get() = frameworkData.liveRun
 
-  /** Taken around each append to [session] during a live run; see [ContextFrameworkData]. */
-  internal val sessionAppendLock: Mutex
-    get() = frameworkData.sessionAppendLock
+  /** The user's input on a live run, or `null` on a turn-based one. */
+  internal val liveRequestQueue: LiveRequestQueue?
+    get() = liveRun?.requestQueue
 
   /** Returns whether the current invocation is resumable. */
   val isResumable: Boolean
@@ -922,31 +921,13 @@ data class ContextFrameworkData(
   @FrameworkInternalApi val callbackContextData: MutableMap<String, Any> = concurrentMutableMapOf()
 ) {
   /**
-   * The user's input on a live run, set by whatever opens it, and `null` on a turn-based one.
+   * The live run this invocation belongs to, set by [openLiveRun], or `null` on a turn-based
+   * invocation.
    *
-   * A body property, so it stays off every public signature; contexts derived with
-   * [InvocationContext.copy] share this holder and so the same queue.
+   * Declared as a body property so it stays off every public signature; contexts derived with
+   * [InvocationContext.copy] share this holder and therefore the same run.
    */
-  @Volatile internal var liveRequestQueue: LiveRequestQueue? = null
-
-  /**
-   * Live audio the caller has sent since the last flush.
-   *
-   * Filled only through [AudioCacheManager], when [LiveRunConfig.saveLiveBlob] is set. It lives on
-   * the context rather than in the manager, so a turn restarted on a new connection keeps one
-   * recording; a transfer or a completed step saves it before the next agent runs.
-   */
-  internal val inputRealtimeCache: RealtimeCache = RealtimeCache()
-  /** The audio the model has spoken since the last flush. See [inputRealtimeCache]. */
-  internal val outputRealtimeCache: RealtimeCache = RealtimeCache()
-
-  /**
-   * Serializes a live run's appends to [InvocationContext.session] (contexts made with
-   * [InvocationContext.copy] share this lock). The turn and its caller both append to that same
-   * object under it, because a session service can reject overlapping appends. Never emit while
-   * holding it, because the collector can deadlock: append, release, then emit.
-   */
-  internal val sessionAppendLock = Mutex()
+  @Volatile internal var liveRun: LiveRun? = null
 
   /**
    * Paths of workflow nodes cancelled mid-run in this turn. Their events show progress rather than

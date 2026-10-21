@@ -21,6 +21,7 @@ import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.LoopAgent
 import com.google.adk.kt.agents.ParallelAgent
 import com.google.adk.kt.agents.SequentialAgent
+import com.google.adk.kt.agents.openLiveRun
 import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.testing.DummyModel
@@ -152,7 +153,7 @@ class AgentTransferProcessorTest {
                 listOf(LlmAgent(name = "sub", description = "Sub agent", model = DummyModel("sub"))),
             )
         )
-        .apply { frameworkData.liveRequestQueue = LiveRequestQueue() }
+        .apply { openLiveRun(LiveRequestQueue()) }
 
     val processedRequest = AgentTransferProcessor().process(context, LlmRequest())
 
@@ -196,7 +197,7 @@ class AgentTransferProcessorTest {
                 ),
             )
         )
-        .apply { frameworkData.liveRequestQueue = LiveRequestQueue() }
+        .apply { openLiveRun(LiveRequestQueue()) }
 
     val processedRequest = AgentTransferProcessor().process(context, LlmRequest())
 
@@ -221,10 +222,7 @@ class AgentTransferProcessorTest {
         subAgents = listOf(helper),
       )
     val unused = LoopAgent(name = "loop", subAgents = listOf(worker))
-    val context =
-      testInvocationContext(agent = worker).apply {
-        frameworkData.liveRequestQueue = LiveRequestQueue()
-      }
+    val context = testInvocationContext(agent = worker).apply { openLiveRun(LiveRequestQueue()) }
 
     val processedRequest = AgentTransferProcessor().process(context, LlmRequest())
 
@@ -252,10 +250,7 @@ class AgentTransferProcessorTest {
         )
       val step2 = LlmAgent(name = "step2", description = "s2", model = DummyModel("s2"))
       val unused = SequentialAgent(name = "sequence", subAgents = listOf(step1, step2))
-      val context =
-        testInvocationContext(agent = step1).apply {
-          frameworkData.liveRequestQueue = LiveRequestQueue()
-        }
+      val context = testInvocationContext(agent = step1).apply { openLiveRun(LiveRequestQueue()) }
 
       val processedRequest = AgentTransferProcessor().process(context, LlmRequest())
 
@@ -284,10 +279,7 @@ class AgentTransferProcessorTest {
           ),
       )
     val unused = SequentialAgent(name = "sequence", subAgents = listOf(step))
-    val context =
-      testInvocationContext(agent = step).apply {
-        frameworkData.liveRequestQueue = LiveRequestQueue()
-      }
+    val context = testInvocationContext(agent = step).apply { openLiveRun(LiveRequestQueue()) }
 
     val error =
       assertFailsWith<IllegalArgumentException> {

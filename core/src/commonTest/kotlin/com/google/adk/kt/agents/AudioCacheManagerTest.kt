@@ -16,6 +16,7 @@
 
 package com.google.adk.kt.agents
 
+import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.artifacts.InMemoryArtifactService
 import com.google.adk.kt.testing.DummyAgent
 import com.google.adk.kt.testing.SaveHookArtifactService
@@ -34,12 +35,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 
 /** Covers the recording that `LiveRunConfig.saveLiveBlob` turns on. */
+@OptIn(ExperimentalLiveApi::class)
 class AudioCacheManagerTest {
 
   private val artifacts = InMemoryArtifactService()
 
   private fun context(agentName: String = "weather_agent") =
-    testInvocationContext(agent = DummyAgent(name = agentName), artifactService = artifacts)
+    testInvocationContext(agent = DummyAgent(name = agentName), artifactService = artifacts).apply {
+      openLiveRun(LiveRequestQueue())
+    }
 
   private fun pcm(vararg bytes: Byte) = Blob(mimeType = "audio/pcm;rate=24000", data = bytes)
 
@@ -150,11 +154,12 @@ class AudioCacheManagerTest {
   @Test
   fun flush_withoutAnArtifactService_writesNothingAndEmptiesTheCache() = runBlocking {
     val context = testInvocationContext(agent = DummyAgent(name = "a"))
+    val liveRun = context.openLiveRun(LiveRequestQueue())
     val manager = AudioCacheManager(context)
     manager.cacheOutput(pcm(1))
 
     assertEquals(emptyList(), manager.flush(flushUserAudio = false, flushModelAudio = true))
-    assertEquals(emptyList(), context.frameworkData.outputRealtimeCache.take())
+    assertEquals(emptyList(), liveRun.outputRealtimeCache.take())
   }
 
   @Test
@@ -175,10 +180,11 @@ class AudioCacheManagerTest {
   fun flush_recordingEvent_carriesTheContextsBranch() = runBlocking {
     val context =
       testInvocationContext(
-        agent = DummyAgent(name = "weather_agent"),
-        artifactService = artifacts,
-        branch = "root.weather_agent",
-      )
+          agent = DummyAgent(name = "weather_agent"),
+          artifactService = artifacts,
+          branch = "root.weather_agent",
+        )
+        .apply { openLiveRun(LiveRequestQueue()) }
     val manager = AudioCacheManager(context)
     manager.cacheOutput(pcm(1))
 
@@ -268,7 +274,9 @@ class AudioCacheManagerTest {
     val failingOnce =
       SaveHookArtifactService(artifacts) { if (it == 0) throw RuntimeException("save failed") }
     val context =
-      testInvocationContext(agent = DummyAgent(name = "a"), artifactService = failingOnce)
+      testInvocationContext(agent = DummyAgent(name = "a"), artifactService = failingOnce).apply {
+        openLiveRun(LiveRequestQueue())
+      }
     val manager = AudioCacheManager(context)
     manager.cacheOutput(pcm(1, 2))
     val firstFlush = manager.flush(flushUserAudio = false, flushModelAudio = true)
@@ -288,7 +296,9 @@ class AudioCacheManagerTest {
     // A failed save swallows its error, but must let a cancellation of the run itself through.
     val cancelling = SaveHookArtifactService(artifacts) { throw CancellationException("cancelled") }
     val context =
-      testInvocationContext(agent = DummyAgent(name = "a"), artifactService = cancelling)
+      testInvocationContext(agent = DummyAgent(name = "a"), artifactService = cancelling).apply {
+        openLiveRun(LiveRequestQueue())
+      }
     val manager = AudioCacheManager(context)
     manager.cacheOutput(pcm(1))
 
