@@ -19,6 +19,7 @@ package com.google.adk.kt.workflow
 import com.google.adk.kt.annotations.AdkJavaInteropApi
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 
 class NodeInfoTest {
 
@@ -33,5 +34,43 @@ class NodeInfoTest {
       nodeInfo.copy(messageAsOutput = false),
       nodeInfo.toBuilder().messageAsOutput(false).build(),
     )
+  }
+
+  @Test
+  fun name_isTheLastSegmentWithoutItsRunId() {
+    assertEquals("b", NodeInfo(path = "wf@1/a@2/b@3").name)
+    assertEquals("b", NodeInfo(path = "wf@1/b").name)
+    assertEquals("wf", NodeInfo(path = "wf@1").name)
+  }
+
+  @Test
+  fun runId_isTheLastSegmentsRunId() {
+    assertEquals("3", NodeInfo(path = "wf@1/a@2/b@3").runId)
+  }
+
+  @Test
+  fun runId_nullWithoutARunId() {
+    assertNull(NodeInfo(path = "wf@1/b").runId)
+  }
+
+  @Test
+  fun parentRunId_isTheSecondToLastSegmentsRunId() {
+    assertEquals("2", NodeInfo(path = "wf@1/a@2/b@3").parentRunId)
+    assertEquals("1", NodeInfo(path = "wf@1/b").parentRunId)
+  }
+
+  @Test
+  fun parentRunId_nullWithoutAParentRunId() {
+    assertNull(NodeInfo(path = "wf@1").parentRunId)
+    assertNull(NodeInfo(path = "wf/b@1").parentRunId)
+  }
+
+  @Test
+  fun pathHelpers_nullForAnEmptyPath() {
+    val nodeInfo = NodeInfo()
+
+    assertNull(nodeInfo.name)
+    assertNull(nodeInfo.runId)
+    assertNull(nodeInfo.parentRunId)
   }
 }

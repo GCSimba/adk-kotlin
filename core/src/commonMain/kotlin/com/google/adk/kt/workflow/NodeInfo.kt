@@ -46,6 +46,33 @@ data class NodeInfo(
   @JsonNames("message_as_output") val messageAsOutput: Boolean = false,
 ) {
   /**
+   * The emitting node's name: the last segment of [path] without its run ID, such as `a` for
+   * `wf@1/a@2`, or null when [path] is empty. Mirrors ADK Python's `NodeInfo.name`, which returns
+   * an empty string instead of null.
+   */
+  val name: String?
+    get() = if (path.isEmpty()) null else path.substringAfterLast('/').substringBeforeLast('@')
+
+  /**
+   * The emitting node's run ID: the part of [path]'s last segment after `@`, such as `2` for
+   * `wf@1/a@2`, or null when the segment has none. Mirrors ADK Python's `NodeInfo.run_id`, which
+   * returns an empty string instead of null.
+   */
+  val runId: String?
+    get() = runIdOf(path.substringAfterLast('/'))
+
+  /**
+   * The run ID of the emitting node's parent: the part of [path]'s second-to-last segment after
+   * `@`, such as `1` for `wf@1/a@2`. Returns null when [path] has no parent segment or the segment
+   * has no run ID. Mirrors ADK Python's `NodeInfo.parent_run_id`.
+   */
+  val parentRunId: String?
+    get() {
+      val segments = path.split('/')
+      return segments.getOrNull(segments.size - 2)?.let(::runIdOf)
+    }
+
+  /**
    * Returns a [Builder] initialized with this instance's properties, primarily for Java callers.
    * Prefer it over `copy` from Java: `copy` takes every property positionally, so its signature
    * changes whenever a property is added.
@@ -80,6 +107,10 @@ data class NodeInfo(
     @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
   }
 }
+
+/** Returns the run ID after the `@` in a [NodeInfo.path] segment, or null when it has no `@`. */
+private fun runIdOf(segment: String): String? =
+  if ('@' in segment) segment.substringAfterLast('@') else null
 
 /**
  * Decodes an all-empty [NodeInfo] to `null`, matching adk-go. adk-python declares the field
