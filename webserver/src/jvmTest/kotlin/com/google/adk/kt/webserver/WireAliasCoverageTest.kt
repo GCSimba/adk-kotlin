@@ -22,7 +22,6 @@ import com.google.adk.kt.webserver.models.CreateSessionRequest
 import com.google.common.truth.Truth.assertThat
 import java.util.Collections
 import java.util.IdentityHashMap
-import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.descriptors.PolymorphicKind
@@ -42,7 +41,6 @@ import org.junit.runners.JUnit4
  * alternative name. Nothing in the type system requires it, so this walks the request bodies the
  * routes decode and fails when a property is reachable only under its camelCase name.
  */
-@OptIn(ExperimentalSerializationApi::class)
 @RunWith(JUnit4::class)
 class WireAliasCoverageTest {
 

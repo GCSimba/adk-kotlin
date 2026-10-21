@@ -27,7 +27,6 @@ import com.google.adk.kt.webserver.models.VersionInfo
 import com.google.common.truth.Truth.assertThat
 import java.util.Collections
 import java.util.IdentityHashMap
-import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.descriptors.PolymorphicKind
@@ -48,7 +47,7 @@ import org.junit.runners.JUnit4
  * rather than by scanning response text, which does not. [WireEndpointTest] exercises the same rule
  * against real responses; [WireAliasCoverageTest] is the intake counterpart of this survey.
  */
-@OptIn(ExperimentalSerializationApi::class, FrameworkInternalApi::class)
+@OptIn(FrameworkInternalApi::class)
 @RunWith(JUnit4::class)
 class WireEmissionCoverageTest {
 

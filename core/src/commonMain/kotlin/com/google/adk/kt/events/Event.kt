@@ -40,7 +40,6 @@ import kotlin.jvm.JvmStatic
 import kotlin.time.Clock
 import kotlinx.serialization.Contextual
 import kotlinx.serialization.EncodeDefault
-import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonNames
@@ -96,9 +95,7 @@ data class Event
 @JvmOverloads
 constructor(
   // Always emit: an omitted default is regenerated at decode time (a fresh random), losing the id.
-  @OptIn(ExperimentalSerializationApi::class)
-  @EncodeDefault(EncodeDefault.Mode.ALWAYS)
-  val id: String = Uuid.random(),
+  @EncodeDefault(EncodeDefault.Mode.ALWAYS) val id: String = Uuid.random(),
   @JsonNames("invocation_id") val invocationId: String? = null,
   @EncodeDefault(EncodeDefault.Mode.ALWAYS) val author: String = "",
   val content: Content? = null,
@@ -123,7 +120,6 @@ constructor(
   @JsonNames("node_info")
   val nodeInfo: NodeInfo? = null,
   // Always emit: an omitted default is regenerated at decode time, changing timestamp on reload.
-  @OptIn(ExperimentalSerializationApi::class)
   @EncodeDefault(EncodeDefault.Mode.ALWAYS)
   @Serializable(with = LenientEpochMillisSerializer::class)
   val timestamp: Long = Clock.System.now().toEpochMilliseconds(),

@@ -17,7 +17,6 @@
 package com.google.adk.kt.webserver
 
 import com.google.common.truth.Truth.assertThat
-import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.descriptors.StructureKind
 import kotlinx.serialization.encoding.CompositeDecoder
@@ -70,7 +69,6 @@ internal fun assertEmissionRule(
  * Walks a response against its descriptor, recording snake_case keys and null-valued fields. Map
  * keys are caller data and are not schema, so they are never reported.
  */
-@OptIn(ExperimentalSerializationApi::class)
 internal class EmissionWalk {
   val snakeCaseKeys = mutableSetOf<String>()
   val nullKeys = mutableSetOf<String>()

@@ -20,7 +20,6 @@ import com.google.adk.kt.annotations.AdkJavaInteropApi
 import kotlin.jvm.JvmStatic
 import kotlinx.serialization.Contextual
 import kotlinx.serialization.EncodeDefault
-import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 
 /**
@@ -34,7 +33,6 @@ import kotlinx.serialization.Serializable
 data class FunctionResponse(
   val name: String,
   // Always emit response (even empty {}) to match the genai/Python golden shape.
-  @OptIn(ExperimentalSerializationApi::class)
   @EncodeDefault(EncodeDefault.Mode.ALWAYS)
   val response: Map<String, @Contextual Any?> = emptyMap(),
   val id: String? = null,
