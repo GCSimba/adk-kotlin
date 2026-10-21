@@ -60,10 +60,31 @@ class DefaultLiteRtLmEngine(private val delegate: Engine) : LiteRtLmEngine {
 /** Default implementation of [LiteRtLmConversation] delegating to the native [Conversation]. */
 class DefaultLiteRtLmConversation(private val delegate: Conversation) : LiteRtLmConversation {
   override fun sendMessage(message: LiteRtLmMessage): LiteRtLmMessage =
-    delegate.sendMessage(message)
+    // A call that omits defaulted parameters fails to link on newer LiteRT-LM releases.
+    delegate.sendMessage(
+      message,
+      extraContext = emptyMap(),
+      repetitionPenaltyConfig = null,
+      noRepeatNgramConfig = null,
+      suppressTokensConfig = null,
+      maxOutputToken = null,
+      thinkingConfig = null,
+      responseFormat = null,
+    )
 
   override fun sendMessageAsync(message: LiteRtLmMessage, callback: MessageCallback) {
-    delegate.sendMessageAsync(message, callback)
+    // A call that omits defaulted parameters fails to link on newer LiteRT-LM releases.
+    delegate.sendMessageAsync(
+      message,
+      callback,
+      extraContext = emptyMap(),
+      repetitionPenaltyConfig = null,
+      noRepeatNgramConfig = null,
+      suppressTokensConfig = null,
+      maxOutputToken = null,
+      thinkingConfig = null,
+      responseFormat = null,
+    )
   }
 
   override fun cancelProcess() = delegate.cancelProcess()

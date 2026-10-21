@@ -67,11 +67,20 @@ internal fun LlmRequest.toConversationDto(history: List<AdkContent>): LiteRtLmCo
 
 /** Builds the native [ConversationConfig] this DTO describes. */
 internal fun LiteRtLmConversationDto.toConversationConfig(): ConversationConfig =
+  // A call that omits defaulted parameters fails to link on newer LiteRT-LM releases.
   ConversationConfig(
     systemInstruction = systemInstruction?.let { LiteRtLmContents.of(it) },
     initialMessages = initialMessages.map { it.toLiteRtLmMessage() },
     tools = toolDescriptions.map { tool(JsonOpenApiTool(it)) },
+    samplerConfig = null,
     automaticToolCalling = false,
+    channels = null,
+    extraContext = emptyMap(),
+    loraConfig = null,
+    prefillPrefaceOnInit = false,
+    maxOutputToken = null,
+    thinkingConfig = null,
+    enableResponseFormat = false,
   )
 
 /** Maps an ADK content directly to a LiteRT-LM message, for the current (last) turn to send. */
