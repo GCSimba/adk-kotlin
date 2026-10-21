@@ -28,10 +28,43 @@ object TrackingHeaders {
   /** ADK's own tag: `google-adk/<ADK version>`. */
   const val ADK_TAG: String = "google-adk/$VERSION"
 
+  /** [ADK_TAG] followed by `gl-kotlin/<Kotlin version>`, for clients that send no language tag. */
+  val VALUE: String = "$ADK_TAG gl-kotlin/${KotlinVersion.CURRENT}"
+
+  /** The `x-goog-api-client` and `user-agent` headers, both set to [VALUE]. */
+  val HEADERS: Map<String, String> = mapOf("x-goog-api-client" to VALUE, "user-agent" to VALUE)
+
   /**
    * Headers for a GenAI SDK client, which puts its own `gl-kotlin` tag first: both set to [ADK_TAG]
    * alone.
    */
   internal val GENAI_SDK_HEADERS: Map<String, String> =
     mapOf("x-goog-api-client" to ADK_TAG, "user-agent" to ADK_TAG)
+
+  /**
+   * Returns [headers] with each tracking header, matched case-insensitively, followed by every tag
+   * of [VALUE] whose name it lacks.
+   */
+  fun mergeInto(headers: Map<String, String>): Map<String, String> {
+    val callerValues = mutableMapOf<String, String>()
+    return buildMap {
+      for ((name, value) in headers) {
+        val trackingName = name.lowercase()
+        if (trackingName in HEADERS) {
+          callerValues[trackingName] = callerValues[trackingName]?.let { "$it $value" } ?: value
+        } else {
+          put(name, value)
+        }
+      }
+      for (name in HEADERS.keys) put(name, extend(callerValues[name].orEmpty()))
+    }
+  }
+
+  /** Returns [callerValue] followed by each tag of [VALUE] whose name it lacks. */
+  private fun extend(callerValue: String): String {
+    val tags = callerValue.split(' ').filter { it.isNotEmpty() }
+    val names = tags.mapTo(mutableSetOf()) { it.substringBefore('/') }
+    val missing = VALUE.split(' ').filter { it.substringBefore('/') !in names }
+    return (tags + missing).joinToString(" ")
+  }
 }

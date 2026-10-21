@@ -21,7 +21,9 @@ import com.anthropic.errors.BadRequestException
 import com.anthropic.errors.RateLimitException
 import com.anthropic.models.messages.OutputConfig
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.models.LlmRequest
+import com.google.adk.kt.models.TrackingHeaders
 import com.google.adk.kt.models.VertexCredentials
 import com.google.adk.kt.types.Blob
 import com.google.adk.kt.types.CodeExecutionResult
@@ -946,6 +948,7 @@ class ClaudeTest {
   }
 
   @Test
+  @OptIn(FrameworkInternalApi::class)
   fun vertexClient_sendsRawPredictWithBearerTokenAndVertexBody() =
     runBlocking<Unit> {
       server.enqueue(jsonResponse(message(content = """[{"type":"text","text":"pong"}]""")))
@@ -961,8 +964,13 @@ class ClaudeTest {
             "claude-haiku-4-5:rawPredict"
         )
       assertThat(recorded.headers["Authorization"]).isEqualTo("Bearer fake-token")
-      assertThat(recorded.headers["x-goog-api-client"]).startsWith("google-adk/")
-      assertThat(recorded.headers["user-agent"]).startsWith("google-adk/")
+      assertThat(recorded.headers.values("x-goog-api-client"))
+        .containsExactly(TrackingHeaders.VALUE)
+      // The tracking value extends the SDK's own User-Agent rather than replacing it.
+      val userAgent = recorded.headers.values("user-agent").single()
+      assertThat(userAgent)
+        .matches("AnthropicClient\\w*/Java \\S+ ${Regex.escape(TrackingHeaders.VALUE)}")
+      assertThat(userAgent.split(' ').map { it.substringBefore('/') }).containsNoDuplicates()
       val body = Json.parseToJsonElement(recorded.body!!.utf8()).jsonObject
       assertThat(body["anthropic_version"]!!.jsonPrimitive.content).isEqualTo("vertex-2023-10-16")
       // The model id travels in the URL, not the body.

@@ -15,7 +15,9 @@
  */
 package com.google.adk.kt.models.openai
 
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.models.LlmRequest
+import com.google.adk.kt.models.TrackingHeaders
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.HttpOptions
 import com.google.adk.kt.types.Part
@@ -241,14 +243,84 @@ class KtorChatCompletionsClientTest {
   }
 
   @Test
-  fun trackingHeadersFor_sendsTrackingOnlyToGoogleApis() {
+  fun sendsTrackingHeaders_onlyToGoogleApis() {
     val vertex =
       "https://aiplatform.googleapis.com/v1/projects/p/locations/global/endpoints/openapi"
 
-    assertThat(trackingHeadersFor(vertex).keys).containsExactly("user-agent", "x-goog-api-client")
-    assertThat(trackingHeadersFor(vertex)["user-agent"]).contains("google-adk/")
-    assertThat(trackingHeadersFor("https://api.openai.com/v1")).isEmpty()
-    assertThat(trackingHeadersFor("https://googleapis.com.example.org/v1")).isEmpty()
+    assertThat(sendsTrackingHeaders(vertex)).isTrue()
+    assertThat(sendsTrackingHeaders("https://api.openai.com/v1")).isFalse()
+    assertThat(sendsTrackingHeaders("https://googleapis.com.example.org/v1")).isFalse()
+  }
+
+  @Test
+  @OptIn(FrameworkInternalApi::class)
+  fun requestHeaders_addsOnlyTheTrackingTagsCallerHeadersLack() {
+    val headers =
+      requestHeaders(
+        provided = mapOf("User-Agent" to "provided/1.0", "Authorization" to "Bearer t"),
+        fixed = mapOf("user-agent" to "my-app/1.0", "x-goog-api-client" to "lib/2 google-adk/0.1"),
+        tracked = true,
+      )
+
+    assertThat(headers["user-agent"]).isEqualTo("my-app/1.0 ${TrackingHeaders.VALUE}")
+    assertThat(headers["x-goog-api-client"])
+      .isEqualTo("lib/2 google-adk/0.1 gl-kotlin/${KotlinVersion.CURRENT}")
+    assertThat(headers["Authorization"]).isEqualTo("Bearer t")
+    assertThat(headers.keys.count { it.equals("user-agent", ignoreCase = true) }).isEqualTo(1)
+  }
+
+  @Test
+  @OptIn(FrameworkInternalApi::class)
+  fun create_extendsTheProvidedUserAgentWithTrackingHeaders() {
+    val client =
+      KtorChatCompletionsClient(
+        headersProvider = { mapOf("User-Agent" to "my-app/1.0") },
+        httpOptions = HttpOptions(baseUrl = server.url("/").toString()),
+        sendTrackingHeaders = true,
+      )
+    server.enqueue(jsonResponse("""{"choices":[]}"""))
+
+    val unused = runBlocking { client.create(request()) }
+
+    val recorded = server.takeRequest()
+    assertThat(recorded.headers.values("user-agent"))
+      .containsExactly("my-app/1.0 ${TrackingHeaders.VALUE}")
+    assertThat(recorded.headers.values("x-goog-api-client")).containsExactly(TrackingHeaders.VALUE)
+  }
+
+  @Test
+  @OptIn(FrameworkInternalApi::class)
+  fun create_addsOnlyTheAdkTagToAUserAgentThatNamesKotlin() {
+    val client =
+      KtorChatCompletionsClient(
+        headersProvider = { mapOf("User-Agent" to "my-app/1.0 gl-kotlin/1.9.0") },
+        httpOptions = HttpOptions(baseUrl = server.url("/").toString()),
+        sendTrackingHeaders = true,
+      )
+    server.enqueue(jsonResponse("""{"choices":[]}"""))
+
+    val unused = runBlocking { client.create(request()) }
+
+    val recorded = server.takeRequest()
+    assertThat(recorded.headers.values("user-agent"))
+      .containsExactly("my-app/1.0 gl-kotlin/1.9.0 ${TrackingHeaders.ADK_TAG}")
+    assertThat(recorded.headers.values("x-goog-api-client")).containsExactly(TrackingHeaders.VALUE)
+  }
+
+  @Test
+  fun create_toAnotherProvider_sendsNoTrackingHeaders() {
+    val client =
+      KtorChatCompletionsClient(
+        headersProvider = { mapOf("User-Agent" to "my-app/1.0") },
+        httpOptions = HttpOptions(baseUrl = server.url("/").toString()),
+      )
+    server.enqueue(jsonResponse("""{"choices":[]}"""))
+
+    val unused = runBlocking { client.create(request()) }
+
+    val recorded = server.takeRequest()
+    assertThat(recorded.headers.values("user-agent")).containsExactly("my-app/1.0")
+    assertThat(recorded.headers.values("x-goog-api-client")).isEmpty()
   }
 
   @Test

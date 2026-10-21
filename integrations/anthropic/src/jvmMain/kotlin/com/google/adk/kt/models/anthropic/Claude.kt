@@ -15,9 +15,11 @@
  */
 package com.google.adk.kt.models.anthropic
 
+import com.anthropic.backends.Backend
 import com.anthropic.client.AnthropicClient
 import com.anthropic.client.okhttp.AnthropicOkHttpClient
 import com.anthropic.core.http.AsyncStreamResponse
+import com.anthropic.core.http.HttpRequest
 import com.anthropic.errors.AnthropicServiceException
 import com.anthropic.errors.RateLimitException
 import com.anthropic.helpers.MessageAccumulator
@@ -26,12 +28,13 @@ import com.anthropic.models.messages.RawContentBlockDelta
 import com.anthropic.models.messages.RawContentBlockDeltaEvent
 import com.anthropic.models.messages.RawMessageStreamEvent
 import com.anthropic.vertex.backends.VertexBackend
-import com.google.adk.kt.VERSION
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.logging.LoggerFactory
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.models.Model
+import com.google.adk.kt.models.TrackingHeaders
 import com.google.adk.kt.models.VertexCredentials
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Part
@@ -52,9 +55,6 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.future.await
 
 private const val CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
-
-/** Lets Vertex AI attribute usage to ADK, in the format the other ADK SDKs send. */
-private val TRACKING_HEADER = "google-adk/$VERSION gl-kotlin/${KotlinVersion.CURRENT}"
 
 private const val RATE_LIMIT_HINT =
   "Claude rate limit reached; see https://docs.anthropic.com/en/api/errors#http-errors"
@@ -331,11 +331,25 @@ internal fun vertexClient(
   val backendBuilder =
     VertexBackend.builder().googleCredentials(credentials).region(location).project(project)
   if (baseUrl != null) backendBuilder.baseUrl(baseUrl)
-  return AnthropicOkHttpClient.builder()
-    .backend(backendBuilder.build())
-    .putHeader("x-goog-api-client", TRACKING_HEADER)
-    .putHeader("user-agent", TRACKING_HEADER)
-    .build()
+  return AnthropicOkHttpClient.builder().backend(TrackingBackend(backendBuilder.build())).build()
+}
+
+/**
+ * Adds any missing ADK tags to each request's tracking headers. Doing this per request keeps the
+ * SDK's own User-Agent, which the SDK sets only when none is configured.
+ */
+@OptIn(FrameworkInternalApi::class)
+private class TrackingBackend(private val delegate: Backend) : Backend by delegate {
+  override fun prepareRequest(request: HttpRequest): HttpRequest {
+    val prepared = delegate.prepareRequest(request)
+    val current =
+      TrackingHeaders.HEADERS.keys.associateWith { prepared.headers.values(it).joinToString(" ") }
+    val builder = prepared.toBuilder()
+    TrackingHeaders.mergeInto(current).forEach { (name, value) ->
+      builder.replaceHeaders(name, value)
+    }
+    return builder.build()
+  }
 }
 
 private fun emptyInputJsonDelta(index: Long): RawMessageStreamEvent =

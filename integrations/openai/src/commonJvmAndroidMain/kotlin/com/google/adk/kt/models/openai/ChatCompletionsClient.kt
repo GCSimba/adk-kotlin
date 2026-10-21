@@ -15,7 +15,8 @@
  */
 package com.google.adk.kt.models.openai
 
-import com.google.adk.kt.VERSION
+import com.google.adk.kt.annotations.FrameworkInternalApi
+import com.google.adk.kt.models.TrackingHeaders
 import com.google.adk.kt.types.HttpOptions
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
@@ -39,6 +40,7 @@ import java.net.URI
 import java.time.Instant
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import java.util.TreeMap
 import java.util.concurrent.Executors
 import kotlin.math.pow
 import kotlin.random.Random
@@ -101,9 +103,6 @@ private val sharedHttpClient: HttpClient by lazy {
 private fun daemonThread(task: Runnable): Thread =
   Thread(task, "ADK Chat Completions").apply { isDaemon = true }
 
-/** Usage-tracking value, in the format the other ADK SDKs use, for Google APIs. */
-private val TRACKING_HEADER = "google-adk/$VERSION gl-kotlin/${KotlinVersion.CURRENT}"
-
 /**
  * Chat Completions transport in wire types, so [ChatCompletions] owns the ADK conversion and tests
  * can replace the HTTP client.
@@ -124,13 +123,15 @@ internal fun bearerAuth(key: String?): Map<String, String> =
  * [ChatCompletionsClient] backed by a Ktor [HttpClient] on the OkHttp engine, as the Gemini model's
  * client is. Cancelling the caller closes the HTTP exchange, except, on Ktor 2, a stream whose body
  * has stalled. [headersProvider] is called before each attempt, so it can hand out a refreshed
- * token; tests pass [retryDelay] and [streamReadTimeout].
+ * token; tests pass [retryDelay], [streamReadTimeout], and [sendTrackingHeaders].
  */
 internal class KtorChatCompletionsClient(
   private val headersProvider: () -> Map<String, String>,
   httpOptions: HttpOptions? = null,
   private val retryDelay: (retry: Int, retryAfter: Duration?) -> Duration = ::defaultRetryDelay,
   private val streamReadTimeout: Duration = STREAM_READ_TIMEOUT,
+  private val sendTrackingHeaders: Boolean =
+    sendsTrackingHeaders(httpOptions?.baseUrl ?: DEFAULT_BASE_URL),
 ) : ChatCompletionsClient {
 
   private val endpoint =
@@ -148,8 +149,6 @@ internal class KtorChatCompletionsClient(
       "HttpOptions.timeout must not be negative."
     }
   }
-
-  private val trackingHeaders = trackingHeadersFor(endpoint)
 
   override suspend fun create(request: ChatCompletionRequest): ChatCompletionResponse {
     val body =
@@ -260,18 +259,14 @@ internal class KtorChatCompletionsClient(
     }
   }
 
-  /**
-   * Builds the HTTP request. Fixed headers replace provided ones, and either can replace the
-   * tracking headers.
-   */
   private suspend fun buildRequest(request: ChatCompletionRequest): HttpRequestBuilder {
     // The provider may block, for example to refresh a token.
     val provided = runInterruptible(Dispatchers.IO) { headersProvider() }
     return HttpRequestBuilder().apply {
       method = HttpMethod.Post
       url(endpoint)
-      for (source in listOf(trackingHeaders, provided, fixedHeaders)) {
-        for ((name, value) in source) headers[name] = value
+      for ((name, value) in requestHeaders(provided, fixedHeaders, sendTrackingHeaders)) {
+        headers[name] = value
       }
       setBody(
         TextContent(chatCompletionsJson.encodeToString(request), ContentType.Application.Json)
@@ -281,15 +276,28 @@ internal class KtorChatCompletionsClient(
 }
 
 /**
- * The usage-tracking headers, sent only to Google APIs, such as Vertex AI, as the Claude backend
- * does; other providers get none.
+ * Builds the headers for a single request. [fixed] headers replace [provided] headers
+ * case-insensitively, and when [tracked] is true, ADK's tracking headers are merged in via
+ * [TrackingHeaders.mergeInto].
  */
-internal fun trackingHeadersFor(url: String): Map<String, String> =
-  if (URI.create(url).host?.lowercase()?.endsWith(".googleapis.com") == true) {
-    mapOf("user-agent" to TRACKING_HEADER, "x-goog-api-client" to TRACKING_HEADER)
-  } else {
-    emptyMap()
-  }
+@OptIn(FrameworkInternalApi::class)
+internal fun requestHeaders(
+  provided: Map<String, String>,
+  fixed: Map<String, String>,
+  tracked: Boolean,
+): Map<String, String> {
+  val headers = TreeMap<String, String>(String.CASE_INSENSITIVE_ORDER)
+  headers.putAll(provided)
+  headers.putAll(fixed)
+  return if (tracked) TrackingHeaders.mergeInto(headers) else headers
+}
+
+/**
+ * Returns whether requests to [url] carry usage-tracking headers. Only Google APIs, such as Vertex
+ * AI, receive them, matching the Claude backend.
+ */
+internal fun sendsTrackingHeaders(url: String): Boolean =
+  URI.create(url).host?.lowercase()?.endsWith(".googleapis.com") == true
 
 /**
  * A response with an error status, carrying the [error] to throw and what decides a retry; it never
