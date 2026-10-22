@@ -28,6 +28,7 @@ import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.models.RealtimeInput
 import com.google.adk.kt.testing.DummyLiveModel
 import com.google.adk.kt.testing.DummyLiveStep
+import com.google.adk.kt.testing.DummyLiveStep.AwaitSent
 import com.google.adk.kt.testing.DummyLiveStep.Respond
 import com.google.adk.kt.testing.DummyTool
 import com.google.adk.kt.testing.audioFrame
@@ -37,9 +38,16 @@ import com.google.adk.kt.testing.simpleAudioTurn
 import com.google.adk.kt.testing.spokenModelTurn
 import com.google.adk.kt.testing.turnCompleteStep
 import com.google.adk.kt.types.Blob
+import com.google.adk.kt.types.FunctionResponse
+import com.google.adk.kt.types.Transcription
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
 import kotlin.test.Test
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
@@ -86,6 +94,40 @@ class LiveRunIntegrationTest {
   }
 
   private fun liveConfig() = RunConfig(streamingMode = StreamingMode.BIDI)
+
+  private fun Any.toolAnswers(): List<FunctionResponse> =
+    (this as? ContentInput)?.content?.parts?.mapNotNull { it.functionResponse }.orEmpty()
+
+  private fun answers(callId: String, response: Map<String, Any?>): (Any) -> Boolean = { message ->
+    message.toolAnswers().any { it.id == callId && it.response == response }
+  }
+
+  private fun DummyLiveModel.toolAnswers(): List<FunctionResponse> =
+    connections.flatMap { connection ->
+      connection.sent.flatMap { it.toolAnswers() }
+    }
+
+  /** Runs live until the model completes a turn, then hangs up as a caller would. */
+  private suspend fun InMemoryRunner.runUntilTurnComplete() =
+    LiveRequestQueue().let { queue ->
+      runLive(USER_ID, SESSION_ID, queue, liveConfig())
+        .onEach { if (it.turnComplete) queue.close() }
+        .toList()
+    }
+
+  /** A stream that emits nothing until it is cancelled, completing [cancelled] when it is. */
+  private fun endlessStream(cancelled: CompletableDeferred<Unit>) =
+    flow<String> {
+      try {
+        awaitCancellation()
+      } finally {
+        cancelled.complete(Unit)
+      }
+    }
+
+  /** A `monitor` tool returning an [endlessStream]. */
+  private fun endlessTool(cancelled: CompletableDeferred<Unit>) =
+    DummyTool(name = "monitor") { _, _ -> endlessStream(cancelled) }
 
   @Test
   fun runLive_spokenTurn_emitsTheTurnsContentAndCompletesWhenTheQueueCloses(): Unit = runBlocking {
@@ -163,9 +205,148 @@ class LiveRunIntegrationTest {
     assertThat(model.connections).hasSize(1)
   }
 
+  @Test
+  fun runLive_toolReturnsAFlow_answersPendingThenEachValueToTheSameCall(): Unit = runBlocking {
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", id = "c1")),
+        AwaitSent("the pending answer", answers("c1", PENDING)),
+        AwaitSent("the first value", answers("c1", mapOf("result" to "300"))),
+        AwaitSent("the second value", answers("c1", mapOf("result" to "400"))),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    val tool = DummyTool(name = "monitor") { _, _ -> flowOf("300", "400") }
+    val (runner, model) = runnerFor(script, tools = listOf(tool))
+
+    val unused = runner.runUntilTurnComplete()
+
+    val answers = model.toolAnswers()
+    assertThat(answers.map { it.response })
+      .containsExactly(PENDING, mapOf("result" to "300"), mapOf("result" to "400"))
+      .inOrder()
+    assertThat(answers.map { it.id to it.name }.distinct()).containsExactly("c1" to "monitor")
+  }
+
+  @Test
+  fun runLive_streamingToolThrows_answersWithAGenericError(): Unit = runBlocking {
+    val error = mapOf("error" to "Invoking `monitor()` failed with an internal error.")
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", id = "c1")),
+        AwaitSent("the pending answer", answers("c1", PENDING)),
+        AwaitSent("the error", answers("c1", error)),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    val tool =
+      DummyTool(name = "monitor") { _, _ ->
+        flow<String> { throw IllegalStateException("account 1234 is overdrawn") }
+      }
+    val (runner, model) = runnerFor(script, tools = listOf(tool))
+
+    val unused = runner.runUntilTurnComplete()
+
+    assertThat(model.toolAnswers().map { it.response }).containsExactly(PENDING, error).inOrder()
+  }
+
+  @Test
+  fun runLive_runEnds_stopsItsStreamingTools(): Unit = runBlocking {
+    val cancelled = CompletableDeferred<Unit>()
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", id = "c1")),
+        AwaitSent("the pending answer", answers("c1", PENDING)),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    val (runner, _) = runnerFor(script, tools = listOf(endlessTool(cancelled)))
+
+    val unused = runner.runUntilTurnComplete()
+
+    assertThat(cancelled.isCompleted).isTrue()
+  }
+
+  @Test
+  fun runLive_callerStopsCollecting_stopsTheStreamingTools(): Unit = runBlocking {
+    val cancelled = CompletableDeferred<Unit>()
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", id = "c1")),
+        AwaitSent("the pending answer", answers("c1", PENDING)),
+        Respond(
+          LlmResponse(
+            outputTranscription = Transcription(text = "watching", finished = false),
+            partial = true,
+          )
+        ),
+      )
+    val (runner, _) = runnerFor(script, tools = listOf(endlessTool(cancelled)))
+
+    val unused =
+      runner.runLive(USER_ID, SESSION_ID, LiveRequestQueue(), liveConfig()).first {
+        it.outputTranscription != null
+      }
+
+    assertThat(cancelled.isCompleted).isTrue()
+  }
+
+  @Test
+  fun runLive_streamingToolThrowsAKotlinError_answersNothingAndTheRunGoesOn(): Unit = runBlocking {
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", id = "c1")),
+        AwaitSent("the pending answer", answers("c1", PENDING)),
+        Respond(
+          LlmResponse(
+            outputTranscription = Transcription(text = "still here", finished = true),
+            partial = false,
+          )
+        ),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    var started = false
+    val broken =
+      flow<String> {
+        started = true
+        throw AssertionError()
+      }
+    val tool = DummyTool(name = "monitor") { _, _ -> broken }
+    val (runner, model) = runnerFor(script, tools = listOf(tool))
+
+    val events = runner.runUntilTurnComplete()
+
+    assertThat(started).isTrue()
+    assertThat(model.toolAnswers().map { it.response }).containsExactly(PENDING)
+    assertThat(events.mapNotNull { it.outputTranscription?.text }).contains("still here")
+  }
+
+  @Test
+  fun runLive_streamingToolEmitsAFunctionResponse_sendsItsPayloadUnderTheCall(): Unit =
+    runBlocking {
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("monitor", id = "c1")),
+          AwaitSent("the payload", answers("c1", mapOf("price" to 300))),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val emitted = FunctionResponse(name = "other", id = "x", response = mapOf("price" to 300))
+      val (runner, model) =
+        runnerFor(script, tools = listOf(DummyTool(name = "monitor") { _, _ -> flowOf(emitted) }))
+
+      val unused = runner.runUntilTurnComplete()
+
+      assertThat(
+          model
+            .toolAnswers()
+            .filter { it.response == mapOf("price" to 300) }
+            .map { it.id to it.name }
+        )
+        .containsExactly("c1" to "monitor")
+    }
+
   companion object {
     private const val USER_ID = "user"
     private const val SESSION_ID = "session"
     private const val TOOL_CALL_ID = "call-1"
+    private val PENDING =
+      mapOf("status" to "The function is running asynchronously and the results are pending.")
   }
 }

@@ -53,6 +53,9 @@ abstract class BaseTool(
    * event is persisted. To return structured data, return a [Map], or expose the function via
    * [com.google.adk.kt.annotations.Tool], which converts data classes (and enums, lists, and nested
    * structures) into Maps automatically.
+   *
+   * In a live run, a returned [kotlinx.coroutines.flow.Flow] streams: the call is answered as
+   * pending at once, and each value then reaches the model as it arrives.
    */
   abstract suspend fun run(context: ToolContext, args: Map<String, Any?>): Any
 
