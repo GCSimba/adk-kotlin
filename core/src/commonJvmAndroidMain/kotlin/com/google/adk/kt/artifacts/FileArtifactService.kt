@@ -53,6 +53,10 @@ import kotlinx.serialization.SerializationException
  * filename, so nested names such as `images/photo.png` create nested directories; absolute paths
  * and names that traverse outside the storage scope (e.g. `../secret`) are rejected.
  *
+ * Saving an artifact whose final path segment is `metadata.json` or whose scope-relative path
+ * contains a `versions` segment is rejected in any casing, including trailing dots or spaces.
+ * Existing artifacts with these names remain readable and deletable.
+ *
  * Versions are 0-based and increase monotonically. A version is published atomically by staging its
  * payload and metadata in a temporary directory and renaming it into place, so concurrent readers
  * only ever observe complete versions (payload and metadata together). Writes to the same artifact
@@ -89,7 +93,20 @@ class FileArtifactService(private val baseDir: String) : ArtifactService {
       val data = requireNotNull(inlineData.data) { "Saveable artifact data must be non-empty." }
       require(data.isNotEmpty()) { "Saveable artifact data must be non-empty." }
 
-      val artifactDir = resolveArtifactDir(sessionKey, filename)
+      val scopeRoot = artifactScopeRoot(sessionKey, filename)
+      val artifactDir = resolveScopedArtifactDir(scopeRoot, filename)
+      // Case-insensitive filesystems alias casing; Windows also strips trailing dots and spaces.
+      require(!artifactDir.name.trimEnd(' ', '.').equals(METADATA_FILE_NAME, ignoreCase = true)) {
+        "Artifact filename is reserved for the metadata document."
+      }
+      val relativePath = scopeRoot.toPath().relativize(artifactDir.toPath())
+      require(
+        relativePath.none {
+          it.toString().trimEnd(' ', '.').equals(VERSIONS_DIR_NAME, ignoreCase = true)
+        },
+      ) {
+        "Artifact filename contains a reserved versions directory."
+      }
       lockFor(artifactDir).withLock {
         val versionsDir = versionsDir(artifactDir)
         val nextVersion = (listVersionsOnDisk(artifactDir).lastOrNull() ?: -1) + 1
@@ -144,7 +161,7 @@ class FileArtifactService(private val baseDir: String) : ArtifactService {
       }
     return Part(
       fileData =
-        FileData(fileUri = uri, mimeType = artifact.inlineData?.mimeType ?: DEFAULT_MIME_TYPE)
+        FileData(fileUri = uri, mimeType = artifact.inlineData?.mimeType ?: DEFAULT_MIME_TYPE),
     )
   }
 
@@ -179,7 +196,7 @@ class FileArtifactService(private val baseDir: String) : ArtifactService {
               data = payload.readBytes(),
               mimeType = metadata?.mimeType,
               displayName = metadata?.displayName,
-            )
+            ),
         )
       } catch (e: IOException) {
         // The payload may be deleted or become unreadable between the existence check and the read
@@ -210,7 +227,7 @@ class FileArtifactService(private val baseDir: String) : ArtifactService {
       val userRoot = userArtifactsDir(base)
       for (dir in iterArtifactDirs(userRoot)) {
         keys.add(
-          latestMetadata(dir)?.fileName ?: "$USER_NAMESPACE_PREFIX${relativePosix(userRoot, dir)}"
+          latestMetadata(dir)?.fileName ?: "$USER_NAMESPACE_PREFIX${relativePosix(userRoot, dir)}",
         )
       }
 
@@ -256,17 +273,19 @@ class FileArtifactService(private val baseDir: String) : ArtifactService {
   private fun isUserScoped(sessionId: String?, filename: String): Boolean =
     sessionId == null || filename.startsWith(USER_NAMESPACE_PREFIX)
 
-  /** Resolves the directory that holds all versions of a given artifact. */
-  private fun resolveArtifactDir(sessionKey: SessionKey, filename: String): File {
+  /** Returns the user or session storage scope for an artifact filename. */
+  private fun artifactScopeRoot(sessionKey: SessionKey, filename: String): File {
     val base = baseRoot(sessionKey.userId)
-    val scopeRoot =
-      if (isUserScoped(sessionKey.id, filename)) {
-        userArtifactsDir(base)
-      } else {
-        sessionArtifactsDir(base, requireNotNull(sessionKey.id))
-      }
-    return resolveScopedArtifactDir(scopeRoot, filename)
+    return if (isUserScoped(sessionKey.id, filename)) {
+      userArtifactsDir(base)
+    } else {
+      sessionArtifactsDir(base, requireNotNull(sessionKey.id))
+    }
   }
+
+  /** Resolves the directory that holds all versions of a given artifact. */
+  private fun resolveArtifactDir(sessionKey: SessionKey, filename: String): File =
+    resolveScopedArtifactDir(artifactScopeRoot(sessionKey, filename), filename)
 
   /**
    * Joins [filename] under [scopeRoot], rejecting absolute paths or paths that escape the scope.
@@ -278,12 +297,12 @@ class FileArtifactService(private val baseDir: String) : ArtifactService {
     val relative = Paths.get(stripped).normalize()
     require(
       !stripped.startsWith("/") &&
-          !relative.isAbsolute &&
-          !relative.startsWith(Paths.get("..")) &&
-          !Regex("^[A-Za-z]:").containsMatchIn(stripped)
+        !relative.isAbsolute &&
+        !relative.startsWith(Paths.get("..")) &&
+        !Regex("^[A-Za-z]:").containsMatchIn(stripped),
     ) {
       "Artifact filename '$filename' must be relative to the storage scope and must not traverse " +
-          "outside it."
+        "outside it."
     }
     val relativeString = relative.toString()
     return if (relativeString.isEmpty()) {
@@ -316,7 +335,7 @@ class FileArtifactService(private val baseDir: String) : ArtifactService {
   // On-disk helpers
   // ---------------------------------------------------------------------------------------------
 
-  private fun versionsDir(artifactDir: File): File = File(artifactDir, "versions")
+  private fun versionsDir(artifactDir: File): File = File(artifactDir, VERSIONS_DIR_NAME)
 
   /** Lists the published version numbers under an artifact, sorted ascending. */
   private fun listVersionsOnDisk(artifactDir: File): List<Int> =
@@ -331,7 +350,7 @@ class FileArtifactService(private val baseDir: String) : ArtifactService {
     if (!root.exists()) return emptyList()
     val result = mutableListOf<File>()
     fun walk(dir: File) {
-      if (File(dir, "versions").exists()) {
+      if (File(dir, VERSIONS_DIR_NAME).exists()) {
         result.add(dir)
         return // An artifact directory is a leaf; do not descend into its versions.
       }
@@ -371,6 +390,7 @@ class FileArtifactService(private val baseDir: String) : ArtifactService {
 
     private const val USER_NAMESPACE_PREFIX: String = "user:"
     private const val METADATA_FILE_NAME: String = "metadata.json"
+    private const val VERSIONS_DIR_NAME: String = "versions"
     private const val DEFAULT_MIME_TYPE: String = "application/octet-stream"
   }
 }

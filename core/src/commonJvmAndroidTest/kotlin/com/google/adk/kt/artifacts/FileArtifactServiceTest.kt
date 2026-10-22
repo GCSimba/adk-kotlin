@@ -24,11 +24,14 @@ import java.nio.file.Files
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 
 /** Unit tests for [FileArtifactService]. */
@@ -119,7 +122,7 @@ class FileArtifactServiceTest {
         FILENAME,
         Part(
           inlineData =
-            Blob(data = "x".toByteArray(), mimeType = "text/plain", displayName = "My Report")
+            Blob(data = "x".toByteArray(), mimeType = "text/plain", displayName = "My Report"),
         ),
       )
 
@@ -161,6 +164,180 @@ class FileArtifactServiceTest {
     assertFailsWith<IllegalArgumentException> {
       service.saveArtifact(SESSION_KEY, FILENAME, Part(inlineData = Blob(data = ByteArray(0))))
     }
+  }
+
+  @Test
+  fun saveArtifact_reservedMetadataBasenames_areRejectedBeforeWriting() = runBlocking {
+    val filenames =
+      listOf(
+        "metadata.json",
+        "Metadata.Json",
+        "METADATA.JSON",
+        "nested/metadata.json",
+        "nested\\metadata.json",
+        "nested/../metadata.json",
+        "metadata.json/child/..",
+        "user:metadata.json",
+        "user:nested/Metadata.Json",
+        "metadata.json.",
+        "metadata.json...",
+        "metadata.json . . ",
+      )
+
+    for (key in listOf(SESSION_KEY, SESSION_KEY.copy(id = null))) {
+      for (filename in filenames) {
+        val context = "filename=$filename, session=${key.id}"
+        val failure =
+          assertFailsWith<IllegalArgumentException>(context) {
+            service.saveArtifact(key, filename, part("user payload"))
+          }
+        assertContains(failure.message.orEmpty(), "reserved", message = context)
+        assertContentEquals(emptyList(), baseDir.listFiles().orEmpty().toList(), context)
+      }
+    }
+  }
+
+  @Test
+  fun saveArtifact_reservedVersionsPathComponents_areRejectedBeforeWriting() = runBlocking {
+    val filenames =
+      listOf(
+        "report/versions/0/x.txt",
+        "versions",
+        "VERSIONS",
+        "versions/x.txt",
+        "report/Versions/x.txt",
+        "report/versions./x.txt",
+        "report/versions . ./x.txt",
+        "versions . . ",
+        "report\\versions\\0\\x.txt",
+        "user:versions/x.txt",
+        "user:report/Versions/x.txt",
+        "nested/../versions/x.txt",
+        "report/child/../versions/x.txt",
+      )
+
+    for (key in listOf(SESSION_KEY, SESSION_KEY.copy(id = null))) {
+      for (filename in filenames) {
+        val context = "filename=$filename, session=${key.id}"
+        val failure =
+          assertFailsWith<IllegalArgumentException>(context) {
+            service.saveArtifact(key, filename, part("user payload"))
+          }
+        assertContains(failure.message.orEmpty(), "reserved", message = context)
+        assertContentEquals(emptyList(), baseDir.listFiles().orEmpty().toList(), context)
+      }
+    }
+  }
+
+  @Test
+  fun saveArtifact_reservedNames_omitCallerFilenameFromErrors() = runBlocking {
+    for (filename in listOf("private-name/metadata.json", "private-name/versions/x.txt")) {
+      val failure =
+        assertFailsWith<IllegalArgumentException>("filename=$filename") {
+          service.saveArtifact(SESSION_KEY, filename, part("user payload"))
+        }
+      assertContains(failure.message.orEmpty(), "reserved", message = "filename=$filename")
+      assertFalse(failure.message.orEmpty().contains("private-name"), "filename=$filename")
+    }
+  }
+
+  @Test
+  fun saveAndReloadArtifact_reservedNames_areRejectedBeforeWriting() = runBlocking {
+    for (filename in listOf("metadata.json", "report/versions/0/x.txt")) {
+      assertFailsWith<IllegalArgumentException>("filename=$filename") {
+        service.saveAndReloadArtifact(SESSION_KEY, filename, part("user payload"))
+      }
+      assertContentEquals(
+        emptyList(),
+        baseDir.listFiles().orEmpty().toList(),
+        "filename=$filename",
+      )
+    }
+  }
+
+  @Test
+  fun saveArtifact_similarNamesAndMetadataParentDirectory_roundTrip() = runBlocking {
+    for (filename in
+      listOf(
+        "report.json",
+        "metadata.json.bak",
+        "metadata.json/report.txt",
+        "versions.txt",
+        "myversions/report.txt",
+        "versions/../normalized.txt",
+      )) {
+      assertEquals(0, service.saveArtifact(SESSION_KEY, filename, part("user payload")), filename)
+      assertEquals(part("user payload"), service.loadArtifact(SESSION_KEY, filename), filename)
+      assertContains(service.listArtifactKeys(SESSION_KEY), filename, filename)
+    }
+  }
+
+  @Test
+  fun saveArtifact_versionsInStorageRootAndScopeIdentifiers_roundTrip() = runBlocking {
+    val scopedService = FileArtifactService(File(baseDir, "versions").path)
+    val key = SESSION_KEY.copy(userId = "versions", id = "versions")
+
+    assertEquals(0, scopedService.saveArtifact(key, FILENAME, part("user payload")))
+    assertEquals(part("user payload"), scopedService.loadArtifact(key, FILENAME))
+    assertEquals(listOf(FILENAME), scopedService.listArtifactKeys(key))
+  }
+
+  @Test
+  fun existingMetadataNamedArtifact_remainsReadableAndDeletable() = runBlocking {
+    val artifactDir = File(baseDir, "users/$USER_ID/sessions/$SESSION_ID/artifacts/metadata.json")
+    val versionDir = File(artifactDir, "versions/0")
+    assertTrue(versionDir.mkdirs())
+    val metadata =
+      """
+      {"version":0,"fileName":"metadata.json","canonicalUri":"file:///legacy",
+       "createTime":0.0,"mimeType":"application/json"}
+      """
+        .trimIndent()
+        .toByteArray()
+    File(versionDir, "metadata.json").writeBytes(metadata)
+
+    assertFailsWith<IllegalArgumentException> {
+      service.saveArtifact(SESSION_KEY, "metadata.json", part("replacement"))
+    }
+    assertContentEquals(
+      metadata,
+      service.loadArtifact(SESSION_KEY, "metadata.json")?.inlineData?.data,
+    )
+    assertEquals(listOf(0), service.listVersions(SESSION_KEY, "metadata.json"))
+    assertEquals(listOf("metadata.json"), service.listArtifactKeys(SESSION_KEY))
+
+    service.deleteArtifact(SESSION_KEY, "metadata.json")
+
+    assertFalse(artifactDir.exists())
+    assertNull(service.loadArtifact(SESSION_KEY, "metadata.json"))
+  }
+
+  @Test
+  fun existingVersionsPathArtifact_remainsReadableAndDeletable() = runBlocking {
+    val filename = "report/versions/0/x.txt"
+    val artifactDir = File(baseDir, "users/$USER_ID/sessions/$SESSION_ID/artifacts/$filename")
+    val versionDir = File(artifactDir, "versions/0")
+    assertTrue(versionDir.mkdirs())
+    File(versionDir, "x.txt").writeText("legacy payload")
+    File(versionDir, "metadata.json")
+      .writeText(
+        """
+        {"version":0,"fileName":"$filename","canonicalUri":"file:///legacy",
+         "createTime":0.0,"mimeType":"text/plain"}
+        """
+          .trimIndent(),
+      )
+
+    assertFailsWith<IllegalArgumentException> {
+      service.saveArtifact(SESSION_KEY, filename, part("replacement"))
+    }
+    assertEquals(part("legacy payload"), service.loadArtifact(SESSION_KEY, filename))
+    assertEquals(listOf(0), service.listVersions(SESSION_KEY, filename))
+
+    service.deleteArtifact(SESSION_KEY, filename)
+
+    assertFalse(artifactDir.exists())
+    assertNull(service.loadArtifact(SESSION_KEY, filename))
   }
 
   @Test
