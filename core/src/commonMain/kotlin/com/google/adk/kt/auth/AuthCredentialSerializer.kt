@@ -67,6 +67,7 @@ internal object AuthCredentialSerializer : KSerializer<AuthCredential> {
     @JsonNames("auth_type") val authType: Type,
     @JsonNames("api_key") val apiKey: JsonSecret? = null,
     val http: Http? = null,
+    @JsonNames("service_account") val serviceAccount: ServiceAccount? = null,
     val oauth2: OAuth2? = null,
   ) {
     fun toCredential(): AuthCredential =
@@ -76,10 +77,7 @@ internal object AuthCredentialSerializer : KSerializer<AuthCredential> {
         Type.OAUTH2 -> oauth2.required("oauth2").toOAuth2(AuthCredential.OAuth2.Variant.OAUTH2)
         Type.OPEN_ID_CONNECT ->
           oauth2.required("oauth2").toOAuth2(AuthCredential.OAuth2.Variant.OPEN_ID_CONNECT)
-        Type.SERVICE_ACCOUNT ->
-          throw SerializationException(
-            "Reading this credential type from JSON is not supported yet."
-          )
+        Type.SERVICE_ACCOUNT -> serviceAccount.required("serviceAccount").toServiceAccount()
       }
 
     // Only an API key's payload may be absent; the other kinds are unusable without theirs.
@@ -109,9 +107,7 @@ internal object AuthCredentialSerializer : KSerializer<AuthCredential> {
               oauth2 = OAuth2(credential),
             )
           is AuthCredential.ServiceAccount ->
-            throw SerializationException(
-              "Writing this credential type as JSON is not supported yet."
-            )
+            Wire(Type.SERVICE_ACCOUNT, serviceAccount = ServiceAccount(credential))
         }
     }
   }
@@ -215,5 +211,84 @@ internal object AuthCredentialSerializer : KSerializer<AuthCredential> {
         codeChallengeMethod = codeChallengeMethod,
         tokenEndpointAuthMethod = tokenEndpointAuthMethod,
       )
+  }
+
+  @Serializable
+  private class ServiceAccount(
+    @JsonNames("service_account_credential") val serviceAccountCredential: Credential? = null,
+    val scopes: List<String>? = null,
+    @JsonNames("use_default_credential") val useDefaultCredential: Boolean = false,
+    @JsonNames("use_id_token") val useIdToken: Boolean = false,
+    val audience: String? = null,
+  ) {
+    constructor(
+      serviceAccount: AuthCredential.ServiceAccount
+    ) : this(
+      serviceAccountCredential = serviceAccount.serviceAccountCredential?.let(::Credential),
+      scopes = serviceAccount.scopes,
+      useDefaultCredential = serviceAccount.useDefaultCredential,
+      useIdToken = serviceAccount.useIdToken,
+      audience = serviceAccount.audience,
+    )
+
+    fun toServiceAccount(): AuthCredential.ServiceAccount =
+      try {
+        AuthCredential.ServiceAccount(
+          serviceAccountCredential = serviceAccountCredential?.toCredential(),
+          scopes = scopes,
+          useDefaultCredential = useDefaultCredential,
+          useIdToken = useIdToken,
+          audience = audience,
+        )
+      } catch (e: IllegalArgumentException) {
+        // The constructor's check messages carry no input.
+        throw SerializationException(e.message, e)
+      }
+
+    @Serializable
+    class Credential(
+      val type: String = "",
+      @JsonNames("project_id") val projectId: String,
+      @JsonNames("private_key_id") val privateKeyId: JsonSecret,
+      @JsonNames("private_key") val privateKey: JsonSecret,
+      @JsonNames("client_email") val clientEmail: String,
+      @JsonNames("client_id") val clientId: String,
+      @JsonNames("auth_uri") val authUri: String,
+      @JsonNames("token_uri") val tokenUri: String,
+      @JsonNames("auth_provider_x509_cert_url") val authProviderX509CertUrl: String,
+      @JsonNames("client_x509_cert_url") val clientX509CertUrl: String,
+      @JsonNames("universe_domain") val universeDomain: String,
+    ) {
+      constructor(
+        key: AuthCredential.ServiceAccount.Credential
+      ) : this(
+        type = key.type,
+        projectId = key.projectId,
+        privateKeyId = key.privateKeyId,
+        privateKey = key.privateKey,
+        clientEmail = key.clientEmail,
+        clientId = key.clientId,
+        authUri = key.authUri,
+        tokenUri = key.tokenUri,
+        authProviderX509CertUrl = key.authProviderX509CertUrl,
+        clientX509CertUrl = key.clientX509CertUrl,
+        universeDomain = key.universeDomain,
+      )
+
+      fun toCredential(): AuthCredential.ServiceAccount.Credential =
+        AuthCredential.ServiceAccount.Credential(
+          type = type,
+          projectId = projectId,
+          privateKeyId = privateKeyId,
+          privateKey = privateKey,
+          clientEmail = clientEmail,
+          clientId = clientId,
+          authUri = authUri,
+          tokenUri = tokenUri,
+          authProviderX509CertUrl = authProviderX509CertUrl,
+          clientX509CertUrl = clientX509CertUrl,
+          universeDomain = universeDomain,
+        )
+    }
   }
 }

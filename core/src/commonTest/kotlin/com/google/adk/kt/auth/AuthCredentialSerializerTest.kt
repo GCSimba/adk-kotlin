@@ -190,13 +190,101 @@ class AuthCredentialSerializerTest {
   }
 
   @Test
-  fun decode_serviceAccount_throwsUntilSupported() {
+  fun decode_serviceAccountIdTokenWithoutAudience_throwsWithItsCheck() {
+    val error =
+      assertFailsWith<SerializationException> {
+        decode(
+          """{"authType": "serviceAccount",
+            "serviceAccount": {"useDefaultCredential": true, "useIdToken": true}}"""
+        )
+      }
+
+    assertEquals("ServiceAccount requires audience when useIdToken is true.", error.message)
+  }
+
+  @Test
+  fun decode_serviceAccountIncompleteKey_throws() {
+    assertMalformed(
+      """{"authType": "serviceAccount", "serviceAccount": {"serviceAccountCredential":
+        {"projectId": "p"}}}"""
+    )
+  }
+
+  @Test
+  fun decode_serviceAccountKeyWithoutType_readsAnEmptyType() {
+    val keyJson = KEY_JSON.replace("\"type\": \"service_account\", ", "")
+
+    assertEquals(
+      AuthCredential.ServiceAccount.fromKey(KEY.copy(type = ""), listOf("s")),
+      decode(
+        """{"authType": "serviceAccount", "serviceAccount": {"serviceAccountCredential": $keyJson,
+          "scopes": ["s"]}}"""
+      ),
+    )
+  }
+
+  @Test
+  fun decode_serviceAccountNullFlags_throws() {
+    for (flag in listOf("useDefaultCredential", "useIdToken")) {
+      assertMalformed(
+        """{"authType": "serviceAccount", "serviceAccount": {"serviceAccountCredential": $KEY_JSON,
+          "scopes": ["s"], "$flag": null}}"""
+      )
+    }
+  }
+
+  @Test
+  fun decode_serviceAccountScopesNotList_throws() {
+    assertMalformed(
+      """{"authType": "serviceAccount", "serviceAccount": {"useDefaultCredential": true,
+        "scopes": "s"}}"""
+    )
+  }
+
+  @Test
+  fun decode_serviceAccountSnakeCaseNames_readsThem() {
+    assertEquals(
+      SERVICE_ACCOUNT,
+      decode(
+        """{"auth_type": "serviceAccount", "service_account": {"service_account_credential": {
+          "type": "service_account", "project_id": "p", "private_key_id": "kid",
+          "private_key": "pem", "client_email": "sa@p.iam.gserviceaccount.com",
+          "client_id": "123", "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+          "token_uri": "https://oauth2.googleapis.com/token",
+          "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+          "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/sa",
+          "universe_domain": "googleapis.com"}, "scopes": ["s"],
+          "use_default_credential": true, "use_id_token": true,
+          "audience": "https://example.com"}}"""
+      ),
+    )
+  }
+
+  @Test
+  fun decode_serviceAccountWithoutKey_throwsWithItsCheck() {
     val error =
       assertFailsWith<SerializationException> {
         decode("""{"authType": "serviceAccount", "serviceAccount": {}}""")
       }
 
-    assertEquals("Reading this credential type from JSON is not supported yet.", error.message)
+    assertEquals(
+      "ServiceAccount requires serviceAccountCredential when useDefaultCredential is false.",
+      error.message,
+    )
+  }
+
+  @Test
+  fun decode_serviceAccountWithoutPayload_throws() {
+    // A service account needs a key or Application Default Credentials.
+    val error =
+      assertFailsWith<SerializationException> { decode("""{"authType": "serviceAccount"}""") }
+
+    assertEquals("An auth credential has no serviceAccount payload.", error.message)
+  }
+
+  @Test
+  fun decode_serviceAccount_readsEveryField() {
+    assertEquals(SERVICE_ACCOUNT, decode(SERVICE_ACCOUNT_JSON))
   }
 
   @Test
@@ -306,13 +394,51 @@ class AuthCredentialSerializerTest {
   }
 
   @Test
-  fun encode_serviceAccount_throwsUntilSupported() {
-    val error =
-      assertFailsWith<SerializationException> {
-        encode(AuthCredential.ServiceAccount(useDefaultCredential = true))
-      }
+  fun encode_serviceAccountDefaults_omitsThem() {
+    val keyJson = KEY_JSON.replace("\"type\": \"service_account\", ", "")
+    val credential = AuthCredential.ServiceAccount.fromKey(KEY.copy(type = ""), listOf("s"))
+    val written = encode(credential)
 
-    assertEquals("Writing this credential type as JSON is not supported yet.", error.message)
+    assertEquals(
+      json(
+        """{"authType": "serviceAccount", "serviceAccount": {"serviceAccountCredential": $keyJson,
+          "scopes": ["s"]}}"""
+      ),
+      written,
+    )
+    assertEquals(credential, decode(written.toString()))
+  }
+
+  @Test
+  fun encode_serviceAccount_writesEveryField() {
+    assertEquals(json(SERVICE_ACCOUNT_JSON), encode(SERVICE_ACCOUNT))
+  }
+
+  @Test
+  fun serviceAccount_applicationDefault_roundTripsWithoutKey() {
+    val credential = AuthCredential.ServiceAccount.applicationDefault()
+    val written = encode(credential)
+
+    assertEquals(
+      json("""{"authType": "serviceAccount", "serviceAccount": {"useDefaultCredential": true}}"""),
+      written,
+    )
+    assertEquals(credential, decode(written.toString()))
+  }
+
+  @Test
+  fun serviceAccount_idTokenWithKey_roundTripsEachFlag() {
+    val credential = AuthCredential.ServiceAccount.forIdToken("https://example.com", KEY)
+    val written = encode(credential)
+
+    assertEquals(
+      json(
+        """{"authType": "serviceAccount", "serviceAccount": {"serviceAccountCredential": $KEY_JSON,
+          "useIdToken": true, "audience": "https://example.com"}}"""
+      ),
+      written,
+    )
+    assertEquals(credential, decode(written.toString()))
   }
 
   @Test
@@ -353,6 +479,44 @@ class AuthCredentialSerializerTest {
   }
 
   private companion object {
+    val KEY =
+      AuthCredential.ServiceAccount.Credential(
+        type = "service_account",
+        projectId = "p",
+        privateKeyId = Secret("kid"),
+        privateKey = Secret("pem"),
+        clientEmail = "sa@p.iam.gserviceaccount.com",
+        clientId = "123",
+        authUri = "https://accounts.google.com/o/oauth2/auth",
+        tokenUri = "https://oauth2.googleapis.com/token",
+        authProviderX509CertUrl = "https://www.googleapis.com/oauth2/v1/certs",
+        clientX509CertUrl = "https://www.googleapis.com/robot/v1/metadata/x509/sa",
+        universeDomain = "googleapis.com",
+      )
+
+    const val KEY_JSON =
+      """{"type": "service_account", "projectId": "p", "privateKeyId": "kid",
+        "privateKey": "pem", "clientEmail": "sa@p.iam.gserviceaccount.com", "clientId": "123",
+        "authUri": "https://accounts.google.com/o/oauth2/auth",
+        "tokenUri": "https://oauth2.googleapis.com/token",
+        "authProviderX509CertUrl": "https://www.googleapis.com/oauth2/v1/certs",
+        "clientX509CertUrl": "https://www.googleapis.com/robot/v1/metadata/x509/sa",
+        "universeDomain": "googleapis.com"}"""
+
+    val SERVICE_ACCOUNT =
+      AuthCredential.ServiceAccount(
+        serviceAccountCredential = KEY,
+        scopes = listOf("s"),
+        useDefaultCredential = true,
+        useIdToken = true,
+        audience = "https://example.com",
+      )
+
+    val SERVICE_ACCOUNT_JSON =
+      """{"authType": "serviceAccount", "serviceAccount": {"serviceAccountCredential": $KEY_JSON,
+        "scopes": ["s"], "useDefaultCredential": true, "useIdToken": true,
+        "audience": "https://example.com"}}"""
+
     val OAUTH2 =
       AuthCredential.OAuth2(
         clientId = "client",
