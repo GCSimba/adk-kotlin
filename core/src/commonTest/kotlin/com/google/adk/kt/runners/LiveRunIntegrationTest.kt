@@ -41,6 +41,7 @@ import com.google.adk.kt.testing.spokenModelTurn
 import com.google.adk.kt.testing.turnCompleteStep
 import com.google.adk.kt.types.Blob
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
@@ -50,12 +51,16 @@ import com.google.common.truth.Truth.assertWithMessage
 import kotlin.test.Test
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 
 /** Drives whole live runs through the public runner against scripted presets of real traffic. */
 class LiveRunIntegrationTest {
@@ -118,6 +123,16 @@ class LiveRunIntegrationTest {
       runLive(USER_ID, SESSION_ID, queue, liveConfig())
         .onEach { if (it.turnComplete) queue.close() }
         .toList()
+    }
+
+  /** A `monitor` tool that emits "watching <symbol>" once, then waits to be cancelled. */
+  private fun watchingTool(streams: MutableStateFlow<Int>) =
+    DummyTool(name = "monitor") { _, args ->
+      flow {
+        streams.update { it + 1 }
+        emit("watching ${args["symbol"]}")
+        awaitCancellation()
+      }
     }
 
   /** A stream that emits nothing until it is cancelled, completing [cancelled] when it is. */
@@ -351,6 +366,210 @@ class LiveRunIntegrationTest {
   }
 
   @Test
+  fun runLive_sameCallIdTwiceInOneTurn_streamsOnlyTheNewerCall(): Unit = runBlocking {
+    val streams = MutableStateFlow(0)
+    val calls =
+      listOf("gold", "silver").map { symbol ->
+        Part(
+          functionCall = FunctionCall(name = "monitor", args = mapOf("symbol" to symbol), id = "c1")
+        )
+      }
+    val script =
+      listOf(
+        Respond(LlmResponse(content = Content(Role.MODEL, calls))),
+        AwaitSent("the silver value", answers("c1", mapOf("result" to "watching silver"))),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    val (runner, model) = runnerFor(script, tools = listOf(watchingTool(streams)))
+
+    val unused = runner.runUntilTurnComplete()
+
+    model.connections.single().assertAllWaitsMet()
+    assertThat(streams.value).isEqualTo(1)
+    assertThat(model.toolAnswers().map { it.response }.filter { it != PENDING })
+      .containsExactly(mapOf("result" to "watching silver"))
+  }
+
+  @Test
+  fun runLive_identicalCallWhileItStreams_answersAlreadyStreamingAndStartsNoSecondStream(): Unit =
+    runBlocking {
+      val streams = MutableStateFlow(0)
+      val gold = mapOf("symbol" to "gold")
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("monitor", gold, id = "c1")),
+          AwaitSent("the first value", answers("c1", mapOf("result" to "watching gold"))),
+          Respond(modelFunctionCallResponse("monitor", gold, id = "c2")),
+          AwaitSent("the repeat's answer", answers("c2", ALREADY_STREAMING)),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) = runnerFor(script, tools = listOf(watchingTool(streams)))
+
+      val unused = runner.runUntilTurnComplete()
+
+      model.connections.single().assertAllWaitsMet()
+      assertThat(streams.value).isEqualTo(1)
+      assertThat(model.toolAnswers().filter { it.id == "c2" }.map { it.response })
+        .containsExactly(ALREADY_STREAMING)
+    }
+
+  @Test
+  fun runLive_identicalCallsInOneResponse_streamOnceAndAnswerTheSecondAlreadyStreaming(): Unit =
+    runBlocking {
+      val streams = MutableStateFlow(0)
+      val calls =
+        listOf("c1", "c2").map { id ->
+          Part(
+            functionCall = FunctionCall(name = "monitor", args = mapOf("symbol" to "gold"), id = id)
+          )
+        }
+      val script =
+        listOf(
+          Respond(LlmResponse(content = Content(Role.MODEL, calls))),
+          AwaitSent("the value", answers("c1", mapOf("result" to "watching gold"))),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      // Suspends before returning its flow, so both calls pass run's check and start refuses c2.
+      val monitor =
+        DummyTool(name = "monitor") { _, args ->
+          yield()
+          flow {
+            streams.update { it + 1 }
+            emit("watching ${args["symbol"]}")
+            awaitCancellation()
+          }
+        }
+      val (runner, model) = runnerFor(script, tools = listOf(monitor))
+
+      val unused = runner.runUntilTurnComplete()
+
+      model.connections.single().assertAllWaitsMet()
+      assertThat(streams.value).isEqualTo(1)
+      assertThat(model.toolAnswers().filter { it.id == "c2" }.map { it.response })
+        .containsExactly(ALREADY_STREAMING)
+    }
+
+  @Test
+  fun runLive_identicalCallReusingTheRunningId_answersAlreadyStreaming(): Unit = runBlocking {
+    val streams = MutableStateFlow(0)
+    val gold = mapOf("symbol" to "gold")
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", gold, id = "c1")),
+        AwaitSent("the first value", answers("c1", mapOf("result" to "watching gold"))),
+        Respond(modelFunctionCallResponse("monitor", gold, id = "c1")),
+        AwaitSent("the repeat's answer", answers("c1", ALREADY_STREAMING)),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    val (runner, model) = runnerFor(script, tools = listOf(watchingTool(streams)))
+
+    val unused = runner.runUntilTurnComplete()
+
+    model.connections.single().assertAllWaitsMet()
+    assertThat(streams.value).isEqualTo(1)
+    assertThat(model.toolAnswers().map { it.response })
+      .containsExactly(PENDING, mapOf("result" to "watching gold"), ALREADY_STREAMING)
+      .inOrder()
+  }
+
+  @Test
+  fun runLive_identicalCallWhileItStreams_doesNotRunTheToolAgain(): Unit = runBlocking {
+    val runs = MutableStateFlow(0)
+    val monitor =
+      DummyTool(name = "monitor") { _, _ ->
+        runs.update { it + 1 }
+        flow {
+          emit("watching gold")
+          awaitCancellation()
+        }
+      }
+    val gold = mapOf("symbol" to "gold")
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", gold, id = "c1")),
+        AwaitSent("the first value", answers("c1", mapOf("result" to "watching gold"))),
+        Respond(modelFunctionCallResponse("monitor", gold, id = "c2")),
+        AwaitSent("the repeat's answer", answers("c2", ALREADY_STREAMING)),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    val (runner, model) = runnerFor(script, tools = listOf(monitor))
+
+    val unused = runner.runUntilTurnComplete()
+
+    model.connections.single().assertAllWaitsMet()
+    assertThat(runs.value).isEqualTo(1)
+  }
+
+  @Test
+  fun runLive_sameToolWithOtherArgumentsWhileItStreams_startsASecondStream(): Unit = runBlocking {
+    val streams = MutableStateFlow(0)
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", mapOf("symbol" to "gold"), id = "c1")),
+        AwaitSent("the gold value", answers("c1", mapOf("result" to "watching gold"))),
+        Respond(modelFunctionCallResponse("monitor", mapOf("symbol" to "silver"), id = "c2")),
+        AwaitSent("the silver pending answer", answers("c2", PENDING)),
+        AwaitSent("the silver value", answers("c2", mapOf("result" to "watching silver"))),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    val (runner, model) = runnerFor(script, tools = listOf(watchingTool(streams)))
+
+    val unused = runner.runUntilTurnComplete()
+
+    model.connections.single().assertAllWaitsMet()
+    assertThat(streams.value).isEqualTo(2)
+  }
+
+  @Test
+  fun runLive_identicalCallAfterTheStreamEnded_startsANewStream(): Unit = runBlocking {
+    val firstEnded = CompletableDeferred<Unit>()
+    val streams = MutableStateFlow(0)
+    val monitor =
+      DummyTool(name = "monitor") { _, _ ->
+        flow {
+            streams.update { it + 1 }
+            emit("300")
+          }
+          .onCompletion { firstEnded.complete(Unit) }
+      }
+    val gold = mapOf("symbol" to "gold")
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", gold, id = "c1")),
+        AwaitSent("the first stream's value", answers("c1", mapOf("result" to "300"))),
+        Respond(LlmResponse(turnComplete = true)),
+        AwaitSent("the caller's next turn") { message ->
+          (message as? ContentInput)?.content?.parts?.any { it.text == "again" } == true
+        },
+        Respond(modelFunctionCallResponse("monitor", gold, id = "c2")),
+        AwaitSent("the second pending answer", answers("c2", PENDING)),
+        AwaitSent("the second stream's value", answers("c2", mapOf("result" to "300"))),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    val (runner, model) = runnerFor(script, tools = listOf(monitor))
+    val queue = LiveRequestQueue()
+    var turns = 0
+
+    val unused =
+      runner
+        .runLive(USER_ID, SESSION_ID, queue, liveConfig())
+        .onEach {
+          if (!it.turnComplete) return@onEach
+          turns++
+          if (turns == 1) {
+            firstEnded.await()
+            queue.sendContent(Content(Role.USER, listOf(Part(text = "again"))))
+          } else {
+            queue.close()
+          }
+        }
+        .toList()
+
+    model.connections.single().assertAllWaitsMet()
+    assertThat(streams.value).isEqualTo(2)
+  }
+
+  @Test
   fun runLive_streamingToolEmitsAFunctionResponse_sendsItsPayloadUnderTheCall(): Unit =
     runBlocking {
       val script =
@@ -413,5 +632,11 @@ class LiveRunIntegrationTest {
     private const val TOOL_CALL_ID = "call-1"
     private val PENDING =
       mapOf("status" to "The function is running asynchronously and the results are pending.")
+    private val ALREADY_STREAMING =
+      mapOf(
+        "status" to
+          "monitor is already running with these arguments; wait for its updates " +
+            "instead of calling again."
+      )
   }
 }

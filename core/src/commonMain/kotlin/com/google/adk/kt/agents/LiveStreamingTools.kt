@@ -118,22 +118,48 @@ internal class LiveStreamingTools(
     Channel<ToolEvent>(Channel.UNLIMITED, onUndeliveredElement = { undelivered.store(it) })
 
   /** One function call to a streaming tool, and the coroutine collecting what it emits. */
-  private class StreamingCall(val toolName: String, val callId: String) {
-    lateinit var job: Job
+  private class StreamingCall(
+    val toolName: String,
+    val callId: String,
+    val args: Map<String, Any?>,
+    val job: Job,
+  ) {
+    /** Whether [other] calls the same tool with the same arguments while this one still streams. */
+    fun isRepeatedBy(other: StreamingCall): Boolean = isRepeatedBy(other.toolName, other.args)
+
+    /**
+     * Whether a call to [toolName] with [args], under any id, repeats this one while it streams.
+     */
+    fun isRepeatedBy(toolName: String, args: Map<String, Any?>): Boolean =
+      toolName == this.toolName &&
+        args == this.args &&
+        // Not yet started still counts: a call in the same response starts once answered.
+        !job.isCompleted &&
+        !job.isCancelled
   }
 
   /**
    * Runs a live tool call, collecting a returned [Flow] in the background and answering the call as
-   * pending.
+   * pending. A repeat of a still-streaming call with the same arguments gets an "already running"
+   * answer instead of a second stream.
    */
   suspend fun run(tool: BaseTool, context: ToolContext, args: Map<String, Any?>): Any {
+    // Checked before the tool runs, so a repeat skips the work a tool does to start a stream.
+    if (active.load().any { it.isRepeatedBy(tool.name, args) }) return alreadyRunning(tool.name)
     val result = tool.run(context, args)
     val stream = result as? Flow<*> ?: return result
     // Every live call has an id: the turn fills in a missing one before any tool runs.
     val callId = checkNotNull(context.functionCallId) { "A live tool call has no id." }
-    start(tool, callId, stream)
+    if (!start(tool, callId, args, stream)) return alreadyRunning(tool.name)
     return mapOf(STATUS_KEY to PENDING_STATUS)
   }
+
+  private fun alreadyRunning(toolName: String): Map<String, Any?> =
+    mapOf(
+      STATUS_KEY to
+        "$toolName is already running with these arguments; wait for its updates instead of " +
+          "calling again."
+    )
 
   /**
    * Starts the streams whose pending answers [content] carries, now that those answers are queued
@@ -154,6 +180,16 @@ internal class LiveStreamingTools(
   /** Puts back an event whose hand-off to the caller never reached it. */
   fun putBack(event: ToolEvent) {
     undelivered.store(event)
+  }
+
+  /**
+   * Cancels the calls whose streams have not started, before a connection opens. Their pending
+   * answers were never queued and never will be, so a repeat of one starts a new stream.
+   */
+  fun onBeforeConnect() {
+    for (call in active.load()) {
+      if (!call.job.isActive) call.job.cancel()
+    }
   }
 
   /** Takes every event tools sent the caller that is not delivered yet, oldest first. */
@@ -184,43 +220,72 @@ internal class LiveStreamingTools(
     scope.cancel()
   }
 
-  /** Starts streaming [stream] for [callId] once its pending answer is queued. */
+  /**
+   * Starts streaming [stream] for [callId], unless an earlier call to the same tool with the same
+   * [args] still streams.
+   *
+   * @return whether the stream started.
+   */
   @Suppress("UnsafeCoroutineCrossing") // Only the launched coroutine touches the stream.
-  private fun start(tool: BaseTool, callId: String, stream: Flow<*>) {
-    val call = StreamingCall(tool.name, callId)
+  private fun start(
+    tool: BaseTool,
+    callId: String,
+    args: Map<String, Any?>,
+    stream: Flow<*>,
+  ): Boolean {
     // Waits for its pending answer to be queued, so the model hears that first.
-    call.job = scope.launch(start = CoroutineStart.LAZY) { relay(tool, call, stream) }
-    active.mutate { calls -> calls + call }
+    val job = scope.launch(start = CoroutineStart.LAZY) { relay(tool, callId, stream) }
+    // A copy, so a caller changing its map cannot change what later calls are compared with.
+    val call = StreamingCall(tool.name, callId, args.toMap(), job)
+    val stale: List<StreamingCall>
+    while (true) {
+      val calls = active.load()
+      // Live models re-call a tool they already stream; a second stream would repeat each value.
+      if (calls.any { it.isRepeatedBy(call) }) {
+        call.job.cancel()
+        return false
+      }
+      // A call id answered twice must not stream twice; the newer call wins.
+      val (sameId, others) = calls.partition { it.callId == callId }
+      if (active.compareAndSet(calls, others + call)) {
+        stale = sameId
+        break
+      }
+    }
     call.job.invokeOnCompletion {
       finished.mutate { ids -> ids + call.callId }
       active.mutate { calls -> calls - call }
     }
+    for (old in stale) {
+      old.job.cancel()
+    }
+    return true
   }
 
-  private suspend fun relay(tool: BaseTool, call: StreamingCall, stream: Flow<*>) {
+  private suspend fun relay(tool: BaseTool, callId: String, stream: Flow<*>) {
     try {
       stream.collect { value ->
         // A flow that never suspends would otherwise outlive a stop or a handover.
         currentCoroutineContext().ensureActive()
         if (value is Event) {
-          sendToCaller(tool, call.callId, value)
+          sendToCaller(tool, callId, value)
         } else {
           // Not partial: Kotlin never sends a partial tool answer, and the wire ignores it anyway.
-          queue.sendContent(functionResponseContent(tool.name, call.callId, value))
+          queue.sendContent(functionResponseContent(tool.name, callId, value))
         }
       }
     } catch (e: Throwable) {
       // Exceptions and TODO()'s NotImplementedError reach the model unless stopped.
       if ((e is Error && e !is NotImplementedError) || !currentCoroutineContext().isActive) throw e
-      reportFailure(tool, call, e)
+      reportFailure(tool, callId, e)
     }
   }
 
-  private fun reportFailure(tool: BaseTool, call: StreamingCall, e: Throwable) {
+  private fun reportFailure(tool: BaseTool, callId: String, e: Throwable) {
     // The exception's text is left out: it can carry the user's or the model's data.
     logger.warn { "Streaming tool ${tool.name} failed (${e::class.simpleName})." }
     val error = mapOf(ERROR_KEY to "Invoking `${tool.name}()` failed with an internal error.")
-    queue.sendContent(functionResponseContent(tool.name, call.callId, error))
+    queue.sendContent(functionResponseContent(tool.name, callId, error))
   }
 
   private suspend fun sendToCaller(tool: BaseTool, callId: String, event: Event) {

@@ -406,6 +406,7 @@ internal class LlmAgentTurn(
 
     var attempt = 0
     while (true) {
+      liveTools?.onBeforeConnect()
       // A timeout at the last connection's end says nothing about this connection's saves.
       storeTimedOut = false
       val handle = resumptionHandle.load()

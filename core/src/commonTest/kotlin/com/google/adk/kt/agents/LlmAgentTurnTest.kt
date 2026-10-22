@@ -134,6 +134,90 @@ import org.junit.Test
 class LlmAgentTurnTest {
 
   @Test
+  fun runLive_dropLosesAStreamsPendingAnswer_anIdenticalCallAfterTheReconnectStartsIt(): Unit =
+    runBlocking {
+      val monitorRan = CompletableDeferred<Unit>()
+      val slowRan = CompletableDeferred<Unit>()
+      var streams = 0
+      val monitor =
+        DummyTool(name = "monitor") { _, _ ->
+          monitorRan.complete(Unit)
+          flow {
+            streams++
+            emit("300")
+            awaitCancellation()
+          }
+        }
+      // Holds the response's answers back until a send drops the connection.
+      val slow =
+        DummyTool(name = "slow") { _, _ ->
+          slowRan.complete(Unit)
+          awaitCancellation()
+        }
+      val pending =
+        mapOf("status" to "The function is running asynchronously and the results are pending.")
+      val first =
+        listOf(
+          Respond(
+            LlmResponse(
+              liveSessionResumptionUpdate =
+                LiveServerSessionResumptionUpdate(newHandle = "h1", resumable = true)
+            )
+          ),
+          Respond(
+            LlmResponse(
+              content =
+                Content(
+                  Role.MODEL,
+                  listOf(
+                    Part(
+                      functionCall = FunctionCall(name = "monitor", args = emptyMap(), id = "c1")
+                    ),
+                    Part(functionCall = FunctionCall(name = "slow", args = emptyMap(), id = "s1")),
+                  ),
+                )
+            )
+          ),
+        )
+      val second =
+        listOf(
+          Respond(modelFunctionCallResponse("monitor", id = "c2")),
+          AwaitSent("the pending answer") { it.answers("c2", pending) },
+          AwaitSent("the value") { it.answers("c2", mapOf("result" to "300")) },
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val model =
+        DummyLiveModel.perConnection(
+          listOf(first, second),
+          name = "gemini-3.8-live",
+          onSend = { connection, message ->
+            if (connection == 0 && message is ContentInput) {
+              throw GenAiApiException(1006, "ConnectionClosed", "socket closed")
+            }
+          },
+        )
+      val runner =
+        InMemoryRunner(
+          agent = LlmAgent(name = "agent", model = model, tools = listOf(monitor, slow))
+        )
+      val queue = LiveRequestQueue()
+
+      launch {
+        monitorRan.await()
+        slowRan.await()
+        queue.sendContent(Content(Role.USER, listOf(Part(text = "hello"))))
+      }
+      val unused =
+        runner
+          .runLive("u", "s", queue, RunConfig())
+          .onEach { if (it.turnComplete) queue.close() }
+          .toList()
+
+      model.connections[1].assertAllWaitsMet()
+      assertEquals(1, streams)
+    }
+
+  @Test
   fun runLive_connectionDropsWhileAToolStreams_deliversWhatItSendsAcrossTheDropOnce(): Unit =
     runBlocking {
       val reconnecting = CompletableDeferred<Unit>()
