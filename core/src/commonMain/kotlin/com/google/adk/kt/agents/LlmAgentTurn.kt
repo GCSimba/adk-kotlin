@@ -68,6 +68,7 @@ import com.google.adk.kt.types.SessionResumptionConfig
 import com.google.adk.kt.types.Transcription
 import com.google.adk.kt.types.UsageMetadata
 import com.google.genai.kotlin.GenAiApiException
+import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.jvm.JvmSynthetic
@@ -353,12 +354,24 @@ internal class LlmAgentTurn(
     }
   }
 
-  /** Stops the run's streaming [tools], however the run [ended]. */
+  /**
+   * Stops the run's streaming [tools] however the run ended. After a normal end ([ended]), it first
+   * hands the caller what the tools sent.
+   */
+  @Suppress("SuspendInFinally") // close runs under NonCancellable itself.
   private suspend fun FlowCollector<Event>.finishLiveRun(
     tools: LiveStreamingTools?,
     ended: Boolean,
   ) {
-    tools?.close()
+    if (tools == null) return
+    try {
+      if (ended) {
+        tools.stopAll()
+        for (event in tools.drainEvents()) emit(event)
+      }
+    } finally {
+      tools.close()
+    }
   }
 
   /**
@@ -606,9 +619,9 @@ internal class LlmAgentTurn(
     channelFlow {
         // Returns once the caller has handled the event, so neither loop runs ahead of the caller.
         val deliver: suspend (Event) -> Unit = { event ->
-          val handled = CompletableDeferred<Unit>()
-          send(event to handled)
-          handled.await()
+          val delivery = Delivery(event)
+          send(delivery)
+          delivery.handled.await()
         }
         val saves = RecordingSaves(this, deliver)
         recordingSaves.store(saves)
@@ -672,6 +685,26 @@ internal class LlmAgentTurn(
           // A close that timed out may never end the connection's receive, so stop reading too.
           if (!closedInTime) receiver.cancel()
         }
+        // Streaming tools' messages join the turn's events in arrival order.
+        val toolEvents =
+          if (liveTools == null) {
+            null
+          } else {
+            launch {
+              while (true) {
+                val next = liveTools.nextEvent()
+                val delivery = Delivery(next.event, next.handled)
+                try {
+                  send(delivery)
+                  delivery.handled.await()
+                } catch (e: CancellationException) {
+                  // Unclaimed means the emitter never took it, sent or not, so it goes back.
+                  if (delivery.claim()) liveTools.putBack(next)
+                  throw e
+                }
+              }
+            }
+          }
 
         try {
           receiver.await()
@@ -681,6 +714,7 @@ internal class LlmAgentTurn(
         }
         // Joined so the sender has stopped before the caller restarts or reconnects.
         sender.cancelAndJoin()
+        toolEvents?.cancelAndJoin()
         // Recordings still saving go out before a transfer, restart, reconnect or the run's end.
         if (!saves.finish()) storeTimedOut = true
         recordingSaves.store(null)
@@ -689,9 +723,12 @@ internal class LlmAgentTurn(
         sendDrop?.let { throw it }
       }
       .buffer(Channel.RENDEZVOUS)
-      .transform { (event, handled) ->
-        emit(event)
-        handled.complete(Unit)
+      .transform { delivery ->
+        // A producer that claimed it puts it back, so its tool waits for the later delivery.
+        if (delivery.claim()) {
+          emit(delivery.event)
+          delivery.handled.complete(Unit)
+        }
       }
 
   /**
@@ -1870,6 +1907,22 @@ private class LiveAttemptResult {
 
 /** A connection write failure other than cancellation or a recoverable transport drop. */
 private class LiveWriteFailure(override val cause: Throwable) : Exception(cause)
+
+/**
+ * One event on its way to the caller, with the signal that the caller has handled it.
+ *
+ * The emitter and a producer whose send was cancelled can both see it; whichever claims it first
+ * owns it, so it is delivered once.
+ */
+@OptIn(ExperimentalAtomicApi::class)
+private class Delivery(
+  val event: Event,
+  val handled: CompletableDeferred<Unit> = CompletableDeferred(),
+) {
+  private val claimed = AtomicBoolean(false)
+
+  fun claim(): Boolean = claimed.compareAndSet(false, true)
+}
 
 /**
  * A request taken off the queue, whether its session writes have run, and the content the

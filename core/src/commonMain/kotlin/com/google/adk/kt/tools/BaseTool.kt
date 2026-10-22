@@ -55,7 +55,8 @@ abstract class BaseTool(
    * structures) into Maps automatically.
    *
    * In a live run, a returned [kotlinx.coroutines.flow.Flow] streams: the call is answered as
-   * pending at once, and each value then reaches the model as it arrives.
+   * pending at once, each value then reaches the model as it arrives, and each emitted
+   * [com.google.adk.kt.events.Event] goes to the caller only.
    */
   abstract suspend fun run(context: ToolContext, args: Map<String, Any?>): Any
 

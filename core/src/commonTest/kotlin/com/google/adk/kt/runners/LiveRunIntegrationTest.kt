@@ -23,9 +23,11 @@ import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.RunConfig
 import com.google.adk.kt.agents.StreamingMode
 import com.google.adk.kt.annotations.ExperimentalLiveApi
+import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.ContentInput
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.models.RealtimeInput
+import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.testing.DummyLiveModel
 import com.google.adk.kt.testing.DummyLiveStep
 import com.google.adk.kt.testing.DummyLiveStep.AwaitSent
@@ -38,7 +40,10 @@ import com.google.adk.kt.testing.simpleAudioTurn
 import com.google.adk.kt.testing.spokenModelTurn
 import com.google.adk.kt.testing.turnCompleteStep
 import com.google.adk.kt.types.Blob
+import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionResponse
+import com.google.adk.kt.types.Part
+import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.Transcription
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
@@ -228,6 +233,33 @@ class LiveRunIntegrationTest {
   }
 
   @Test
+  fun runLive_streamingToolEmitsAnEvent_deliversItsMessageToTheCallerOnly(): Unit = runBlocking {
+    val message =
+      Event(author = "someone_else", content = Content(Role.MODEL, listOf(Part(text = "watching"))))
+    val script =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", id = "c1")),
+        AwaitSent("the pending answer", answers("c1", PENDING)),
+        AwaitSent("the value", answers("c1", mapOf("result" to "300"))),
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    // The content-less event has nothing to deliver and is dropped.
+    val tool = DummyTool(name = "monitor") { _, _ -> flowOf(message, Event(), "300") }
+    val (runner, model) = runnerFor(script, tools = listOf(tool))
+
+    val events = runner.runUntilTurnComplete()
+
+    val delivered = events.filter { it.branch == "monitor@c1" }
+    assertThat(delivered.map { it.content })
+      .containsExactly(Content(Role.USER, listOf(Part(text = "watching"))))
+    assertThat(delivered.single().author).isEqualTo("live_agent")
+    assertThat(delivered.single().id).isNotEqualTo(message.id)
+    assertThat(model.toolAnswers().map { it.response })
+      .containsExactly(PENDING, mapOf("result" to "300"))
+      .inOrder()
+  }
+
+  @Test
   fun runLive_streamingToolThrows_answersWithAGenericError(): Unit = runBlocking {
     val error = mapOf("error" to "Invoking `monitor()` failed with an internal error.")
     val script =
@@ -340,6 +372,39 @@ class LiveRunIntegrationTest {
             .map { it.id to it.name }
         )
         .containsExactly("c1" to "monitor")
+    }
+
+  @Test
+  fun runLive_twoStreamingToolsInterleaveEventsAndValues_eachArrivesOnceAndIsStored(): Unit =
+    runBlocking {
+      val note = Event(content = Content(Role.MODEL, listOf(Part(text = "note"))))
+      val first = DummyTool(name = "first") { _, _ -> flowOf(note, "a1", note, "a2") }
+      val second = DummyTool(name = "second") { _, _ -> flowOf("b1") }
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("first", id = "c1")),
+          AwaitSent("the first tool's last value", answers("c1", mapOf("result" to "a2"))),
+          Respond(modelFunctionCallResponse("second", id = "c2")),
+          AwaitSent("the second tool's value", answers("c2", mapOf("result" to "b1"))),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) = runnerFor(script, tools = listOf(first, second))
+
+      val events = runner.runUntilTurnComplete()
+
+      assertThat(model.toolAnswers().filter { it.id == "c1" }.map { it.response })
+        .containsExactly(PENDING, mapOf("result" to "a1"), mapOf("result" to "a2"))
+        .inOrder()
+      assertThat(model.toolAnswers().filter { it.id == "c2" }.map { it.response })
+        .containsExactly(PENDING, mapOf("result" to "b1"))
+        .inOrder()
+      // The same Event object emitted twice reaches the caller as two events of its own.
+      val notes = events.filter { it.branch == "first@c1" }
+      assertThat(notes).hasSize(2)
+      assertThat(notes.map { it.id }.distinct()).hasSize(2)
+      val session =
+        runner.sessionService.getSession(SessionKey(runner.appName, USER_ID, SESSION_ID))
+      assertThat(session?.events?.count { it.branch == "first@c1" }).isEqualTo(2)
     }
 
   companion object {

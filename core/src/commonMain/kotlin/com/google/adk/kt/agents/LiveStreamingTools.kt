@@ -19,6 +19,7 @@
 package com.google.adk.kt.agents
 
 import com.google.adk.kt.annotations.ExperimentalLiveApi
+import com.google.adk.kt.events.Event
 import com.google.adk.kt.logging.LoggerFactory
 import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.tools.ToolContext
@@ -31,6 +32,7 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.coroutines.CoroutineContext
 import kotlin.jvm.JvmSynthetic
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -38,6 +40,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
@@ -83,7 +86,9 @@ internal inline fun <T> AtomicReference<T>.mutate(transform: (T) -> T) {
  * The streaming tools one agent's live run started, each collected in the background until it ends
  * or the run ends or hands the conversation over.
  *
- * Each value a tool emits reaches the model as a function response to the call that started it.
+ * Each [Event] a tool emits reaches only the caller, and the tool waits until the caller has
+ * handled it before continuing; every other value reaches the model as a function response to the
+ * call that started it.
  */
 internal class LiveStreamingTools(
   private val queue: LiveRequestQueue,
@@ -106,6 +111,11 @@ internal class LiveStreamingTools(
 
   // Calls that finished since the last stop, whose last values may still be queued.
   private val finished = AtomicReference<List<String>>(emptyList())
+
+  // An event whose hand-off was cancelled after it left the channel; taken first next time.
+  private val undelivered = AtomicReference<ToolEvent?>(null)
+  private val events =
+    Channel<ToolEvent>(Channel.UNLIMITED, onUndeliveredElement = { undelivered.store(it) })
 
   /** One function call to a streaming tool, and the coroutine collecting what it emits. */
   private class StreamingCall(val toolName: String, val callId: String) {
@@ -138,6 +148,20 @@ internal class LiveStreamingTools(
     }
   }
 
+  /** Waits for the next event a tool sent the caller, taking an undelivered one first. */
+  suspend fun nextEvent(): ToolEvent = undelivered.exchange(null) ?: events.receive()
+
+  /** Puts back an event whose hand-off to the caller never reached it. */
+  fun putBack(event: ToolEvent) {
+    undelivered.store(event)
+  }
+
+  /** Takes every event tools sent the caller that is not delivered yet, oldest first. */
+  fun drainEvents(): List<Event> = buildList {
+    undelivered.exchange(null)?.let { add(it.event) }
+    addAll(generateSequence { events.tryReceive().getOrNull()?.event })
+  }
+
   /**
    * Cancels every streaming call this run started and waits up to [STOP_TIMEOUT] for them when the
    * live run ends or hands over, even if the caller is cancelled.
@@ -153,9 +177,10 @@ internal class LiveStreamingTools(
       queue.discardAnswersTo(finished.exchange(emptyList()) + running.map { it.callId })
     }
 
-  /** Stops every streaming call and releases the scope. */
+  /** Stops every streaming call, releases the scope and drops what no one will deliver. */
   suspend fun close() {
     stopAll()
+    events.close()
     scope.cancel()
   }
 
@@ -177,8 +202,12 @@ internal class LiveStreamingTools(
       stream.collect { value ->
         // A flow that never suspends would otherwise outlive a stop or a handover.
         currentCoroutineContext().ensureActive()
-        // Not partial: Kotlin never sends a partial tool answer, and the wire ignores it anyway.
-        queue.sendContent(functionResponseContent(tool.name, call.callId, value))
+        if (value is Event) {
+          sendToCaller(tool, call.callId, value)
+        } else {
+          // Not partial: Kotlin never sends a partial tool answer, and the wire ignores it anyway.
+          queue.sendContent(functionResponseContent(tool.name, call.callId, value))
+        }
       }
     } catch (e: Throwable) {
       // Exceptions and TODO()'s NotImplementedError reach the model unless stopped.
@@ -192,6 +221,32 @@ internal class LiveStreamingTools(
     logger.warn { "Streaming tool ${tool.name} failed (${e::class.simpleName})." }
     val error = mapOf(ERROR_KEY to "Invoking `${tool.name}()` failed with an internal error.")
     queue.sendContent(functionResponseContent(tool.name, call.callId, error))
+  }
+
+  private suspend fun sendToCaller(tool: BaseTool, callId: String, event: Event) {
+    val content = event.content
+    if (content == null) {
+      logger.warn { "Streaming tool ${tool.name} yielded an Event with no content; it is dropped." }
+      return
+    }
+    if (event != Event(id = event.id, content = content, timestamp = event.timestamp)) {
+      logger.warn {
+        "Streaming tool ${tool.name} yielded an Event with fields beyond its content; they are " +
+          "ignored."
+      }
+    }
+    // Built fresh, so the caller gets the message alone and a reused event gets its own id.
+    val delivered =
+      ToolEvent(
+        Event(
+          invocationId = invocationId,
+          author = agentName,
+          content = content.copy(role = Role.USER),
+          branch = "${tool.name}@$callId",
+        )
+      )
+    // A value the tool sends next reaches the model only after the caller has this event.
+    if (events.trySend(delivered).isSuccess) delivered.handled.await()
   }
 
   /**
@@ -211,6 +266,11 @@ internal class LiveStreamingTools(
       }
     }
     return stopped
+  }
+
+  /** An event a tool sent the caller, and the signal that the caller has handled it. */
+  class ToolEvent(val event: Event) {
+    val handled = CompletableDeferred<Unit>()
   }
 
   companion object {

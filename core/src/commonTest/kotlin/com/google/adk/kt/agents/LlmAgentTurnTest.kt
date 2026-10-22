@@ -141,6 +141,7 @@ class LlmAgentTurnTest {
         DummyTool(name = "monitor") { _, _ ->
           flow {
             reconnecting.await()
+            emit(Event(content = Content(Role.MODEL, listOf(Part(text = "still watching")))))
             emit("300")
             awaitCancellation()
           }
@@ -174,12 +175,13 @@ class LlmAgentTurnTest {
         InMemoryRunner(agent = LlmAgent(name = "agent", model = model, tools = listOf(tool)))
       val queue = LiveRequestQueue()
 
-      val unused =
+      val events =
         runner
           .runLive("u", "s", queue, RunConfig())
           .onEach { if (it.turnComplete) queue.close() }
           .toList()
 
+      assertEquals(1, events.count { it.branch == "monitor@c1" })
       assertEquals(
         1,
         model.connections.flatMap { it.sent }.count { it.answers("c1", mapOf("result" to "300")) },
@@ -271,6 +273,43 @@ class LlmAgentTurnTest {
       assertEquals("the stream should stop before the child connects", 0, childConnectsWhenStopped)
       assertEquals("the child heard the parent's stream", emptyList<String>(), childHeard)
     }
+
+  @Test
+  fun runLive_freshSessionAfterAToolEvent_leavesTheEventOutOfItsHistory(): Unit = runBlocking {
+    val tool =
+      DummyTool(name = "monitor") { _, _ ->
+        flow {
+          emit(Event(content = Content(Role.MODEL, listOf(Part(text = "watching")))))
+          emit("300")
+          awaitCancellation()
+        }
+      }
+    val first =
+      listOf(
+        Respond(modelFunctionCallResponse("monitor", id = "c1")),
+        AwaitSent("the value") { it.answers("c1", mapOf("result" to "300")) },
+        Respond(LlmResponse(goAway = LiveServerGoAway(timeLeft = null))),
+      )
+    val second = listOf(Respond(LlmResponse(turnComplete = true)))
+    val model = DummyLiveModel.perConnection(listOf(first, second), name = "gemini-3.8-live")
+    val runner =
+      InMemoryRunner(agent = LlmAgent(name = "agent", model = model, tools = listOf(tool)))
+    val queue = LiveRequestQueue()
+
+    val events =
+      runner
+        .runLive("u", "s", queue, RunConfig())
+        .onEach { if (it.turnComplete) queue.close() }
+        .toList()
+
+    assertEquals(1, events.count { it.branch == "monitor@c1" })
+    val history = model.connectRequests[1].contents.flatMap { it.parts }
+    assertTrue(history.any { it.functionCall?.id == "c1" }, "the history should keep the call")
+    assertTrue(
+      history.mapNotNull { it.text }.none { "watching" in it },
+      "the tool's event should stay out of the model's history",
+    )
+  }
 
   private fun Any.answers(callId: String, response: Map<String, Any?>): Boolean =
     this is ContentInput &&
