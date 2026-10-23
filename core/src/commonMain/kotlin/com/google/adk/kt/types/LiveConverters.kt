@@ -359,7 +359,7 @@ internal fun TranslationConfig.toGenaiSdk(): GenAiTranslationConfig =
 // --- LiveConnectConfig ---
 /**
  * Converts a [GenAiLiveConnectConfig] from the GenAI SDK to an ADK [LiveConnectConfig]. The SDK
- * fields ADK does not mirror, `httpOptions` and `avatarConfig`, are dropped.
+ * fields ADK does not mirror, `httpOptions`, `avatarConfig` and `labels`, are dropped.
  *
  * Three numbers also narrow on the way in: `temperature` and `topP` cross from the SDK's `Double?`
  * to `Float?`, and `topK` to `Int?`, which truncates toward zero rather than rounding.

@@ -407,7 +407,7 @@ class LiveConvertersTest {
   @Test
   fun liveConnectConfig_mirrorsEverySdkFieldItDoesNotDeliberatelyDrop() {
     // Names only: the round trip above catches wrong targets; this catches an undecided field.
-    val deliberatelyDropped = setOf("avatarConfig", "httpOptions")
+    val deliberatelyDropped = setOf("avatarConfig", "httpOptions", "labels")
     val sdkDescriptor = SdkLiveConnectConfig.serializer().descriptor
     val adkDescriptor = LiveConnectConfig.serializer().descriptor
     val sdkDeclared =
@@ -415,7 +415,8 @@ class LiveConvertersTest {
     val adkDeclared =
       (0 until adkDescriptor.elementsCount).map(adkDescriptor::getElementName).toSet()
 
-    assertEquals(sdkDeclared, adkDeclared + deliberatelyDropped)
+    // Subtract, not add: Gradle's pinned SDK release can predate a field dropped here.
+    assertEquals(sdkDeclared - deliberatelyDropped, adkDeclared)
   }
 
   @Test
