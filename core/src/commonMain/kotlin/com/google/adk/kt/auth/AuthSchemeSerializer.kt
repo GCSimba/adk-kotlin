@@ -48,7 +48,7 @@ internal object AuthSchemeSerializer : KSerializer<AuthScheme> {
       when (value) {
         is AuthScheme.ApiKey -> json.encodeToJsonElement(ApiKey.serializer(), ApiKey(value))
         is AuthScheme.Http -> json.encodeToJsonElement(Http.serializer(), Http(value))
-        is AuthScheme.OAuth2,
+        is AuthScheme.OAuth2 -> json.encodeToJsonElement(OAuth2.serializer(), OAuth2(value))
         is AuthScheme.OpenIdConnectUrl,
         is AuthScheme.OpenIdConnect ->
           throw SerializationException(
@@ -77,7 +77,7 @@ internal object AuthSchemeSerializer : KSerializer<AuthScheme> {
     return when (type) {
       "apiKey" -> decode(ApiKey.serializer()).toApiKey()
       "http" -> decode(Http.serializer()).toHttp()
-      "oauth2",
+      "oauth2" -> decode(OAuth2.serializer()).toOAuth2()
       "openIdConnect" ->
         throw SerializationException(
           "Reading this auth scheme type from JSON is not supported yet."
@@ -119,5 +119,100 @@ internal object AuthSchemeSerializer : KSerializer<AuthScheme> {
     constructor(http: AuthScheme.Http) : this(http.scheme, http.bearerFormat, http.description)
 
     fun toHttp(): AuthScheme.Http = AuthScheme.Http(scheme, bearerFormat, description)
+  }
+
+  @Serializable
+  private class OAuth2(
+    val flows: Flows,
+    val issuerUrl: String? = null,
+    val description: String? = null,
+  ) {
+    constructor(
+      oauth2: AuthScheme.OAuth2
+    ) : this(Flows(oauth2.flows), oauth2.issuerUrl, oauth2.description)
+
+    fun toOAuth2(): AuthScheme.OAuth2 = AuthScheme.OAuth2(flows.toFlows(), issuerUrl, description)
+
+    @Serializable
+    class Flows(
+      val implicit: Implicit? = null,
+      val password: Password? = null,
+      val clientCredentials: ClientCredentials? = null,
+      val authorizationCode: AuthorizationCode? = null,
+    ) {
+      constructor(
+        flows: AuthScheme.OAuth2.Flows
+      ) : this(
+        implicit = flows.implicit?.let(::Implicit),
+        password = flows.password?.let(::Password),
+        clientCredentials = flows.clientCredentials?.let(::ClientCredentials),
+        authorizationCode = flows.authorizationCode?.let(::AuthorizationCode),
+      )
+
+      fun toFlows(): AuthScheme.OAuth2.Flows =
+        AuthScheme.OAuth2.Flows(
+          implicit = implicit?.toImplicit(),
+          password = password?.toPassword(),
+          clientCredentials = clientCredentials?.toClientCredentials(),
+          authorizationCode = authorizationCode?.toAuthorizationCode(),
+        )
+    }
+
+    @Serializable
+    class Implicit(
+      val authorizationUrl: String,
+      val refreshUrl: String? = null,
+      val scopes: Map<String, String> = emptyMap(),
+    ) {
+      constructor(
+        flow: AuthScheme.OAuth2.Flow.Implicit
+      ) : this(flow.authorizationUrl, flow.refreshUrl, flow.scopes)
+
+      fun toImplicit(): AuthScheme.OAuth2.Flow.Implicit =
+        AuthScheme.OAuth2.Flow.Implicit(authorizationUrl, refreshUrl, scopes)
+    }
+
+    @Serializable
+    class Password(
+      val tokenUrl: String,
+      val refreshUrl: String? = null,
+      val scopes: Map<String, String> = emptyMap(),
+    ) {
+      constructor(
+        flow: AuthScheme.OAuth2.Flow.Password
+      ) : this(flow.tokenUrl, flow.refreshUrl, flow.scopes)
+
+      fun toPassword(): AuthScheme.OAuth2.Flow.Password =
+        AuthScheme.OAuth2.Flow.Password(tokenUrl, refreshUrl, scopes)
+    }
+
+    @Serializable
+    class ClientCredentials(
+      val tokenUrl: String,
+      val refreshUrl: String? = null,
+      val scopes: Map<String, String> = emptyMap(),
+    ) {
+      constructor(
+        flow: AuthScheme.OAuth2.Flow.ClientCredentials
+      ) : this(flow.tokenUrl, flow.refreshUrl, flow.scopes)
+
+      fun toClientCredentials(): AuthScheme.OAuth2.Flow.ClientCredentials =
+        AuthScheme.OAuth2.Flow.ClientCredentials(tokenUrl, refreshUrl, scopes)
+    }
+
+    @Serializable
+    class AuthorizationCode(
+      val authorizationUrl: String,
+      val tokenUrl: String,
+      val refreshUrl: String? = null,
+      val scopes: Map<String, String> = emptyMap(),
+    ) {
+      constructor(
+        flow: AuthScheme.OAuth2.Flow.AuthorizationCode
+      ) : this(flow.authorizationUrl, flow.tokenUrl, flow.refreshUrl, flow.scopes)
+
+      fun toAuthorizationCode(): AuthScheme.OAuth2.Flow.AuthorizationCode =
+        AuthScheme.OAuth2.Flow.AuthorizationCode(authorizationUrl, tokenUrl, refreshUrl, scopes)
+    }
   }
 }

@@ -92,11 +92,54 @@ class AuthSchemeSerializerTest {
   }
 
   @Test
-  fun decode_oauth2_throwsUntilSupported() {
-    val error =
-      assertFailsWith<SerializationException> { decode("""{"type": "oauth2", "flows": {}}""") }
+  fun decode_oauth2FlowWithoutTokenUrl_throws() {
+    assertMalformed("""{"type": "oauth2", "flows": {"password": {}}}""")
+  }
 
-    assertEquals("Reading this auth scheme type from JSON is not supported yet.", error.message)
+  @Test
+  fun decode_oauth2FlowsWithoutScopes_readsThemEmpty() {
+    assertEquals(
+      AuthScheme.OAuth2(
+        AuthScheme.OAuth2.Flows(
+          implicit = AuthScheme.OAuth2.Flow.Implicit("https://a"),
+          password = AuthScheme.OAuth2.Flow.Password("https://t"),
+          clientCredentials = AuthScheme.OAuth2.Flow.ClientCredentials("https://t"),
+          authorizationCode = AuthScheme.OAuth2.Flow.AuthorizationCode("https://a", "https://t"),
+        )
+      ),
+      decode(
+        """{"type": "oauth2", "flows": {
+          "implicit": {"authorizationUrl": "https://a"},
+          "password": {"tokenUrl": "https://t"},
+          "clientCredentials": {"tokenUrl": "https://t"},
+          "authorizationCode": {"authorizationUrl": "https://a", "tokenUrl": "https://t"}}}"""
+      ),
+    )
+  }
+
+  @Test
+  fun decode_oauth2ScopesNull_throws() {
+    assertMalformed(
+      """{"type": "oauth2", "flows": {"implicit": {"authorizationUrl": "a", "scopes": null}}}"""
+    )
+  }
+
+  @Test
+  fun decode_oauth2WithoutAnyFlow_readsEmptyFlows() {
+    assertEquals(
+      AuthScheme.OAuth2(AuthScheme.OAuth2.Flows()),
+      decode("""{"type": "oauth2", "flows": {}}"""),
+    )
+  }
+
+  @Test
+  fun decode_oauth2WithoutFlows_throws() {
+    assertMalformed("""{"type": "oauth2"}""")
+  }
+
+  @Test
+  fun decode_oauth2_readsEveryFlowAndField() {
+    assertEquals(OAUTH2, decode(OAUTH2_JSON))
   }
 
   @Test
@@ -173,10 +216,39 @@ class AuthSchemeSerializerTest {
   }
 
   @Test
-  fun encode_oauth2_throwsUntilSupported() {
+  fun encode_oauth2EmptyScopes_omitsThem() {
+    val scheme =
+      AuthScheme.OAuth2(
+        AuthScheme.OAuth2.Flows(
+          implicit = AuthScheme.OAuth2.Flow.Implicit("https://a"),
+          password = AuthScheme.OAuth2.Flow.Password("https://t"),
+          clientCredentials = AuthScheme.OAuth2.Flow.ClientCredentials("https://t"),
+          authorizationCode = AuthScheme.OAuth2.Flow.AuthorizationCode("https://a", "https://t"),
+        )
+      )
+
+    assertEquals(
+      json(
+        """{"type": "oauth2", "flows": {
+          "implicit": {"authorizationUrl": "https://a"},
+          "password": {"tokenUrl": "https://t"},
+          "clientCredentials": {"tokenUrl": "https://t"},
+          "authorizationCode": {"authorizationUrl": "https://a", "tokenUrl": "https://t"}}}"""
+      ),
+      encode(scheme),
+    )
+  }
+
+  @Test
+  fun encode_oauth2_writesEveryFlowAndField() {
+    assertEquals(json(OAUTH2_JSON), encode(OAUTH2))
+  }
+
+  @Test
+  fun encode_openIdConnect_throwsUntilSupported() {
     val error =
       assertFailsWith<SerializationException> {
-        encode(AuthScheme.OAuth2.clientCredentials("https://example.com/token", emptyMap()))
+        encode(AuthScheme.OpenIdConnectUrl("https://example.com"))
       }
 
     assertEquals("Writing this auth scheme type as JSON is not supported yet.", error.message)
@@ -212,6 +284,52 @@ class AuthSchemeSerializerTest {
   }
 
   private companion object {
+    val OAUTH2 =
+      AuthScheme.OAuth2(
+        flows =
+          AuthScheme.OAuth2.Flows(
+            implicit =
+              AuthScheme.OAuth2.Flow.Implicit(
+                "https://i/auth",
+                "https://i/refresh",
+                mapOf("a" to "A"),
+              ),
+            password =
+              AuthScheme.OAuth2.Flow.Password(
+                "https://p/token",
+                "https://p/refresh",
+                mapOf("b" to "B"),
+              ),
+            clientCredentials =
+              AuthScheme.OAuth2.Flow.ClientCredentials(
+                "https://c/token",
+                "https://c/refresh",
+                mapOf("e" to "E"),
+              ),
+            authorizationCode =
+              AuthScheme.OAuth2.Flow.AuthorizationCode(
+                "https://ac/auth",
+                "https://ac/token",
+                "https://ac/refresh",
+                mapOf("c" to "C", "d" to "D"),
+              ),
+          ),
+        issuerUrl = "https://issuer",
+        description = "d",
+      )
+
+    const val OAUTH2_JSON =
+      """{"type": "oauth2", "flows": {
+        "implicit": {"authorizationUrl": "https://i/auth", "refreshUrl": "https://i/refresh",
+          "scopes": {"a": "A"}},
+        "password": {"tokenUrl": "https://p/token", "refreshUrl": "https://p/refresh",
+          "scopes": {"b": "B"}},
+        "clientCredentials": {"tokenUrl": "https://c/token", "refreshUrl": "https://c/refresh",
+          "scopes": {"e": "E"}},
+        "authorizationCode": {"authorizationUrl": "https://ac/auth", "tokenUrl": "https://ac/token",
+          "refreshUrl": "https://ac/refresh", "scopes": {"c": "C", "d": "D"}}},
+        "issuerUrl": "https://issuer", "description": "d"}"""
+
     fun json(text: String): JsonElement = Json.parseToJsonElement(text)
 
     fun encode(scheme: AuthScheme): JsonElement =
