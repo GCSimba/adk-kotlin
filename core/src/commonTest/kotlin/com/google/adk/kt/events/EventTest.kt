@@ -17,6 +17,7 @@
 package com.google.adk.kt.events
 
 import com.google.adk.kt.agents.InvocationContext
+import com.google.adk.kt.agents.TypedData
 import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.models.CacheMetadata
 import com.google.adk.kt.processors.generateRequestConfirmationEvent
@@ -41,6 +42,7 @@ import com.google.adk.kt.workflow.NodeInfo
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
 
@@ -160,6 +162,26 @@ class EventTest {
 
     assertEquals("hi", event.contentText(" "))
     assertEquals("hi hmm", event.contentText(" ", includeThoughts = true))
+  }
+
+  @Test
+  fun nodeName_isTheEmittingNodesName() {
+    assertEquals("a", Event(nodeInfo = NodeInfo(path = "wf@1/a@2")).nodeName)
+  }
+
+  @Test
+  fun nodeName_nullOutsideAWorkflow() {
+    assertNull(Event(author = "model").nodeName)
+  }
+
+  @Test
+  fun nodeName_nullForAgentStateAndEndOfAgentEvents() {
+    val nodeInfo = NodeInfo(path = "wf@1/a@2")
+
+    assertNull(Event(nodeInfo = nodeInfo, actions = EventActions(endOfAgent = true)).nodeName)
+    assertNull(
+      Event(nodeInfo = nodeInfo, actions = EventActions(agentState = TypedData.NullValue)).nodeName
+    )
   }
 
   @OptIn(AdkJavaInteropApi::class)

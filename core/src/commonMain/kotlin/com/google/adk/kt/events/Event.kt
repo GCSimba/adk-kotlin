@@ -175,6 +175,14 @@ constructor(
     content?.parts?.lastOrNull()?.codeExecutionResult != null
 
   /**
+   * The name of the workflow node that emitted this event, from [NodeInfo.name]. Null outside a
+   * workflow and on an event that carries any agent state or ends an agent. Mirrors ADK Python's
+   * `Event.node_name`, which returns an empty string instead and ignores an empty agent state.
+   */
+  val nodeName: String?
+    get() = if (actions.agentState != null || actions.endOfAgent) null else nodeInfo?.name
+
+  /**
    * Scans a model response event's parts for function calls missing an ID and generates one for
    * them.
    *
