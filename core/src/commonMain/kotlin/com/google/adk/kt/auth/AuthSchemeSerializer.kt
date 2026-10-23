@@ -32,9 +32,10 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 
 /**
- * Reads and writes an [AuthScheme] as a JSON object whose `type` picks the kind, such as `apiKey`.
- * It rejects a scheme with no `type`, a `type` ADK does not define, or a missing or invalid field
- * its `type` needs.
+ * Reads and writes an [AuthScheme] as a JSON object whose `type` picks the kind, such as `apiKey`;
+ * an `openIdConnect` scheme with an `openIdConnectUrl` is the discovery URL kind. It rejects a
+ * scheme with no `type`, a `type` ADK does not define, or a missing or invalid field its `type`
+ * needs.
  */
 internal object AuthSchemeSerializer : KSerializer<AuthScheme> {
   override val descriptor: SerialDescriptor = JsonObject.serializer().descriptor
@@ -49,11 +50,10 @@ internal object AuthSchemeSerializer : KSerializer<AuthScheme> {
         is AuthScheme.ApiKey -> json.encodeToJsonElement(ApiKey.serializer(), ApiKey(value))
         is AuthScheme.Http -> json.encodeToJsonElement(Http.serializer(), Http(value))
         is AuthScheme.OAuth2 -> json.encodeToJsonElement(OAuth2.serializer(), OAuth2(value))
-        is AuthScheme.OpenIdConnectUrl,
+        is AuthScheme.OpenIdConnectUrl ->
+          json.encodeToJsonElement(OpenIdConnectUrl.serializer(), OpenIdConnectUrl(value))
         is AuthScheme.OpenIdConnect ->
-          throw SerializationException(
-            "Writing this auth scheme type as JSON is not supported yet."
-          )
+          json.encodeToJsonElement(OpenIdConnect.serializer(), OpenIdConnect(value))
       }
     jsonEncoder.encodeJsonElement(
       JsonObject(mapOf("type" to JsonPrimitive(value.type)) + fields.jsonObject)
@@ -79,9 +79,11 @@ internal object AuthSchemeSerializer : KSerializer<AuthScheme> {
       "http" -> decode(Http.serializer()).toHttp()
       "oauth2" -> decode(OAuth2.serializer()).toOAuth2()
       "openIdConnect" ->
-        throw SerializationException(
-          "Reading this auth scheme type from JSON is not supported yet."
-        )
+        if ("openIdConnectUrl" in fields) {
+          decode(OpenIdConnectUrl.serializer()).toOpenIdConnectUrl()
+        } else {
+          decode(OpenIdConnect.serializer()).toOpenIdConnect()
+        }
       else -> throw SerializationException("An auth scheme has an unsupported type.")
     }
   }
@@ -214,5 +216,52 @@ internal object AuthSchemeSerializer : KSerializer<AuthScheme> {
       fun toAuthorizationCode(): AuthScheme.OAuth2.Flow.AuthorizationCode =
         AuthScheme.OAuth2.Flow.AuthorizationCode(authorizationUrl, tokenUrl, refreshUrl, scopes)
     }
+  }
+
+  @Serializable
+  private class OpenIdConnectUrl(val openIdConnectUrl: String, val description: String? = null) {
+    constructor(
+      scheme: AuthScheme.OpenIdConnectUrl
+    ) : this(scheme.openIdConnectUrl, scheme.description)
+
+    fun toOpenIdConnectUrl(): AuthScheme.OpenIdConnectUrl =
+      AuthScheme.OpenIdConnectUrl(openIdConnectUrl, description)
+  }
+
+  @Serializable
+  private class OpenIdConnect(
+    val authorizationEndpoint: String,
+    val tokenEndpoint: String,
+    val userinfoEndpoint: String? = null,
+    val revocationEndpoint: String? = null,
+    val tokenEndpointAuthMethodsSupported: List<String>? = null,
+    val grantTypesSupported: List<String>? = null,
+    val scopes: List<String>? = null,
+    val description: String? = null,
+  ) {
+    constructor(
+      scheme: AuthScheme.OpenIdConnect
+    ) : this(
+      authorizationEndpoint = scheme.authorizationEndpoint,
+      tokenEndpoint = scheme.tokenEndpoint,
+      userinfoEndpoint = scheme.userinfoEndpoint,
+      revocationEndpoint = scheme.revocationEndpoint,
+      tokenEndpointAuthMethodsSupported = scheme.tokenEndpointAuthMethodsSupported,
+      grantTypesSupported = scheme.grantTypesSupported,
+      scopes = scheme.scopes,
+      description = scheme.description,
+    )
+
+    fun toOpenIdConnect(): AuthScheme.OpenIdConnect =
+      AuthScheme.OpenIdConnect(
+        authorizationEndpoint = authorizationEndpoint,
+        tokenEndpoint = tokenEndpoint,
+        userinfoEndpoint = userinfoEndpoint,
+        revocationEndpoint = revocationEndpoint,
+        tokenEndpointAuthMethodsSupported = tokenEndpointAuthMethodsSupported,
+        grantTypesSupported = grantTypesSupported,
+        scopes = scopes,
+        description = description,
+      )
   }
 }

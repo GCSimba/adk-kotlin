@@ -143,13 +143,49 @@ class AuthSchemeSerializerTest {
   }
 
   @Test
-  fun decode_openIdConnect_throwsUntilSupported() {
-    val error =
-      assertFailsWith<SerializationException> {
-        decode("""{"type": "openIdConnect", "openIdConnectUrl": "https://example.com"}""")
-      }
+  fun decode_openIdConnectEndpointNotString_throws() {
+    assertMalformed(
+      """{"type": "openIdConnect", "authorizationEndpoint": "https://a", "tokenEndpoint": 1}"""
+    )
+  }
 
-    assertEquals("Reading this auth scheme type from JSON is not supported yet.", error.message)
+  @Test
+  fun decode_openIdConnectUrlNotString_throws() {
+    assertMalformed("""{"type": "openIdConnect", "openIdConnectUrl": 1}""")
+  }
+
+  @Test
+  fun decode_openIdConnectUrl_readsTheUrl() {
+    assertEquals(
+      AuthScheme.OpenIdConnectUrl("https://o", "d"),
+      decode("""{"type": "openIdConnect", "openIdConnectUrl": "https://o", "description": "d"}"""),
+    )
+  }
+
+  @Test
+  fun decode_openIdConnectWithBothForms_readsTheUrl() {
+    assertEquals(
+      AuthScheme.OpenIdConnectUrl("https://o"),
+      decode(
+        """{"type": "openIdConnect", "openIdConnectUrl": "https://o",
+          "authorizationEndpoint": "https://a", "tokenEndpoint": "https://t"}"""
+      ),
+    )
+  }
+
+  @Test
+  fun decode_openIdConnectWithOnlyAuthorizationEndpoint_throws() {
+    assertMalformed("""{"type": "openIdConnect", "authorizationEndpoint": "https://a"}""")
+  }
+
+  @Test
+  fun decode_openIdConnectWithoutUrl_throws() {
+    assertMalformed("""{"type": "openIdConnect"}""")
+  }
+
+  @Test
+  fun decode_openIdConnect_readsEveryField() {
+    assertEquals(OPEN_ID_CONNECT, decode(OPEN_ID_CONNECT_JSON))
   }
 
   @Test
@@ -245,13 +281,16 @@ class AuthSchemeSerializerTest {
   }
 
   @Test
-  fun encode_openIdConnect_throwsUntilSupported() {
-    val error =
-      assertFailsWith<SerializationException> {
-        encode(AuthScheme.OpenIdConnectUrl("https://example.com"))
-      }
+  fun encode_openIdConnectUrl_writesTheUrl() {
+    assertEquals(
+      json("""{"type": "openIdConnect", "openIdConnectUrl": "https://o", "description": "d"}"""),
+      encode(AuthScheme.OpenIdConnectUrl("https://o", "d")),
+    )
+  }
 
-    assertEquals("Writing this auth scheme type as JSON is not supported yet.", error.message)
+  @Test
+  fun encode_openIdConnect_writesEveryField() {
+    assertEquals(json(OPEN_ID_CONNECT_JSON), encode(OPEN_ID_CONNECT))
   }
 
   @Test
@@ -284,6 +323,26 @@ class AuthSchemeSerializerTest {
   }
 
   private companion object {
+    val OPEN_ID_CONNECT =
+      AuthScheme.OpenIdConnect(
+        authorizationEndpoint = "https://a",
+        tokenEndpoint = "https://t",
+        userinfoEndpoint = "https://u",
+        revocationEndpoint = "https://r",
+        tokenEndpointAuthMethodsSupported = listOf("client_secret_basic"),
+        grantTypesSupported = listOf("authorization_code"),
+        scopes = listOf("openid", "email"),
+        description = "d",
+      )
+
+    const val OPEN_ID_CONNECT_JSON =
+      """{"type": "openIdConnect", "authorizationEndpoint": "https://a",
+        "tokenEndpoint": "https://t", "userinfoEndpoint": "https://u",
+        "revocationEndpoint": "https://r",
+        "tokenEndpointAuthMethodsSupported": ["client_secret_basic"],
+        "grantTypesSupported": ["authorization_code"], "scopes": ["openid", "email"],
+        "description": "d"}"""
+
     val OAUTH2 =
       AuthScheme.OAuth2(
         flows =
