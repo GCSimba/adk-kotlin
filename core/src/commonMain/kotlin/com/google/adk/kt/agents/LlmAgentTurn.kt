@@ -67,6 +67,7 @@ import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.SessionResumptionConfig
 import com.google.adk.kt.types.Transcription
 import com.google.adk.kt.types.UsageMetadata
+import com.google.errorprone.annotations.CanIgnoreReturnValue
 import com.google.genai.kotlin.GenAiApiException
 import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.AtomicReference
@@ -192,6 +193,23 @@ internal class LlmAgentTurn(
 
   /** Whether the store timed out on the saves still running when the last connection ended. */
   @Volatile private var storeTimedOut = false
+
+  /**
+   * The model's output transcription so far in this turn, which the after-model callbacks screen.
+   */
+  @Volatile private var spoken = ""
+
+  /** The user's speech in this turn that the connection has not yet marked finished. */
+  @Volatile private var unfinishedInput = ""
+
+  /** Speech stored ahead of a tool call, so the connection's own finished copy is skipped. */
+  @Volatile private var storedInput: String? = null
+
+  /**
+   * A transfer set while the user was still speaking, which waits until that speech passes; if the
+   * connection ends first, [runLiveSession] screens the speech so far and then applies it.
+   */
+  @Volatile private var heldTransfer: String? = null
 
   /**
    * Executes the turn logic and returns a flow of events.
@@ -381,29 +399,11 @@ internal class LlmAgentTurn(
    *   output or spoken input, or a go-away left no handle; the caller has handled every event by
    *   the time this returns.
    */
-  // closeQuietly runs under NonCancellable itself, so the finally's close survives cancellation.
-  @Suppress("SuspendInFinally")
   private suspend fun runLiveSession(collector: FlowCollector<Event>): Boolean {
     if (context.isEndOfInvocation) return false
 
     val queue = liveRun().requestQueue
-    val request =
-      when (val prepared = prepareRequest { collector.emit(it) }) {
-        is RequestOrResponse.Request -> prepared.request
-        is RequestOrResponse.Response -> {
-          collector.emit(createModelResponseEvent().copy(content = prepared.response.content))
-          return false
-        }
-      }
-    // A request processor can end the invocation, as in ADK Python.
-    if (context.isEndOfInvocation) return false
-
-    // A non-empty caller handle seeds the first connection, so it resumes and can retry.
-    request.liveConnectConfig.sessionResumption
-      ?.handle
-      ?.takeIf { it.isNotEmpty() }
-      ?.let { resumptionHandle.store(it) }
-
+    val request = prepareLiveSession(collector) ?: return false
     var attempt = 0
     while (true) {
       liveTools?.onBeforeConnect()
@@ -411,195 +411,292 @@ internal class LlmAgentTurn(
       storeTimedOut = false
       val handle = resumptionHandle.load()
       val attemptRequest = if (handle == null) request else request.resumingFrom(handle)
-      // Null until the open returns, so the teardown can tell a failed open from a live connection.
-      var connection: LiveConnection? = null
-      // Closed at most once per connection, so a close that never returns holds one bound, not two.
-      var closed = false
-      val close: suspend () -> Boolean = {
-        val conn = connection
-        // A failed open leaves nothing to close, so the teardown is a no-op.
-        if (closed || conn == null) true
-        else {
-          closed = true
-          closeQuietly(conn)
-        }
-      }
-      val result = LiveAttemptResult()
-      var droppedBy: Throwable? = null
-      // Set when the downstream collector threw, so its failure is never taken for a drop.
-      var collectorFailed = false
-      try {
-        // Inside the try so a drop while opening is retried; a model without live support throws.
-        val opened = agent.model.connect(attemptRequest)
-        connection = opened
-        // The model replies only if history ends with the user; a resumed session already has it.
-        if (handle == null && attemptRequest.contents.isNotEmpty()) {
-          // Safe inside `flow { }`: withSpan switches context, but nothing in this block emits.
-          withSpan(
-            SEND_DATA_SPAN,
-            {
-              this[TelemetryAttributes.GCP_VERTEX_AGENT_INVOCATION_ID] = context.invocationId
-              this[TelemetryAttributes.GCP_VERTEX_AGENT_EVENT_ID] = Uuid.random()
-              this[TelemetryAttributes.GCP_VERTEX_AGENT_DATA] = capturedJson {
-                attemptRequest.contents.toLiveTracePayload()
-              }
-            },
-          ) {
-            opened.sendHistory(attemptRequest.contents)
-          }
-        }
-        collectLiveTurns(attemptRequest, opened, queue, close, result).collect { event ->
-          // A failure thrown here is the caller's, not the connection's; never retry it.
-          try {
-            collector.emit(event)
-            // Delivered, so a blocked reply no longer needs re-emitting after the attempt.
-            if (event === pendingBlockedReply.load()) pendingBlockedReply.store(null)
-            pendingHandover.load()?.recordDelivery(event)
-          } catch (t: Throwable) {
-            // Flow.trace's flowOn runs emit in the caller's context; only the caller throws here.
-            collectorFailed = true
-            throw t
-          }
-        }
-      } catch (e: Throwable) {
-        // A failed open wraps its cause, so only then is the cause checked for a drop.
-        val dropped =
-          e.isLiveTransportDrop() ||
-            (connection == null &&
-              e !is CancellationException &&
-              e.cause?.isLiveTransportDrop() == true)
-        if (collectorFailed || !dropped) throw e
-        droppedBy = e
-      } finally {
-        // The one teardown per connection, and it precedes any restart, transfer or reconnect.
-        val unused = close()
-      }
-      // The teardown is uninterruptible, so re-check before opening any further connection.
-      currentCoroutineContext().ensureActive()
-      // A write the connection outlived failed on its own, so only a later drop can still resume.
-      if (droppedBy == null && result.outlivedWriteFailure) result.writeFailure?.let { throw it }
-      // Otherwise a failed write fails the run wherever it would end, but not where it goes on.
+      val result = connectAndCollect(attemptRequest, fresh = handle == null, queue, collector)
+      val droppedBy = result.droppedBy
+      // A failed write fails the run wherever it would end, but not where it goes on.
       val failure = droppedBy ?: result.writeFailure
       // Deliver any blocked reply the sender could not finish emitting before branching.
       pendingBlockedReply.exchange(null)?.let { collector.emit(it) }
 
-      // A blocked turn starts a fresh session, as ADK Python's restart does; it is not a drop.
+      // A blocked turn starts a fresh session; it is not a drop.
       if (result.end == LiveTurnsEnd.BLOCKED) {
         // Save both sides' audio heard before the block, so the blocked sentence is its own
         // recording rather than joined with the next turn's; the next turn then starts clean.
-        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a blocked turn").forEach {
-          collector.emit(it)
-        }
+        emitRecordingsNow(collector, "a blocked turn")
         return true
       }
 
       val goAway = result.end == LiveTurnsEnd.GO_AWAY
       // Stop once the caller hung up, unless a go-away still has queued input left to drain.
       if (result.closedByCaller || (!goAway && queue.isClosed)) {
-        // Best effort: save what both sides said since the last turn ended, unlike ADK Python.
-        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "close").forEach {
-          collector.emit(it)
-        }
-        failure?.let { throw it }
-        break
+        // Best effort: save what both sides said since the last turn ended.
+        saveRecordingsAndRethrow(collector, "close", failure)
+        return false
       }
 
-      // The handover the model asked for, even when a drop ended the attempt before it.
-      val handover =
-        pendingHandover.exchange(null)?.also { lost ->
-          // A drop may have cut its emit short; the caller still sees it before the handover.
-          if (!lost.delivered) collector.emit(lost.event)
-          // Likewise its held speech; a callback that blocks it cannot stop the handover.
-          lost.input?.let { input ->
-            val unused = handleLiveResponse(attemptRequest, input, "", queue, collector::emit)
-          }
-        }
-      val transferTo = handover?.transferTo
+      // A held transfer: screen its speech so far once, then hand over, or restart on a block.
+      if (screenHeldTransfer(attemptRequest, queue, collector)) {
+        emitRecordingsNow(collector, "a blocked turn")
+        return true
+      }
+
       // Transfer before the drop rethrow, so a drop during the handover still hands over.
-      transferTo?.let { agentName ->
-        // Save the audio so far, so the next agent does not save this agent's audio as its own.
-        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a transfer").forEach {
-          collector.emit(it)
-        }
-        val target =
-          if (agentName == agent.name) agent
-          else
-            liveTransferTargets(agent).firstOrNull { it.name == agentName }
-              ?: throw IllegalArgumentException(
-                "Agent '${agent.name}' is not allowed to transfer to the requested agent."
-              )
-        collector.emitAll(target.runLive(context.forLiveChild(target)))
-        return false
-      }
-
-      // Any other handover is a task_completed, which ends its run (in a sequence, the step).
-      if (handover != null) {
-        // Save the audio so far, so the next step does not save this step's audio as its own.
-        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a completed step")
-          .forEach { collector.emit(it) }
-        return false
-      }
+      if (applyHandover(collector)) return false
 
       // Without a handle a drop fails the run; a go-away continues in a fresh session below.
       if (droppedBy != null && !goAway && resumptionHandle.load() == null) {
         // Save the audio so far, so the failed run keeps it, as the close branch does.
-        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a drop").forEach {
-          collector.emit(it)
-        }
+        emitRecordingsNow(collector, "a drop")
         throw droppedBy
       }
       // A go-away with no handle cannot resume, so it reopens a fresh session.
       val freshRestart = goAway && resumptionHandle.load() == null
-      // A clean close with a handle reconnects, as ADK Python does; with none the run ends.
+      // A clean close with a handle reconnects; with none the run ends.
       if (!freshRestart && resumptionHandle.load() == null) {
         // Save the audio so far, so a later step does not save this agent's audio as its own.
-        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "a server close").forEach {
-          collector.emit(it)
-        }
-        failure?.let { throw it }
-        break
+        saveRecordingsAndRethrow(collector, "a server close", failure)
+        return false
       }
       // A go-away never counts against the budget; a completed turn resets it too.
       if (result.completedATurn || goAway) attempt = 0
-      if (attempt >= MAX_RECONNECT_ATTEMPTS) {
-        // Save the audio so far, so an exhausted reconnect keeps it, as the close branch does.
-        saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "exhausted reconnects")
-          .forEach { collector.emit(it) }
-        // The exhausting failure surfaces as itself; a go-away is reset above and never gets here.
-        failure?.let { throw it }
-        error("live connection could not be resumed after $MAX_RECONNECT_ATTEMPTS attempts")
-      }
+      if (attempt >= MAX_RECONNECT_ATTEMPTS) failAfterExhaustedReconnects(collector, failure)
       attempt++
-      if (freshRestart) {
-        logger.info {
-          "Restarting the live session fresh after a go-away with no handle to resume."
-        }
-      } else {
-        // A drop names its close code, even when a failed open wrapped it.
-        val closeCode =
-          (droppedBy as? GenAiApiException ?: droppedBy?.cause as? GenAiApiException)?.code
-        logger.info {
-          "Reconnecting the live session (attempt $attempt of $MAX_RECONNECT_ATTEMPTS)." +
-            (closeCode?.let { " Close code $it." } ?: "")
-        }
-      }
-      // Waiting before every reconnect and restart keeps a go-away-only server from spinning.
-      when {
-        // A go-away still drains queued input, so a closed queue does not cut the wait short.
-        goAway -> delay(liveReconnectDelay(attempt))
-        withTimeoutOrNull(liveReconnectDelay(attempt)) { queue.closed.await() } != null -> {
-          // A hang-up while waiting saves what both sides said, as the close above does.
-          saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, "close").forEach {
-            collector.emit(it)
-          }
-          failure?.let { throw it }
-          break
-        }
+      if (!waitToReconnect(attempt, freshRestart, goAway, droppedBy, queue)) {
+        // A hang-up while waiting saves what both sides said, as the close above does.
+        saveRecordingsAndRethrow(collector, "close", failure)
+        return false
       }
       // No handle to resume, so leave the reconnect loop and start a fresh turn.
       if (freshRestart) return true
     }
+  }
+
+  /**
+   * Prepares the session's request and seeds any caller handle. Returns null when there is nothing
+   * to connect for: a request processor answered (the answer is emitted) or ended the invocation.
+   */
+  private suspend fun prepareLiveSession(collector: FlowCollector<Event>): LlmRequest? {
+    val request =
+      when (val prepared = prepareRequest { collector.emit(it) }) {
+        is RequestOrResponse.Request -> prepared.request
+        is RequestOrResponse.Response -> {
+          collector.emit(createModelResponseEvent().copy(content = prepared.response.content))
+          return null
+        }
+      }
+    // A request processor can end the invocation.
+    if (context.isEndOfInvocation) return null
+
+    // A non-empty caller handle seeds the first connection, so it resumes and can retry.
+    request.liveConnectConfig.sessionResumption
+      ?.handle
+      ?.takeIf { it.isNotEmpty() }
+      ?.let { resumptionHandle.store(it) }
+    return request
+  }
+
+  /**
+   * Opens one connection for [request], sends the history to a [fresh] session, and emits the
+   * connection's events into [collector] until it ends. A transport drop ends it without throwing
+   * and is kept in the result; any other failure is rethrown.
+   */
+  // closeQuietly runs under NonCancellable itself, so the finally's close survives cancellation.
+  @Suppress("SuspendInFinally")
+  private suspend fun connectAndCollect(
+    request: LlmRequest,
+    fresh: Boolean,
+    queue: LiveRequestQueue,
+    collector: FlowCollector<Event>,
+  ): LiveAttemptResult {
+    // Null until the open returns, so the teardown can tell a failed open from a live connection.
+    var connection: LiveConnection? = null
+    // Closed at most once per connection, so a close that never returns holds one bound, not two.
+    var closed = false
+    val close: suspend () -> Boolean = {
+      val conn = connection
+      // A failed open leaves nothing to close, so the teardown is a no-op.
+      if (closed || conn == null) true
+      else {
+        closed = true
+        closeQuietly(conn)
+      }
+    }
+    val result = LiveAttemptResult()
+    // Set when the downstream collector threw, so its failure is never taken for a drop.
+    var collectorFailed = false
+    try {
+      // Inside the try so a drop while opening is retried; a model without live support throws.
+      val opened = agent.model.connect(request)
+      connection = opened
+      // The model replies only if history ends with the user; a resumed session already has it.
+      if (fresh && request.contents.isNotEmpty()) sendTracedHistory(opened, request)
+      collectLiveTurns(request, opened, queue, close, result).collect { event ->
+        // A failure thrown here is the caller's, not the connection's; never retry it.
+        try {
+          collector.emit(event)
+          // Delivered, so a blocked reply no longer needs re-emitting after the attempt.
+          if (event === pendingBlockedReply.load()) pendingBlockedReply.store(null)
+          pendingHandover.load()?.recordDelivery(event)
+        } catch (t: Throwable) {
+          // Flow.trace's flowOn runs emit in the caller's context; only the caller throws here.
+          collectorFailed = true
+          throw t
+        }
+      }
+    } catch (e: Throwable) {
+      // A failed open wraps its cause, so only then is the cause checked for a drop.
+      val dropped =
+        e.isLiveTransportDrop() ||
+          (connection == null &&
+            e !is CancellationException &&
+            e.cause?.isLiveTransportDrop() == true)
+      if (collectorFailed || !dropped) throw e
+      result.droppedBy = e
+    } finally {
+      // The one teardown per connection, and it precedes any restart, transfer or reconnect.
+      val unused = close()
+    }
+    // The teardown is uninterruptible, so re-check before opening any further connection.
+    currentCoroutineContext().ensureActive()
+    // A write the connection outlived failed on its own, so only a later drop can still resume.
+    if (result.droppedBy == null && result.outlivedWriteFailure) {
+      result.writeFailure?.let { throw it }
+    }
+    return result
+  }
+
+  /** Sends [request]'s history on [connection], traced as the data a live run sends at connect. */
+  private suspend fun sendTracedHistory(connection: LiveConnection, request: LlmRequest) {
+    // Safe inside `flow { }`: withSpan switches context, but nothing in this block emits.
+    withSpan(
+      SEND_DATA_SPAN,
+      {
+        this[TelemetryAttributes.GCP_VERTEX_AGENT_INVOCATION_ID] = context.invocationId
+        this[TelemetryAttributes.GCP_VERTEX_AGENT_EVENT_ID] = Uuid.random()
+        this[TelemetryAttributes.GCP_VERTEX_AGENT_DATA] = capturedJson {
+          request.contents.toLiveTracePayload()
+        }
+      },
+    ) {
+      connection.sendHistory(request.contents)
+    }
+  }
+
+  /**
+   * Once the connection has ended with a transfer still held, screens the speech it waits for;
+   * unless a callback blocks it, records the transfer as the handover and stops this agent's
+   * streams.
+   *
+   * @return whether a callback blocked the speech, so the session restarts without the transfer.
+   */
+  private suspend fun screenHeldTransfer(
+    request: LlmRequest,
+    queue: LiveRequestQueue,
+    collector: FlowCollector<Event>,
+  ): Boolean {
+    if (heldTransfer == null) return false
+    val speech = unfinishedInput
+    if (
+      speech.isNotEmpty() &&
+        emitAsFinishedInput(request, speech, LlmResponse(), queue, collector::emit)
+    ) {
+      return true
+    }
+    releaseHeldTransfer()
+    // Stopped before the handover, so this agent's streams reach no other agent.
+    liveTools?.stopAll()
     return false
+  }
+
+  /**
+   * Applies the handover the model asked for, even when a drop ended the attempt before it: runs
+   * the transfer's target, or ends the step on a task_completed.
+   *
+   * @return whether there was a handover, which ends this agent's session.
+   */
+  private suspend fun applyHandover(collector: FlowCollector<Event>): Boolean {
+    val handover = pendingHandover.exchange(null) ?: return false
+    // A drop may have cut its emit short; the caller still sees it before the handover.
+    if (!handover.delivered) collector.emit(handover.event)
+    val agentName = handover.transferTo
+    if (agentName == null) {
+      // Any other handover is a task_completed, which ends its run (in a sequence, the step).
+      // Save the audio so far, so the next step does not save this step's audio as its own.
+      emitRecordingsNow(collector, "a completed step")
+      return true
+    }
+    // Save the audio so far, so the next agent does not save this agent's audio as its own.
+    emitRecordingsNow(collector, "a transfer")
+    val target =
+      if (agentName == agent.name) agent
+      else
+        liveTransferTargets(agent).firstOrNull { it.name == agentName }
+          ?: throw IllegalArgumentException(
+            "Agent '${agent.name}' is not allowed to transfer to the requested agent."
+          )
+    collector.emitAll(target.runLive(context.forLiveChild(target)))
+    return true
+  }
+
+  /** Saves the audio so far, so an exhausted reconnect keeps it, then fails the run. */
+  private suspend fun failAfterExhaustedReconnects(
+    collector: FlowCollector<Event>,
+    failure: Throwable?,
+  ): Nothing {
+    emitRecordingsNow(collector, "exhausted reconnects")
+    // The exhausting failure surfaces as itself; a go-away resets the count and never gets here.
+    failure?.let { throw it }
+    error("live connection could not be resumed after $MAX_RECONNECT_ATTEMPTS attempts")
+  }
+
+  /**
+   * Logs reconnect [attempt], or a [freshRestart] after a go-away, with [droppedBy]'s close code,
+   * and waits before it.
+   *
+   * @return false when the caller hung up while waiting, so the run ends instead.
+   */
+  private suspend fun waitToReconnect(
+    attempt: Int,
+    freshRestart: Boolean,
+    goAway: Boolean,
+    droppedBy: Throwable?,
+    queue: LiveRequestQueue,
+  ): Boolean {
+    if (freshRestart) {
+      logger.info { "Restarting the live session fresh after a go-away with no handle to resume." }
+    } else {
+      // A drop names its close code, even when a failed open wrapped it.
+      val closeCode =
+        (droppedBy as? GenAiApiException ?: droppedBy?.cause as? GenAiApiException)?.code
+      logger.info {
+        "Reconnecting the live session (attempt $attempt of $MAX_RECONNECT_ATTEMPTS)." +
+          (closeCode?.let { " Close code $it." } ?: "")
+      }
+    }
+    // Waiting before every reconnect and restart keeps a go-away-only server from spinning.
+    if (goAway) {
+      // A go-away still drains queued input, so a closed queue does not cut the wait short.
+      delay(liveReconnectDelay(attempt))
+      return true
+    }
+    return withTimeoutOrNull(liveReconnectDelay(attempt)) { queue.closed.await() } == null
+  }
+
+  /** Saves both sides' audio so far, for [reason], and emits the recordings into [collector]. */
+  private suspend fun emitRecordingsNow(collector: FlowCollector<Event>, reason: String) {
+    saveRecordingsNow(flushUserAudio = true, flushModelAudio = true, reason).forEach {
+      collector.emit(it)
+    }
+  }
+
+  /** Saves the audio so far, as [emitRecordingsNow] does, then fails with [failure] if any. */
+  private suspend fun saveRecordingsAndRethrow(
+    collector: FlowCollector<Event>,
+    reason: String,
+    failure: Throwable?,
+  ) {
+    emitRecordingsNow(collector, reason)
+    failure?.let { throw it }
   }
 
   /**
@@ -743,12 +840,9 @@ internal class LlmAgentTurn(
     result: LiveAttemptResult,
     emitEvent: suspend (Event) -> Unit,
   ) {
-    // The model's output transcription so far in this turn, which the after-model callbacks screen.
-    var spoken = ""
-    // The user's speech in this turn that the connection has not yet marked finished.
-    var unfinishedInput = ""
-    // Speech stored ahead of a tool call, so the connection's own finished copy is skipped.
-    var storedInput: String? = null
+    spoken = ""
+    unfinishedInput = ""
+    storedInput = null
     while (true) {
       var sawResponse = false
       var end: LiveTurnsEnd? = null
@@ -765,59 +859,7 @@ internal class LlmAgentTurn(
             return@takeWhile false
           }
           sawResponse = true
-          if (response.turnComplete == true) {
-            result.completedATurn = true
-          }
-          storedInput?.let { stored ->
-            val rest = response.finishedInputAfter(stored) ?: return@let
-            storedInput = null
-            unfinishedInput = ""
-            // The turn went on after the stored speech, so keep only what the user said after it.
-            if (
-              rest.isNotEmpty() &&
-                emitAsFinishedInput(request, rest, response, spoken, queue, emitEvent)
-            ) {
-              end = LiveTurnsEnd.BLOCKED
-              return@takeWhile false
-            }
-            return@takeWhile true
-          }
-          // Cut-off audio or grounding comes before GeminiLiveConnection's finished copy, so wait.
-          val bareInterruption =
-            response.interrupted && response.content == null && response.groundingMetadata == null
-          if (response.turnComplete == true || bareInterruption) storedInput = null
-          spoken = spokenSoFar(spoken, response)
-          unfinishedInput = unfinishedInputSoFar(unfinishedInput, response)
-          // Store and screen the speech before any tool runs, as ADK Python does.
-          if (unfinishedInput.isNotEmpty() && response.content?.hasFunctionCall() == true) {
-            val speech = unfinishedInput
-            unfinishedInput = ""
-            // A blocked question runs no tool and ends the turn, as ADK Python's restart does.
-            if (emitAsFinishedInput(request, speech, response, spoken, queue, emitEvent)) {
-              end = LiveTurnsEnd.BLOCKED
-              return@takeWhile false
-            }
-            storedInput = storedInput.orEmpty() + speech
-          }
-          val blocked =
-            handleLiveResponse(request, response, spoken, queue, emitEvent, unfinishedInput)
-          pendingHandover.load()?.let { handover ->
-            // Only a transfer set without a tool call still has unstored speech here.
-            if (unfinishedInput.isNotEmpty()) {
-              // The transfer already reached the caller, so blocking this speech cannot stop it.
-              val unused =
-                emitAsFinishedInput(request, unfinishedInput, response, spoken, queue, emitEvent)
-              unfinishedInput = ""
-            }
-            // Stopped before the handover, so this agent's streams reach no other agent.
-            liveTools?.stopAll()
-            handOverConnection(handover, queue)
-            end =
-              if (handover.transferTo != null) LiveTurnsEnd.TRANSFER
-              else LiveTurnsEnd.TASK_COMPLETED
-          }
-          // A handover beats a blocked input in the same response: any answer is already queued.
-          if (blocked && end == null) end = LiveTurnsEnd.BLOCKED
+          end = handleTurnResponse(request, response, queue, result, emitEvent)
           end == null
         }
         .collect()
@@ -834,6 +876,92 @@ internal class LlmAgentTurn(
   }
 
   /**
+   * Handles one [response] that [receiveTurns] read: stores or screens the user's speech, emits the
+   * response, and releases a held transfer or hands over when it is due.
+   *
+   * @return how the reading stops after [response], or null to read on.
+   */
+  private suspend fun handleTurnResponse(
+    request: LlmRequest,
+    response: LlmResponse,
+    queue: LiveRequestQueue,
+    result: LiveAttemptResult,
+    emitEvent: suspend (Event) -> Unit,
+  ): LiveTurnsEnd? {
+    if (response.turnComplete == true) {
+      result.completedATurn = true
+    }
+    storedInput?.let { stored ->
+      val rest = response.finishedInputAfter(stored) ?: return@let
+      storedInput = null
+      unfinishedInput = ""
+      // The turn went on after the stored speech, so keep only what the user said after it.
+      if (rest.isNotEmpty() && emitAsFinishedInput(request, rest, response, queue, emitEvent)) {
+        return LiveTurnsEnd.BLOCKED
+      }
+      // The whole speech has now passed, so a transfer held for it goes.
+      val handover = releaseHeldTransfer()
+      if (handover != null) {
+        emitEvent(handover.event)
+        liveTools?.stopAll()
+        handOverConnection(handover, queue)
+        return LiveTurnsEnd.TRANSFER
+      }
+      return null
+    }
+    // Cut-off audio or grounding comes before GeminiLiveConnection's finished copy, so wait.
+    if (response.turnComplete == true || response.isBareInterruption()) storedInput = null
+    spoken = spokenSoFar(spoken, response)
+    unfinishedInput = unfinishedInputSoFar(unfinishedInput, response)
+    val screensOutput = shouldScreenModelOutput(response, spoken)
+    // Store and screen the speech before any tool runs.
+    if (unfinishedInput.isNotEmpty() && response.content?.hasFunctionCall() == true) {
+      val speech = unfinishedInput
+      unfinishedInput = ""
+      // A blocked question runs no tool; the turn ends and starts over.
+      if (emitAsFinishedInput(request, speech, response, queue, emitEvent)) {
+        return LiveTurnsEnd.BLOCKED
+      }
+      storedInput = storedInput.orEmpty() + speech
+    }
+    // The speech is screened only once it is finished, so a transfer set meanwhile waits.
+    val holdTransfer: ((String) -> Unit)? =
+      if (unfinishedInput.isEmpty() && storedInput == null) null
+      else { target -> heldTransfer = heldTransfer ?: target }
+    val blocked =
+      handleLiveResponse(
+        request,
+        response,
+        spoken.takeIf { screensOutput },
+        queue,
+        emitEvent,
+        holdTransfer,
+      )
+    // With no before-model callback nothing can block the speech, so it goes out now.
+    val unscreenable = heldTransfer != null && !screensUserInput()
+    if (!blocked && unscreenable && unfinishedInput.isNotEmpty()) {
+      val unused = emitAsFinishedInput(request, unfinishedInput, response, queue, emitEvent)
+      unfinishedInput = ""
+    }
+    // A held transfer goes only after the finished speech passed, or once the turn is over.
+    val speechDone =
+      unscreenable || response.turnComplete == true || response.inputTranscription?.finished == true
+    if (!blocked && speechDone && pendingHandover.load() == null) {
+      val released = releaseHeldTransfer()
+      if (released != null) emitEvent(released.event)
+    }
+    val handover = pendingHandover.load()
+    if (handover != null) {
+      // Stopped before the handover, so this agent's streams reach no other agent.
+      liveTools?.stopAll()
+      handOverConnection(handover, queue)
+      return if (handover.transferTo != null) LiveTurnsEnd.TRANSFER else LiveTurnsEnd.TASK_COMPLETED
+    }
+    // A handover beats a blocked input in the same response: any answer is already queued.
+    return if (blocked) LiveTurnsEnd.BLOCKED else null
+  }
+
+  /**
    * Emits the user's [speech] as the finished transcription the connection has not sent yet.
    *
    * @return whether a callback blocked it.
@@ -842,17 +970,40 @@ internal class LlmAgentTurn(
     request: LlmRequest,
     speech: String,
     response: LlmResponse,
-    spoken: String,
     queue: LiveRequestQueue,
     emitEvent: suspend (Event) -> Unit,
   ): Boolean =
-    handleLiveResponse(request, response.asFinishedInput(speech), spoken, queue, emitEvent)
+    handleLiveResponse(
+      request,
+      response.asFinishedInput(speech),
+      screenedOutput = null,
+      queue,
+      emitEvent,
+    )
+
+  /**
+   * Records the held transfer, if any, as the handover, on an event of its own that the caller then
+   * emits. Recorded first, so a drop mid-emit cannot lose it; runLiveSession emits it if lost.
+   *
+   * @return the recorded handover, or null when no transfer was held.
+   */
+  @CanIgnoreReturnValue
+  private fun releaseHeldTransfer(): PendingHandover? {
+    val held = heldTransfer ?: return null
+    heldTransfer = null
+    val event = createModelResponseEvent().copy(actions = EventActions(transferToAgent = held))
+    val handover = PendingHandover(null, event, held)
+    pendingHandover.store(handover)
+    return handover
+  }
 
   /** The user's unfinished speech in this turn, [unfinished], updated with [response]. */
   private fun unfinishedInputSoFar(unfinished: String, response: LlmResponse): String {
     val input = response.inputTranscription
     return when {
-      input?.finished == true || response.turnComplete == true || response.interrupted -> ""
+      // A cut-off reply keeps the speech, whose finished copy still follows it.
+      input?.finished == true || response.turnComplete == true || response.isBareInterruption() ->
+        ""
       input != null -> unfinished + input.text.orEmpty()
       else -> unfinished
     }
@@ -866,38 +1017,69 @@ internal class LlmAgentTurn(
   }
 
   /**
-   * Screens and emits one live [response], answering its tool calls through [queue]. A handover it
-   * asks for keeps [unfinishedInput], the user's speech still to emit after it, so a drop cannot
-   * lose it.
+   * Whether after-model callbacks should screen [response], given the turn's output so far,
+   * [spoken]. Every plugin counts, since each adds an after-model callback.
+   */
+  private fun shouldScreenModelOutput(response: LlmResponse, spoken: String): Boolean =
+    response.outputTranscription != null &&
+      spoken.isNotEmpty() &&
+      (context.pluginManager.afterModelCallbacks.isNotEmpty() ||
+        agent.afterModelCallbacks.isNotEmpty())
+
+  /**
+   * Whether any before-model callback screens the user's speech, so it could block it. Every plugin
+   * counts, since each adds a before-model callback.
+   */
+  private fun screensUserInput(): Boolean =
+    context.pluginManager.beforeModelCallbacks.isNotEmpty() ||
+      agent.beforeModelCallbacks.isNotEmpty()
+
+  /**
+   * Screens and emits one live [response], answering its tool calls through [queue]. After-model
+   * callbacks screen it with the turn's output so far, [screenedOutput], unless that is null. A
+   * callback's transfer goes to [holdTransfer] instead, when that is set, rather than handing over.
    *
    * @return whether a callback blocked the model's output or the user's spoken input.
    */
   private suspend fun handleLiveResponse(
     request: LlmRequest,
     response: LlmResponse,
-    spoken: String,
+    screenedOutput: String?,
     queue: LiveRequestQueue,
     emitEvent: suspend (Event) -> Unit,
-    unfinishedInput: String = "",
+    holdTransfer: ((String) -> Unit)? = null,
   ): Boolean {
     val callbackContext = CallbackContext(context)
-    if (response.outputTranscription != null && spoken.isNotEmpty()) {
-      val blockedOutput = screenModelOutput(request, response, spoken, callbackContext)
+    if (screenedOutput != null) {
+      val blockedOutput = screenModelOutput(request, response, screenedOutput, callbackContext)
       if (blockedOutput != null) {
         emitEvent(blockedOutput)
         return true
       }
     }
-    emitLiveResponse(request, response, callbackContext) { event ->
+    emitLiveResponse(request, response, callbackContext) { emitted ->
+      val target = emitted.actions.transferToAgent
+      // Only a callback's transfer is held; a tool's already follows its screened speech.
+      val event =
+        if (target != null && holdTransfer != null && emitted.functionResponses().isEmpty()) {
+          holdTransfer(target)
+          emitted.copy(actions = emitted.actions.copy(transferToAgent = null))
+        } else {
+          emitted
+        }
       val transferTo = event.actions.transferToAgent
       // A transfer from any event of the response wins, so a task_completed never replaces it.
       if (
         transferTo != null ||
           (event.signalsTaskCompleted() &&
             pendingHandover.load()?.transferTo == null &&
+            // A held transfer wins too: it goes once the speech passes, or neither does.
+            heldTransfer == null &&
             // A tool-not-found answer to an unoffered task_completed call does not count.
             TASK_COMPLETED_TOOL_NAME in getToolMap(request))
       ) {
+        // A recorded transfer wins over a held one, so the held one never replaces it later.
+        if (transferTo != null) heldTransfer = null
         // Kept before the emit, so a drop mid-emit cannot lose it; runLiveSession emits it if lost.
         pendingHandover.store(
           PendingHandover(
@@ -905,7 +1087,6 @@ internal class LlmAgentTurn(
             event.content?.takeIf { c -> c.parts.any { it.functionResponse != null } },
             event,
             transferTo,
-            unfinishedInput.takeIf { it.isNotEmpty() }?.let { response.asFinishedInput(it) },
           )
         )
       }
@@ -1897,9 +2078,11 @@ private enum class LiveTurnsEnd {
  *   it resumes, restarts or continues after a go-away.
  * @property outlivedWriteFailure whether the receive loop was still running
  *   [CONNECTION_TEARDOWN_TIMEOUT] after the failed write, so the write failed on its own.
+ * @property droppedBy the transport drop that ended the connection, which the run may resume.
  */
 private class LiveAttemptResult {
   @Volatile var end: LiveTurnsEnd = LiveTurnsEnd.CLOSED
+  @Volatile var droppedBy: Throwable? = null
   @Volatile var completedATurn: Boolean = false
   @Volatile var closedByCaller: Boolean = false
   @Volatile var writeFailure: Throwable? = null
@@ -1947,16 +2130,8 @@ private data class PendingSend(
  * a `task_completed` tool the agent has, which ends its live run (in a sequence, the step). It
  * holds the tool's [answer], the [event] that carries it, and the signal the sender completes once
  * it has written that answer.
- *
- * @property input the user's speech still to emit after [event], as a finished transcription; null
- *   when there is none or it has reached the caller.
  */
-private class PendingHandover(
-  val answer: Content?,
-  val event: Event,
-  val transferTo: String?,
-  @Volatile var input: LlmResponse?,
-) {
+private class PendingHandover(val answer: Content?, val event: Event, val transferTo: String?) {
   val written = CompletableDeferred<Unit>()
 
   /** Whether [event] reached the caller; if not, it is emitted before the handover. */
@@ -1965,7 +2140,6 @@ private class PendingHandover(
   /** Records that [emitted] reached the caller, so the handover does not emit it again. */
   fun recordDelivery(emitted: Event) {
     if (emitted === event) delivered = true
-    if (emitted.inputTranscription == input?.inputTranscription) input = null
   }
 }
 
@@ -2015,6 +2189,10 @@ private fun LlmResponse.finishedInputAfter(speech: String): String? {
       LlmResponse()
   return if (alone && text.startsWith(speech)) text.removePrefix(speech).trimStart() else null
 }
+
+/** Whether this response is an interruption with no cut-off audio or grounding on it. */
+private fun LlmResponse.isBareInterruption(): Boolean =
+  interrupted && content == null && groundingMetadata == null
 
 /** The user's [speech] as a finished transcription on a response of its own, from this session. */
 private fun LlmResponse.asFinishedInput(speech: String): LlmResponse =
