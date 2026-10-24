@@ -68,6 +68,7 @@ import com.google.adk.kt.workflow.ToolNode
 import com.google.adk.kt.workflow.Workflow
 import com.google.adk.kt.workflow.findUserMessageForInvocation
 import kotlin.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.catch
@@ -75,6 +76,7 @@ import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 
 /** An abstract base class for [Runner] implementations that provides common orchestration logic. */
@@ -218,10 +220,9 @@ abstract class AbstractRunner : Runner {
       return
     }
 
-    emitAll(runAgentWithPlugins(context).notifyingRunError(context))
+    emitAll(runAgentWithPlugins(context))
 
-    // Compaction runs after a successful invocation; like Python, a compaction failure is not a run
-    // error, so it stays outside the notification above.
+    // A compaction failure is not a run error, so onRunError is not told of it.
     runPostInvocationCompaction(session)
   }
 
@@ -280,7 +281,7 @@ abstract class AbstractRunner : Runner {
           val context = createLiveInvocationContext(session, runConfig)
           // Copies share frameworkData by reference, so every context derived later sees the run.
           val liveRun = context.openLiveRun(liveRequestQueue)
-          emitAll(runAgentWithPlugins(context, liveRun).notifyingRunError(context))
+          emitAll(runAgentWithPlugins(context, liveRun))
         }
       }
       // ADK Python opens no live invocation span; keep agent spans in the caller's trace.
@@ -678,14 +679,80 @@ abstract class AbstractRunner : Runner {
   /**
    * Runs the agent with the registered plugins.
    *
+   * The afterRun callbacks also run when the caller stops collecting early, for example with
+   * `first()`, or its collector throws, unless a `buffer()` or a dispatcher-changing `flowOn()` in
+   * between turns the stop into a cancel. The onRunError callbacks hear of every run failure, which
+   * is rethrown, and of an afterRun failure after an early stop, which is rethrown only if it is an
+   * Error.
+   *
    * @param context The current [InvocationContext].
    * @return A [Flow] of [Event]s generated during the execution.
    */
   protected fun runAgentWithPlugins(context: InvocationContext): Flow<Event> =
     runAgentWithPlugins(context, liveRun = null)
 
-  /** Runs the resolved root with plugins, live when [liveRun] is set; see [store]. */
-  private fun runAgentWithPlugins(context: InvocationContext, liveRun: LiveRun?): Flow<Event> {
+  /**
+   * Runs the resolved root with plugins, live when [liveRun] is set (see [store]), and notifies
+   * onRunError of a run failure. An exception thrown out of `emit` while this job is still active
+   * is the caller stopping early (`first()`, `take(n)` or a throwing collector). If the run then
+   * ends with that exception or a copy of it while the job is still active, afterRun runs and the
+   * exception is rethrown; an Error from afterRun is thrown instead.
+   */
+  private fun runAgentWithPlugins(context: InvocationContext, liveRun: LiveRun?): Flow<Event> =
+    flow {
+        // Only the emit site knows an exception came from the caller rather than the agent.
+        var callerStop: Throwable? = null
+        try {
+          runBeforeRunAndAgent(context, liveRun).collect { event ->
+            try {
+              emit(event)
+            } catch (e: Throwable) {
+              // first() throws a CancellationException; only isActive tells a stop from a cancel.
+              if (currentCoroutineContext().isActive) callerStop = e
+              throw e
+            }
+          }
+        } catch (e: Throwable) {
+          val stop = callerStop
+          when {
+            // No caller stop: the run failed or was canceled, so rethrow it unchanged.
+            stop == null -> {}
+            // The caller's own exception, or a same-class copy of it, so the caller stopped early.
+            e.isCopyOf(stop) -> {
+              // A cancel while the agent unwound after the stop skips afterRun.
+              if (currentCoroutineContext().isActive) runAfterRunAfterEarlyStop(context)
+            }
+            // The agent threw another exception after the stop; notifyingRunError skips this.
+            e !is CancellationException ->
+              runOnRunErrorCallbacksPipeline(pluginManager.onRunErrorCallbacks, context, e)
+            // Any other CancellationException, such as a cancel or the agent's own: nothing runs.
+            else -> {}
+          }
+          throw e
+        }
+        runAfterRunCallbacksPipeline(pluginManager.afterRunCallbacks, context)
+      }
+      .notifyingRunError(context)
+
+  /**
+   * Runs afterRun after the caller stopped early. A failure is logged and goes to onRunError, and
+   * only an Error also reaches the caller; a cancellation is rethrown, as after a full run.
+   */
+  private suspend fun runAfterRunAfterEarlyStop(context: InvocationContext) {
+    try {
+      runAfterRunCallbacksPipeline(pluginManager.afterRunCallbacks, context)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Throwable) {
+      logger.error(e) { "afterRun failed after an early stop" }
+      runOnRunErrorCallbacksPipeline(pluginManager.onRunErrorCallbacks, context, e)
+      // An Error is fatal, so it is still thrown, as on the completion path.
+      if (e is Error) throw e
+    }
+  }
+
+  /** Runs the beforeRun callbacks and then the resolved root, live when [liveRun] is set. */
+  private fun runBeforeRunAndAgent(context: InvocationContext, liveRun: LiveRun?): Flow<Event> {
     return flow {
       // 1. Run beforeRun callback
       val beforeResult = runBeforeRunCallbacksPipeline(pluginManager.beforeRunCallbacks, context)
@@ -716,8 +783,6 @@ abstract class AbstractRunner : Runner {
           }
         }
       }
-      // 4. Run afterRun callback
-      val unused = runAfterRunCallbacksPipeline(pluginManager.afterRunCallbacks, context)
     }
   }
 
@@ -1193,3 +1258,15 @@ abstract class AbstractRunner : Runner {
     }
   }
 }
+
+/**
+ * Whether this is the caller's [stop] or a same-class copy of it, judged by class and `cause`,
+ * rather than an exception of another class or cause that the agent threw while unwinding. With JVM
+ * assertions on, as in Gradle tests, upstream kotlinx's stack-trace recovery can rethrow an
+ * exception that crosses a coroutine boundary as a same-class copy caused by the original, or by
+ * the original's cause for a copy of a copy. Builds without that recovery keep the same object, and
+ * first() or take(n) are never copied.
+ */
+private fun Throwable.isCopyOf(stop: Throwable): Boolean =
+  this === stop ||
+    (this::class == stop::class && (cause === stop || (stop.cause != null && cause === stop.cause)))

@@ -599,6 +599,23 @@ class RunLiveTest {
   }
 
   @Test
+  fun runLive_callerTakesTheFirstEvent_runsAfterRunOnce(): Unit = runBlocking {
+    var afterRunCalls = 0
+    val runner =
+      InMemoryRunner(
+        agent = ScriptedAgent(listOf(modelEvent(modelMessage("a")), modelEvent(modelMessage("b")))),
+        plugins = listOf(plugin(recordAfterRun = { afterRunCalls++ })),
+      )
+    val queue = LiveRequestQueue()
+    queue.close()
+
+    val first = runner.runLive("u", "s", queue).first()
+
+    assertThat(first.content?.parts?.single()?.text).isEqualTo("a")
+    assertThat(afterRunCalls).isEqualTo(1)
+  }
+
+  @Test
   fun runLive_doesNotPersistPartialEvents(): Unit = runBlocking {
     // Partials are skipped as in the turn-based rule; only the media rule is live-specific.
     val runner =

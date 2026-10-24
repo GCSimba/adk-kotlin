@@ -44,8 +44,10 @@ import com.google.adk.kt.testing.DummyModel
 import com.google.adk.kt.testing.DummyTool
 import com.google.adk.kt.testing.MonotonicTimestampSessionService
 import com.google.adk.kt.testing.compactionEvent
+import com.google.adk.kt.testing.modelEvent
 import com.google.adk.kt.testing.modelFunctionCall
 import com.google.adk.kt.testing.modelMessage
+import com.google.adk.kt.testing.testInvocationContext
 import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.types.Blob
@@ -65,12 +67,21 @@ import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.yield
 
 class AbstractRunnerTest {
 
@@ -363,6 +374,345 @@ class AbstractRunnerTest {
 
     assertEquals("after boom", thrown.message)
     assertSame(failure, captured)
+  }
+
+  @Test
+  fun runAsync_completes_runsAfterRunOnce() = runBlocking {
+    val plugin = AfterRunRecorder()
+
+    val events =
+      runnerWith(emitter(), plugin).runAsync("user", "s", newMessage = userMessage("go")).toList()
+
+    assertEquals(3, events.size)
+    assertEquals(1, plugin.afterRuns)
+  }
+
+  @Test
+  fun runAsync_collectorTakesTheFirstEvent_runsAfterRunOnce() = runBlocking {
+    val plugin = AfterRunRecorder()
+
+    val first =
+      runnerWith(emitter(), plugin).runAsync("user", "s", newMessage = userMessage("go")).first()
+
+    assertEquals("e0", first.content?.parts?.single()?.text)
+    assertEquals(1, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_collectorTakesSomeEvents_runsAfterRunOnce() = runBlocking {
+    val plugin = AfterRunRecorder()
+
+    val events =
+      runnerWith(emitter(), plugin)
+        .runAsync("user", "s", newMessage = userMessage("go"))
+        .take(2)
+        .toList()
+
+    assertEquals(2, events.size)
+    assertEquals(1, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_collectorThrows_runsAfterRunOnceAndRethrows() = runBlocking {
+    val plugin = AfterRunRecorder()
+    val collectorFailure = IllegalStateException("collector boom")
+
+    val thrown =
+      assertFailsWith<IllegalStateException> {
+        runnerWith(emitter(), plugin)
+          .runAsync("user", "s", newMessage = userMessage("go"))
+          .collect { throw collectorFailure }
+      }
+
+    assertSame(collectorFailure, thrown)
+    assertEquals(1, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_collectingScopeCanceled_skipsAfterRun() = runBlocking {
+    val plugin = AfterRunRecorder()
+    val runner = runnerWith(emitter(), plugin)
+
+    // yield() throws the cancellation out of emit while the caller's job is no longer active.
+    launch {
+        runner.runAsync("user", "s", newMessage = userMessage("go")).collect {
+          cancel()
+          yield()
+        }
+      }
+      .join()
+
+    assertEquals(0, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_agentFails_skipsAfterRunAndNotifiesOnRunError() = runBlocking {
+    val failure = IllegalStateException("agent boom")
+    val plugin = AfterRunRecorder()
+    val agent =
+      DummyAgent("emitter") { context ->
+        emit(modelEvent("e0", invocationId = context.invocationId, author = "emitter"))
+        throw failure
+      }
+
+    assertFailsWith<IllegalStateException> {
+      runnerWith(agent, plugin).runAsync("user", "s", newMessage = userMessage("go")).toList()
+    }
+
+    assertEquals(0, plugin.afterRuns)
+    assertEquals(listOf<Throwable>(failure), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_afterRunFailsAfterAnEarlyStop_notifiesOnRunErrorWithoutThrowing() = runBlocking {
+    val failure = IllegalStateException("after boom")
+    val plugin = AfterRunRecorder(afterRunFailure = failure)
+
+    val first =
+      runnerWith(emitter(), plugin).runAsync("user", "s", newMessage = userMessage("go")).first()
+
+    assertEquals("e0", first.content?.parts?.single()?.text)
+    assertEquals(listOf<Throwable>(failure), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_afterRunThrowsAnErrorAfterAnEarlyStop_notifiesOnRunErrorAndThrowsIt() = runBlocking {
+    val failure = NotImplementedError("after boom")
+    val plugin = AfterRunRecorder(afterRunFailure = failure)
+
+    val thrown =
+      assertFailsWith<NotImplementedError> {
+        runnerWith(emitter(), plugin).runAsync("user", "s", newMessage = userMessage("go")).first()
+      }
+
+    assertSame(failure, thrown)
+    assertEquals(listOf<Throwable>(failure), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_agentCleanupFailsAfterAnEarlyStop_skipsAfterRunAndNotifiesOnRunError() =
+    runBlocking {
+      val cleanupFailure = IllegalStateException("cleanup boom")
+      val plugin = AfterRunRecorder()
+      val agent =
+        DummyAgent("emitter") { context ->
+          try {
+            emit(modelEvent("e0", invocationId = context.invocationId, author = "emitter"))
+            emit(modelEvent("e1", invocationId = context.invocationId, author = "emitter"))
+          } finally {
+            throw cleanupFailure
+          }
+        }
+
+      val thrown =
+        assertFailsWith<IllegalStateException> {
+          runnerWith(agent, plugin).runAsync("user", "s", newMessage = userMessage("go")).first()
+        }
+
+      assertSame(cleanupFailure, thrown)
+      assertEquals(0, plugin.afterRuns)
+      assertEquals(listOf<Throwable>(cleanupFailure), plugin.runErrors)
+    }
+
+  @Test
+  fun runAsync_collectorThrowsThroughAChannelInTheAgent_runsAfterRunOnce() = runBlocking {
+    // Crossing the agent's channel, coroutines may rethrow a copy of the caller's exception.
+    val plugin = AfterRunRecorder()
+    val agent =
+      DummyAgent("emitter") { context ->
+        emitAll(
+          channelFlow {
+            repeat(3) { i ->
+              send(modelEvent("e$i", invocationId = context.invocationId, author = "emitter"))
+            }
+          }
+        )
+      }
+
+    val thrown =
+      assertFailsWith<IllegalStateException> {
+        runnerWith(agent, plugin).runAsync("user", "s", newMessage = userMessage("go")).collect {
+          throw IllegalStateException("caller boom", IllegalStateException("inner"))
+        }
+      }
+
+    assertEquals("caller boom", thrown.message)
+    assertEquals(1, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_agentRethrowsACopyOfTheCallersException_runsAfterRunOnce() = runBlocking {
+    // Stands in for the copy stack-trace recovery makes: same class, caused by the original.
+    val plugin = AfterRunRecorder()
+    val agent = copyingAgent { IllegalStateException(it.message, it) }
+
+    assertFailsWith<IllegalStateException> {
+      runnerWith(agent, plugin).runAsync("user", "s", newMessage = userMessage("go")).collect {
+        throw IllegalStateException("caller boom")
+      }
+    }
+
+    assertEquals(1, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_agentRethrowsACopyOfACopiedCallerException_runsAfterRunOnce() = runBlocking {
+    // Recovery copies the original again, not the copy the caller threw, so both share a cause.
+    val plugin = AfterRunRecorder()
+    val agent = copyingAgent { IllegalStateException(it.message, it.cause) }
+
+    assertFailsWith<IllegalStateException> {
+      runnerWith(agent, plugin).runAsync("user", "s", newMessage = userMessage("go")).collect {
+        throw IllegalStateException("caller boom", IllegalStateException("original"))
+      }
+    }
+
+    assertEquals(1, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_afterRunThrowsItsOwnCancellationAfterAnEarlyStop_doesNotNotifyOnRunError() =
+    runBlocking {
+      // As after a full run, a cancellation from afterRun is not a failure.
+      val plugin = AfterRunRecorder(afterRunFailure = CancellationException("plugin timeout"))
+
+      val first =
+        runnerWith(emitter(), plugin).runAsync("user", "s", newMessage = userMessage("go")).first()
+
+      assertEquals("e0", first.content?.parts?.single()?.text)
+      assertEquals(emptyList(), plugin.runErrors)
+    }
+
+  @Test
+  fun runAsync_afterRunThrowsItsOwnCancellationAfterACollectorThrows_keepsTheCallersException() =
+    runBlocking {
+      val plugin = AfterRunRecorder(afterRunFailure = CancellationException("plugin timeout"))
+      val collectorFailure = IllegalStateException("collector boom")
+
+      val thrown =
+        assertFailsWith<IllegalStateException> {
+          runnerWith(emitter(), plugin)
+            .runAsync("user", "s", newMessage = userMessage("go"))
+            .collect { throw collectorFailure }
+        }
+
+      assertSame(collectorFailure, thrown)
+      assertEquals(emptyList(), plugin.runErrors)
+    }
+
+  @Test
+  fun runAsync_scopeCanceledWhileTheAgentUnwindsAfterAnEarlyStop_skipsAfterRun() = runBlocking {
+    val plugin = AfterRunRecorder()
+    val agent =
+      DummyAgent("emitter") { context ->
+        val job = currentCoroutineContext().job
+        try {
+          emit(modelEvent("e0", invocationId = context.invocationId, author = "emitter"))
+          emit(modelEvent("e1", invocationId = context.invocationId, author = "emitter"))
+        } finally {
+          job.cancel()
+        }
+      }
+
+    launch {
+        runCatching {
+          runnerWith(agent, plugin).runAsync("user", "s", newMessage = userMessage("go")).first()
+        }
+      }
+      .join()
+
+    assertEquals(0, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAgentWithPlugins_agentFails_notifiesOnRunErrorOnce() = runBlocking {
+    val failure = IllegalStateException("agent boom")
+    val plugin = AfterRunRecorder()
+    val agent = DummyAgent("failing") { throw failure }
+    val runner =
+      ProtectedCallRunner(App(appName = "app", rootAgent = agent, plugins = listOf(plugin)))
+
+    assertFailsWith<IllegalStateException> {
+      runner.runWithPlugins(testInvocationContext(agent = agent)).toList()
+    }
+
+    assertEquals(listOf<Throwable>(failure), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_agentWrapsTheCallersExceptionInAnotherClass_notifiesOnRunError() = runBlocking {
+    val plugin = AfterRunRecorder()
+    val agent = copyingAgent { AgentError(it.message, it) }
+
+    val thrown =
+      assertFailsWith<AgentError> {
+        runnerWith(agent, plugin).runAsync("user", "s", newMessage = userMessage("go")).collect {
+          throw IllegalStateException("caller boom")
+        }
+      }
+
+    assertEquals(0, plugin.afterRuns)
+    assertEquals(listOf<Throwable>(thrown), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_agentCancelsItself_skipsAfterRun() = runBlocking {
+    val plugin = AfterRunRecorder()
+    val agent =
+      DummyAgent("emitter") { context ->
+        emit(modelEvent("e0", invocationId = context.invocationId, author = "emitter"))
+        throw CancellationException("agent cancel")
+      }
+
+    assertFailsWith<CancellationException> {
+      runnerWith(agent, plugin).runAsync("user", "s", newMessage = userMessage("go")).toList()
+    }
+
+    assertEquals(0, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_agentCancelsAfterAnEarlyStop_skipsAfterRun() = runBlocking {
+    val plugin = AfterRunRecorder()
+    val agent =
+      DummyAgent("emitter") { context ->
+        try {
+          emit(modelEvent("e0", invocationId = context.invocationId, author = "emitter"))
+          emit(modelEvent("e1", invocationId = context.invocationId, author = "emitter"))
+        } finally {
+          throw CancellationException("agent cancel")
+        }
+      }
+
+    val first =
+      runnerWith(agent, plugin).runAsync("user", "s", newMessage = userMessage("go")).first()
+
+    assertEquals("e0", first.content?.parts?.single()?.text)
+    assertEquals(0, plugin.afterRuns)
+    assertEquals(emptyList(), plugin.runErrors)
+  }
+
+  @Test
+  fun runAsync_collectorTakesTheFirstEvent_doesNotCompact() = runBlocking {
+    // Compaction waits for a later turn, so first() does not wait for a summarizer call.
+    val summarizer = RecordingSummarizer(returning = compactionEvent(startTs = 0L, endTs = 0L))
+    val config =
+      EventsCompactionConfig(compactionInterval = 1, overlapSize = 0, summarizer = summarizer)
+    val runner =
+      InMemoryRunner(App(appName = "app", rootAgent = emitter(), eventsCompactionConfig = config))
+
+    runner.runAsync("user", "s", newMessage = userMessage("go")).first()
+
+    assertTrue(summarizer.calls.isEmpty())
   }
 
   @Test
@@ -1929,6 +2279,51 @@ class AbstractRunnerTest {
     )
     assertEquals(streamedEarlyExit, persisted.single { it.author == Role.MODEL })
   }
+
+  /** Counts afterRun calls, which throw [afterRunFailure] if set, and records onRunError errors. */
+  private class AfterRunRecorder(private val afterRunFailure: Throwable? = null) : Plugin {
+    override val name = "after_run_recorder"
+    var afterRuns = 0
+    val runErrors = mutableListOf<Throwable>()
+
+    override suspend fun afterRun(invocationContext: InvocationContext) {
+      afterRuns++
+      if (afterRunFailure != null) throw afterRunFailure
+    }
+
+    override suspend fun onRunError(invocationContext: InvocationContext, error: Throwable) {
+      runErrors += error
+    }
+  }
+
+  /** Exposes the protected [runAgentWithPlugins] to tests. */
+  private class ProtectedCallRunner(app: App) : InMemoryRunner(app) {
+    fun runWithPlugins(context: InvocationContext) = runAgentWithPlugins(context)
+  }
+
+  /** An agent's own failure type, unlike anything a caller throws. */
+  private class AgentError(message: String?, cause: Throwable) : RuntimeException(message, cause)
+
+  /** An agent that emits "e0" and rethrows what the caller threw as [copy] makes it. */
+  private fun copyingAgent(copy: (IllegalStateException) -> Throwable) =
+    DummyAgent("emitter") { context ->
+      try {
+        emit(modelEvent("e0", invocationId = context.invocationId, author = "emitter"))
+      } catch (e: IllegalStateException) {
+        throw copy(e)
+      }
+    }
+
+  /** An agent that emits "e0", "e1" and "e2". */
+  private fun emitter() =
+    DummyAgent("emitter") { context ->
+      repeat(3) { i ->
+        emit(modelEvent("e$i", invocationId = context.invocationId, author = "emitter"))
+      }
+    }
+
+  private fun runnerWith(agent: BaseAgent, plugin: Plugin) =
+    InMemoryRunner(App(appName = "app", rootAgent = agent, plugins = listOf(plugin)))
 }
 
 /** A [DummyAgent] that emits one model [Event] tagged with the current invocation id per turn. */
