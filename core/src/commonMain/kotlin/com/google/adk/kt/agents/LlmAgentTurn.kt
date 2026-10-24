@@ -37,6 +37,7 @@ import com.google.adk.kt.models.RealtimeInput
 import com.google.adk.kt.models.toTracePayload
 import com.google.adk.kt.processors.LlmRequestProcessor
 import com.google.adk.kt.processors.LlmResponseProcessor
+import com.google.adk.kt.processors.STREAM_FINAL_ANSWER_KEY
 import com.google.adk.kt.processors.createFinalModelResponseEvent
 import com.google.adk.kt.processors.findTransferTargets
 import com.google.adk.kt.processors.generateRequestConfirmationEvent
@@ -373,10 +374,10 @@ internal class LlmAgentTurn(
   }
 
   /**
-   * Stops the run's streaming [tools] however the run ended. After a normal end ([ended]), it first
-   * hands the caller what the tools sent.
+   * Stops the run's streaming [tools] however the run ended, recording each call it stops. After a
+   * normal end ([ended]), it first hands the caller what the tools sent.
    */
-  @Suppress("SuspendInFinally") // close runs under NonCancellable itself.
+  @Suppress("SuspendInFinally") // close and the record run under NonCancellable.
   private suspend fun FlowCollector<Event>.finishLiveRun(
     tools: LiveStreamingTools?,
     ended: Boolean,
@@ -384,11 +385,12 @@ internal class LlmAgentTurn(
     if (tools == null) return
     try {
       if (ended) {
-        tools.stopAll()
+        tools.stopRunning()
+        // Emitted first, so the session stores them before the `finally` records the answers.
         for (event in tools.drainEvents()) emit(event)
       }
     } finally {
-      tools.close()
+      recordFinalAnswers(tools.close())
     }
   }
 
@@ -604,7 +606,7 @@ internal class LlmAgentTurn(
     }
     releaseHeldTransfer()
     // Stopped before the handover, so this agent's streams reach no other agent.
-    liveTools?.stopAll()
+    liveTools?.stopRunning()
     return false
   }
 
@@ -618,6 +620,12 @@ internal class LlmAgentTurn(
     val handover = pendingHandover.exchange(null) ?: return false
     // A drop may have cut its emit short; the caller still sees it before the handover.
     if (!handover.delivered) collector.emit(handover.event)
+    if (liveTools != null) {
+      // As at a run's end, the stopped streams' queued events are stored before their answers.
+      for (event in liveTools.drainEvents()) collector.emit(event)
+      // After the lost handover event, which may hold the pending answers these supersede.
+      recordFinalAnswers(liveTools.stopAll())
+    }
     val agentName = handover.transferTo
     if (agentName == null) {
       // Any other handover is a task_completed, which ends its run (in a sequence, the step).
@@ -634,8 +642,6 @@ internal class LlmAgentTurn(
           ?: throw IllegalArgumentException(
             "Agent '${agent.name}' is not allowed to transfer to the requested agent."
           )
-    // This agent's tools stopped before the handover; what they sent the caller goes first.
-    liveTools?.drainEvents()?.forEach { collector.emit(it) }
     collector.emitAll(target.runLive(context.forLiveChild(target)))
     return true
   }
@@ -733,7 +739,7 @@ internal class LlmAgentTurn(
             receiveTurns(request, connection, queue, result, deliver)
           } catch (e: Throwable) {
             // A handover cut short stops its streams first; the saves below can take seconds.
-            if (pendingHandover.load() != null) liveTools?.stopAll()
+            if (pendingHandover.load() != null) liveTools?.stopRunning()
             // A drop or error cancels this scope; let running saves deliver their recordings first.
             if (e !is CancellationException && !saves.finish()) storeTimedOut = true
             throw e
@@ -905,7 +911,7 @@ internal class LlmAgentTurn(
       val handover = releaseHeldTransfer()
       if (handover != null) {
         emitEvent(handover.event)
-        liveTools?.stopAll()
+        liveTools?.stopRunning()
         handOverConnection(handover, queue)
         return LiveTurnsEnd.TRANSFER
       }
@@ -955,7 +961,7 @@ internal class LlmAgentTurn(
     val handover = pendingHandover.load()
     if (handover != null) {
       // Stopped before the handover, so this agent's streams reach no other agent.
-      liveTools?.stopAll()
+      liveTools?.stopRunning()
       handOverConnection(handover, queue)
       return if (handover.transferTo != null) LiveTurnsEnd.TRANSFER else LiveTurnsEnd.TASK_COMPLETED
     }
@@ -1203,6 +1209,42 @@ internal class LlmAgentTurn(
       )
     )
     return true
+  }
+
+  /**
+   * Records each streaming call's final [answers] once the run ended or handed over, for calls
+   * whose pending or repeat answer reached the session, so a later run's history shows the stream
+   * ended. It writes straight to the session because the connection is closing and a failed or
+   * abandoned run has no collector. A failed append is logged rather than thrown, so it does not
+   * replace an exception unwinding the run.
+   */
+  private suspend fun recordFinalAnswers(answers: List<Content>) {
+    if (answers.isEmpty()) return
+    val answered =
+      context.session.events.flatMapTo(mutableSetOf()) { event ->
+        event.functionResponses().mapNotNull { it.id }
+      }
+    val owed = answers.filter { answer -> answer.parts.any { it.functionResponse?.id in answered } }
+    if (owed.isEmpty()) return
+    withContext(NonCancellable) {
+      try {
+        for (answer in owed) {
+          val record =
+            createModelResponseEvent()
+              .copy(
+                content = answer,
+                // As the runner adds the run's metadata to each event it stores.
+                customMetadata =
+                  context.runConfig?.customMetadata.orEmpty() + (STREAM_FINAL_ANSWER_KEY to true),
+              )
+          liveRun().append(record)
+        }
+      } catch (e: CancellationException) {
+        throw e
+      } catch (e: Exception) {
+        logger.warn { "Recording ${owed.size} stopped streams failed (${e::class.simpleName})." }
+      }
+    }
   }
 
   /** Records the request's state change on an event of its own. */

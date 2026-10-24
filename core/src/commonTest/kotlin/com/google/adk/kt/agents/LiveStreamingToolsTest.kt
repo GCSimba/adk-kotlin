@@ -28,6 +28,7 @@ import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
+import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -71,17 +72,19 @@ class LiveStreamingToolsTest {
       var started = false
       val tool = DummyTool(name = "monitor") { _, _ -> flow<String> { started = true } }
 
+      val closed: List<Content>
       try {
         val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
         tools.onAnswersQueued(answerTo("c1"), mayStart = false)
         yield()
       } finally {
-        withContext(NonCancellable) { tools.close() }
+        closed = withContext(NonCancellable) { tools.close() }
       }
 
       assertWithMessage("a stream answered alongside a handover should never start")
         .that(started)
         .isFalse()
+      assertThat(closed.flatMap { it.parts }.map { it.functionResponse?.id }).containsExactly("c1")
     }
   }
 
@@ -92,17 +95,156 @@ class LiveStreamingToolsTest {
     var started = false
     val tool = DummyTool(name = "monitor") { _, _ -> flow<String> { started = true } }
 
+    val closed: List<Content>
     try {
       val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
       tools.onAnswersQueued(answerTo("c1"))
       yield()
     } finally {
-      withContext(NonCancellable) { tools.close() }
+      closed = withContext(NonCancellable) { tools.close() }
     }
 
     assertWithMessage("a stream whose pending answer was dropped should never start")
       .that(started)
       .isFalse()
+    // Answered as pending by `run`, so `close` still returns a final answer though it never ran.
+    assertThat(closed.flatMap { it.parts }.map { it.functionResponse?.id }).containsExactly("c1")
+  }
+
+  @Test
+  fun stopRunning_stopsTheStream_stopAllStillReturnsItsFinalAnswer() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      val tool = DummyTool(name = "monitor") { _, _ -> flow<String> { awaitCancellation() } }
+      val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
+      tools.onAnswersQueued(answerTo("c1"))
+
+      tools.stopRunning()
+
+      val stopped = tools.stopAll().flatMap { it.parts }.map { it.functionResponse?.id }
+      val closed = tools.close()
+
+      assertThat(stopped).containsExactly("c1")
+      assertThat(closed).isEmpty()
+    }
+  }
+
+  @Test
+  fun onBeforeConnect_cancelsAStreamThatNeverStarted_closeStillReturnsItsFinalAnswer() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      val tool = DummyTool(name = "monitor") { _, _ -> flow<String> { awaitCancellation() } }
+
+      val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
+      tools.onBeforeConnect()
+
+      assertThat(tools.close().flatMap { it.parts }.map { it.functionResponse?.id })
+        .containsExactly("c1")
+    }
+  }
+
+  @Test
+  fun close_afterARefusedRepeat_returnsAFinalAnswerForTheRepeatToo() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      val tool = DummyTool(name = "monitor") { _, _ -> flow<String> { awaitCancellation() } }
+      val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
+      tools.onAnswersQueued(answerTo("c1"))
+
+      val repeat = tools.run(tool, streamingToolContext("c2"), emptyMap())
+
+      val stopped = tools.close().flatMap { it.parts }.map { it.functionResponse?.id }
+
+      assertThat((repeat as Map<*, *>)["status"].toString()).contains("already running")
+      assertThat(stopped).containsExactly("c1", "c2")
+    }
+  }
+
+  @Test
+  fun close_sameCallIdOwedTwice_returnsOneFinalAnswer() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      val tool = DummyTool(name = "monitor") { _, _ -> flow<String> { awaitCancellation() } }
+      val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
+      tools.onBeforeConnect()
+      // Re-running the same id after onBeforeConnect owes it twice, but close answers each id once.
+      val again = tools.run(tool, streamingToolContext("c1"), emptyMap())
+      tools.onAnswersQueued(answerTo("c1"))
+
+      val stopped = tools.close().flatMap { it.parts }.map { it.functionResponse?.id }
+
+      assertThat((again as Map<*, *>)["status"].toString()).contains("pending")
+      assertThat(stopped).containsExactly("c1")
+    }
+  }
+
+  @Test
+  fun close_repeatOfAReplacedCall_returnsAFinalAnswerForTheRepeat() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      val tool = DummyTool(name = "monitor") { _, _ -> flow<String> { awaitCancellation() } }
+      val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
+      tools.onAnswersQueued(answerTo("c1"))
+      val repeat = tools.run(tool, streamingToolContext("c2"), emptyMap())
+
+      // c1 again with other arguments replaces the first, so it must inherit c2's final answer.
+      val replacement = tools.run(tool, streamingToolContext("c1"), mapOf("symbol" to "silver"))
+      tools.onAnswersQueued(answerTo("c1"))
+
+      val stopped = tools.close().flatMap { it.parts }.map { it.functionResponse?.id }
+
+      assertThat((repeat as Map<*, *>)["status"].toString()).contains("already running")
+      assertThat((replacement as Map<*, *>)["status"].toString()).contains("pending")
+      assertThat(stopped).containsExactly("c1", "c2")
+    }
+  }
+
+  @Test
+  fun close_streamThatEndedOnItsOwn_returnsAFinishedAnswerForItAndItsRepeat() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      val release = CompletableDeferred<Unit>()
+      val tool =
+        DummyTool(name = "ticker") { _, _ ->
+          flow {
+            release.await()
+            emit("tick")
+          }
+        }
+      val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
+      tools.onAnswersQueued(answerTo("c1"))
+      val repeat = tools.run(tool, streamingToolContext("c2"), emptyMap())
+
+      release.complete(Unit)
+      yield()
+      val closed = tools.close().flatMap { it.parts }.mapNotNull { it.functionResponse }
+
+      assertThat((repeat as Map<*, *>)["status"].toString()).contains("already running")
+      val finished = mapOf("status" to "ticker finished streaming; no more updates will arrive.")
+      assertThat(closed.associate { it.id to it.response })
+        .containsExactly("c1", finished, "c2", finished)
+    }
+  }
+
+  @Test
+  fun close_streamThatFailed_returnsAnErrorAnswerWithoutTheErrorText() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      val tool = DummyTool(name = "ticker") { _, _ -> flow<String> { error("secret detail") } }
+      val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
+      tools.onAnswersQueued(answerTo("c1"))
+
+      yield()
+      val closed = tools.close().flatMap { it.parts }.mapNotNull { it.functionResponse }
+
+      assertThat(closed.map { it.id to it.response })
+        .containsExactly(
+          "c1" to
+            mapOf(
+              "status" to "ticker stopped streaming after an error; no more updates will arrive."
+            )
+        )
+    }
   }
 
   @Test
@@ -111,18 +253,21 @@ class LiveStreamingToolsTest {
     val tools = LiveStreamingTools(queue, "agent", "invocation", coroutineContext)
     val stream = flow<String> { awaitCancellation() }.onCompletion { error("cleanup failed") }
     val tool = DummyTool(name = "monitor") { _, _ -> stream }
+    val closed: List<Content>
     try {
       val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
       tools.onAnswersQueued(answerTo("c1"))
       yield()
     } finally {
-      withContext(NonCancellable) { tools.close() }
+      closed = withContext(NonCancellable) { tools.close() }
     }
     queue.close()
 
     assertWithMessage("a stream that was stopped sent an answer")
       .that(queue.receiveRequest())
       .isNull()
+    // Its stop still records a final answer; only the queue must stay empty.
+    assertThat(closed.flatMap { it.parts }.map { it.functionResponse?.id }).containsExactly("c1")
   }
 
   @Test

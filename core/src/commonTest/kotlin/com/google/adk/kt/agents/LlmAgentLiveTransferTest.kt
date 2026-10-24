@@ -25,6 +25,7 @@ import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.ContentInput
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.runners.InMemoryRunner
+import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.testing.DummyLiveModel
 import com.google.adk.kt.testing.DummyLiveStep.AwaitSent
 import com.google.adk.kt.testing.DummyLiveStep.EndStream
@@ -41,6 +42,7 @@ import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
+import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
 import kotlin.test.Test
 import kotlin.time.Duration.Companion.milliseconds
@@ -102,6 +104,121 @@ class LlmAgentLiveTransferTest {
     val parent = LlmAgent(name = "router", model = parentModel, subAgents = listOf(child))
     return Handover(InMemoryRunner(agent = parent), parentModel, childModel)
   }
+
+  @Test
+  fun runLive_transferWhileAToolStreams_recordsTheParentsStreamAsStopped(): Unit = runTest {
+    val stopped =
+      mapOf(
+        "status" to
+          "monitor stopped streaming when its live session ended; no more updates will arrive."
+      )
+    val childModel =
+      DummyLiveModel(
+        listOf(Respond(LlmResponse(content = modelMessage("sunny"), partial = false)), EndStream)
+      )
+    val monitor = DummyTool(name = "monitor") { _, _ -> flow<String> { awaitCancellation() } }
+    val parentModel =
+      DummyLiveModel(
+        listOf(
+          Respond(modelFunctionCallResponse("monitor", id = "c1")),
+          AwaitSent("a tool response") {
+            it is ContentInput && it.content.parts.all { p -> p.functionResponse != null }
+          },
+          Respond(modelTransferToAgentResponse("weather_agent")),
+          EndStream,
+        )
+      )
+    val child = LlmAgent(name = "weather_agent", model = childModel)
+    val parent =
+      LlmAgent(
+        name = "router",
+        model = parentModel,
+        subAgents = listOf(child),
+        tools = listOf(monitor),
+      )
+    val runner = InMemoryRunner(agent = parent)
+
+    val unused = runner.runLive("u", "s", LiveRequestQueue()).toList()
+
+    parentModel.connections.forEach { it.assertAllWaitsMet() }
+    val records =
+      runner.sessionService
+        .getSession(SessionKey(runner.appName, "u", "s"))
+        ?.events
+        .orEmpty()
+        .filter { event ->
+          event.functionResponses().any { it.id == "c1" && it.response == stopped }
+        }
+    assertThat(records.map { it.author }).containsExactly("router")
+  }
+
+  @Test
+  fun runLive_transferWithToolEventsStillQueued_storesThemBeforeTheStoppedAnswers(): Unit =
+    runTest {
+      val childModel =
+        DummyLiveModel(
+          listOf(Respond(LlmResponse(content = modelMessage("sunny"), partial = false)))
+        )
+      val monitor =
+        DummyTool(name = "monitor") { _, args ->
+          flow {
+            emit(Event(content = Content(Role.MODEL, listOf(Part(text = "watching ${args["n"]}")))))
+            awaitCancellation()
+          }
+        }
+      val calls =
+        (1..6).map { FunctionCall(name = "monitor", args = mapOf("n" to it), id = "c$it") }
+      val parentModel =
+        DummyLiveModel(
+          listOf(
+            Respond(
+              LlmResponse(content = Content(Role.MODEL, calls.map { Part(functionCall = it) }))
+            ),
+            AwaitSent("the pending answers") {
+              it is ContentInput &&
+                it.content.parts.count { part -> part.functionResponse != null } == 6
+            },
+            Respond(modelTransferToAgentResponse("weather_agent")),
+            EndStream,
+          )
+        )
+      val child = LlmAgent(name = "weather_agent", model = childModel)
+      val parent =
+        LlmAgent(
+          name = "router",
+          model = parentModel,
+          subAgents = listOf(child),
+          tools = listOf(monitor),
+        )
+      val queue = LiveRequestQueue()
+      val runner = InMemoryRunner(agent = parent)
+
+      // A slow caller leaves tool events queued when the transfer stops the streams.
+      val unused =
+        runner
+          .runLive("u", "s", queue)
+          .onEach { event ->
+            if (event.branch?.startsWith("monitor@") == true) delay(3000.milliseconds)
+            if (event.content?.parts?.any { it.text == "sunny" } == true) queue.close()
+          }
+          .toList()
+
+      val events =
+        checkNotNull(runner.sessionService.getSession(SessionKey(runner.appName, "u", "s"))).events
+      val toolEventsAt = events.indices.filter { events[it].branch?.startsWith("monitor@") == true }
+      val stopped =
+        mapOf(
+          "status" to
+            "monitor stopped streaming when its live session ended; no more updates will arrive."
+        )
+      val stoppedAnswersAt =
+        events.indices.filter { index ->
+          events[index].functionResponses().any { it.response == stopped }
+        }
+      assertThat(toolEventsAt).hasSize(6)
+      assertThat(stoppedAnswersAt).hasSize(6)
+      assertThat(toolEventsAt.max()).isLessThan(stoppedAnswersAt.min())
+    }
 
   @Test
   fun runLive_streamingCallInTheSameTurnAsATransfer_neverStarts(): Unit = runTest {

@@ -27,7 +27,10 @@ import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.ContentInput
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.models.RealtimeInput
+import com.google.adk.kt.sessions.InMemorySessionService
+import com.google.adk.kt.sessions.Session
 import com.google.adk.kt.sessions.SessionKey
+import com.google.adk.kt.sessions.SessionService
 import com.google.adk.kt.testing.DummyLiveModel
 import com.google.adk.kt.testing.DummyLiveStep
 import com.google.adk.kt.testing.DummyLiveStep.AwaitSent
@@ -49,8 +52,10 @@ import com.google.adk.kt.types.Transcription
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
 import kotlin.test.Test
+import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
@@ -60,6 +65,7 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.yield
 
 /** Drives whole live runs through the public runner against scripted presets of real traffic. */
@@ -569,6 +575,168 @@ class LiveRunIntegrationTest {
     assertThat(streams.value).isEqualTo(2)
   }
 
+  /** The ids of the calls the session holds a stopped answer for, oldest first. */
+  private suspend fun InMemoryRunner.stoppedCallIds(): List<String?> =
+    sessionService
+      .getSession(SessionKey(appName, USER_ID, SESSION_ID))
+      ?.events
+      .orEmpty()
+      .flatMap { it.functionResponses() }
+      .filter { it.response == STOPPED }
+      .map { it.id }
+
+  @Test
+  fun runLive_runEndsWithStreamsRunning_recordsEachAsStopped() {
+    runBlocking {
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("monitor", mapOf("symbol" to "gold"), id = "c1")),
+          AwaitSent("the gold pending answer", answers("c1", PENDING)),
+          Respond(modelFunctionCallResponse("monitor", mapOf("symbol" to "silver"), id = "c2")),
+          AwaitSent("the silver pending answer", answers("c2", PENDING)),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) = runnerFor(script, tools = listOf(endlessTool(CompletableDeferred())))
+
+      val unused = runner.runUntilTurnComplete()
+
+      model.connections.single().assertAllWaitsMet()
+      assertThat(runner.stoppedCallIds()).containsExactly("c1", "c2")
+      // A record for later runs: the model is not told.
+      assertThat(model.toolAnswers().map { it.response }).doesNotContain(STOPPED)
+    }
+  }
+
+  @Test
+  fun runLive_runEndsWithARepeatedCallWaiting_recordsTheRepeatAsStoppedToo() {
+    runBlocking {
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("monitor", id = "c1")),
+          AwaitSent("the pending answer", answers("c1", PENDING)),
+          Respond(modelFunctionCallResponse("monitor", id = "c2")),
+          AwaitSent("the repeat's answer", answers("c2", ALREADY_STREAMING)),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) = runnerFor(script, tools = listOf(endlessTool(CompletableDeferred())))
+
+      val unused = runner.runUntilTurnComplete()
+
+      model.connections.single().assertAllWaitsMet()
+      assertThat(runner.stoppedCallIds()).containsExactly("c1", "c2")
+    }
+  }
+
+  // Virtual time lets a slow caller leave tool events queued when the run ends.
+  @Test
+  fun runLive_runEndsWithToolEventsStillQueued_storesThemBeforeTheStoppedRecords(): Unit = runTest {
+    val calls = (1..6).map { FunctionCall(name = "monitor", args = mapOf("n" to it), id = "c$it") }
+    val script =
+      listOf(
+        Respond(LlmResponse(content = Content(Role.MODEL, calls.map { Part(functionCall = it) }))),
+        AwaitSent("the pending answers") {
+          it is ContentInput &&
+            it.content.parts.count { part -> part.functionResponse != null } == 6
+        },
+        Respond(LlmResponse(turnComplete = true)),
+      )
+    val tool =
+      DummyTool(name = "monitor") { _, args ->
+        flow<Any> {
+          emit(Event(content = Content(Role.USER, listOf(Part(text = "watching ${args["n"]}")))))
+          awaitCancellation()
+        }
+      }
+    val (runner, _) = runnerFor(script, tools = listOf(tool))
+    val queue = LiveRequestQueue()
+
+    val unused =
+      runner
+        .runLive(USER_ID, SESSION_ID, queue, liveConfig())
+        .onEach { event ->
+          if (event.branch?.startsWith("monitor@") == true) delay(3000.milliseconds)
+          if (event.turnComplete) queue.close()
+        }
+        .toList()
+
+    val stored = runner.sessionService.getSession(SessionKey(runner.appName, USER_ID, SESSION_ID))
+    val events = checkNotNull(stored).events
+    val toolEventsAt = events.indices.filter { events[it].branch?.startsWith("monitor@") == true }
+    val recordsAt =
+      events.indices.filter { index ->
+        events[index].functionResponses().any { it.response == STOPPED }
+      }
+    // Stored after the tools' updates, so each stop is its call's last event in the session.
+    assertThat(toolEventsAt).hasSize(6)
+    assertThat(recordsAt).hasSize(6)
+    assertThat(toolEventsAt.max()).isLessThan(recordsAt.min())
+  }
+
+  @Test
+  fun runLive_callerStopsCollectingWithAStreamRunning_recordsItAsStopped() {
+    runBlocking {
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("monitor", id = "c1")),
+          AwaitSent("the pending answer", answers("c1", PENDING)),
+          Respond(
+            LlmResponse(
+              outputTranscription = Transcription(text = "watching", finished = false),
+              partial = true,
+            )
+          ),
+        )
+      val (runner, _) = runnerFor(script, tools = listOf(endlessTool(CompletableDeferred())))
+
+      val unused =
+        runner.runLive(USER_ID, SESSION_ID, LiveRequestQueue(), liveConfig()).first {
+          it.outputTranscription != null
+        }
+
+      assertThat(runner.stoppedCallIds()).containsExactly("c1")
+    }
+  }
+
+  @Test
+  fun runLive_stoppedRecordFailsToSave_callerStillGetsTheEventItStoppedAt() {
+    runBlocking {
+      val inner = InMemorySessionService()
+      val failingRecords =
+        object : SessionService by inner {
+          override suspend fun appendEvent(session: Session, event: Event): Event {
+            if (event.functionResponses().any { it.response == STOPPED }) error("store unavailable")
+            return inner.appendEvent(session, event)
+          }
+        }
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("monitor", id = "c1")),
+          AwaitSent("the pending answer", answers("c1", PENDING)),
+          Respond(
+            LlmResponse(
+              outputTranscription = Transcription(text = "watching", finished = false),
+              partial = true,
+            )
+          ),
+        )
+      val agent =
+        LlmAgent(
+          name = "live_agent",
+          model = DummyLiveModel(script, "fake-live-model"),
+          tools = listOf(endlessTool(CompletableDeferred())),
+        )
+      val runner = InMemoryRunner(agent = agent, sessionService = failingRecords)
+
+      // A teardown append that fails after `first` cancels must not replace the event it took.
+      val heard =
+        runner.runLive(USER_ID, SESSION_ID, LiveRequestQueue(), liveConfig()).first {
+          it.outputTranscription != null
+        }
+
+      assertThat(heard.outputTranscription?.text).isEqualTo("watching")
+    }
+  }
+
   @Test
   fun runLive_streamingToolEmitsAFunctionResponse_sendsItsPayloadUnderTheCall(): Unit =
     runBlocking {
@@ -632,6 +800,11 @@ class LiveRunIntegrationTest {
     private const val TOOL_CALL_ID = "call-1"
     private val PENDING =
       mapOf("status" to "The function is running asynchronously and the results are pending.")
+    private val STOPPED =
+      mapOf(
+        "status" to
+          "monitor stopped streaming when its live session ended; no more updates will arrive."
+      )
     private val ALREADY_STREAMING =
       mapOf(
         "status" to

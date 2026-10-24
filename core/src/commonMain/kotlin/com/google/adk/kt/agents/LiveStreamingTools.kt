@@ -112,6 +112,12 @@ internal class LiveStreamingTools(
   // Calls that finished since the last stop, whose last values may still be queued.
   private val finished = AtomicReference<List<String>>(emptyList())
 
+  // Calls answered as pending that stopped, ended or never started; the next stopAll answers them.
+  private val owed = AtomicReference<List<StreamingCall>>(emptyList())
+
+  // Calls whose stream failed, so their final answer says so.
+  private val failed = AtomicReference<Set<String>>(emptySet())
+
   // An event whose hand-off was cancelled after it left the channel; taken first next time.
   private val undelivered = AtomicReference<ToolEvent?>(null)
   private val events =
@@ -124,6 +130,9 @@ internal class LiveStreamingTools(
     val args: Map<String, Any?>,
     val job: Job,
   ) {
+    // Repeats told this call is running need a final answer too when this stream is stopped.
+    val repeatIds = AtomicReference<List<String>>(emptyList())
+
     /** Whether [other] calls the same tool with the same arguments while this one still streams. */
     fun isRepeatedBy(other: StreamingCall): Boolean = isRepeatedBy(other.toolName, other.args)
 
@@ -145,7 +154,13 @@ internal class LiveStreamingTools(
    */
   suspend fun run(tool: BaseTool, context: ToolContext, args: Map<String, Any?>): Any {
     // Checked before the tool runs, so a repeat skips the work a tool does to start a stream.
-    if (active.load().any { it.isRepeatedBy(tool.name, args) }) return alreadyRunning(tool.name)
+    val original = active.load().firstOrNull { it.isRepeatedBy(tool.name, args) }
+    if (original != null) {
+      // The repeat then gets a final answer too when the running call's stream is stopped.
+      val repeatId = context.functionCallId
+      if (repeatId != null) original.repeatIds.mutate { ids -> ids + repeatId }
+      return alreadyRunning(tool.name)
+    }
     val result = tool.run(context, args)
     val stream = result as? Flow<*> ?: return result
     // Every live call has an id: the turn fills in a missing one before any tool runs.
@@ -170,7 +185,12 @@ internal class LiveStreamingTools(
     val ids = content.parts.mapNotNullTo(mutableSetOf()) { it.functionResponse?.id }
     for (call in active.load()) {
       if (call.callId !in ids) continue
-      if (mayStart && !queue.isClosed) call.job.start() else call.job.cancel()
+      if (mayStart && !queue.isClosed) {
+        call.job.start()
+      } else {
+        call.job.cancel()
+        owed.mutate { calls -> calls + call }
+      }
     }
   }
 
@@ -188,6 +208,10 @@ internal class LiveStreamingTools(
    */
   fun onBeforeConnect() {
     for (call in active.load()) {
+      // Its pending answer may already be stored, so stopAll still owes it a final answer.
+      if (!call.job.isActive && !call.job.isCompleted && !call.job.isCancelled) {
+        owed.mutate { calls -> calls + call }
+      }
       if (!call.job.isActive) call.job.cancel()
     }
   }
@@ -199,12 +223,15 @@ internal class LiveStreamingTools(
   }
 
   /**
-   * Cancels every streaming call this run started and waits up to [STOP_TIMEOUT] for them when the
-   * live run ends or hands over, even if the caller is cancelled.
+   * Cancels every running call and waits for them as [stopAll] does, keeping their final answers
+   * for the next [stopAll].
    */
-  suspend fun stopAll(): Unit =
+  suspend fun stopRunning(): Unit =
     withContext(NonCancellable) {
       val running = active.exchange(emptyList())
+      // Before cancelling: a replaced call needs no stopped answer.
+      val ended = running.filter { !it.job.isCancelled }
+      owed.mutate { calls -> calls + ended }
       // A call that ignores cancellation is already warned about and left behind.
       if (running.isNotEmpty()) {
         val unused = cancelAndAwait(running)
@@ -213,11 +240,46 @@ internal class LiveStreamingTools(
       queue.discardAnswersTo(finished.exchange(emptyList()) + running.map { it.callId })
     }
 
-  /** Stops every streaming call, releases the scope and drops what no one will deliver. */
-  suspend fun close() {
-    stopAll()
+  /**
+   * Cancels every streaming call this run started and waits up to [STOP_TIMEOUT] for them when the
+   * live run ends or hands over, even if the caller is cancelled.
+   *
+   * @return one final answer per call stopped, ended or never started, and per repeat of one told
+   *   it was already running.
+   */
+  suspend fun stopAll(): List<Content> {
+    stopRunning()
+    // An id owed twice is answered once, by the first call that owes it.
+    val callById: Map<String, StreamingCall> = buildMap {
+      for (call in owed.exchange(emptyList())) {
+        for (callId in listOf(call.callId) + call.repeatIds.load()) {
+          getOrPut(callId) { call }
+        }
+      }
+    }
+    return callById.map { (callId, call) ->
+      functionResponseContent(call.toolName, callId, mapOf(STATUS_KEY to finalStatus(call)))
+    }
+  }
+
+  /** Why [call]'s stream ended: stopped by the run, finished, or failed. */
+  private fun finalStatus(call: StreamingCall): String =
+    when {
+      call.job.isCancelled -> stoppedStatus(call.toolName)
+      call.callId in failed.load() -> failedStatus(call.toolName)
+      else -> finishedStatus(call.toolName)
+    }
+
+  /**
+   * Stops every streaming call, releases the scope and drops what no one will deliver.
+   *
+   * @return what [stopAll] returns.
+   */
+  suspend fun close(): List<Content> {
+    val stopped = stopAll()
     events.close()
     scope.cancel()
+    return stopped
   }
 
   /**
@@ -241,7 +303,9 @@ internal class LiveStreamingTools(
     while (true) {
       val calls = active.load()
       // Live models re-call a tool they already stream; a second stream would repeat each value.
-      if (calls.any { it.isRepeatedBy(call) }) {
+      val original = calls.firstOrNull { it.isRepeatedBy(call) }
+      if (original != null) {
+        original.repeatIds.mutate { ids -> ids + callId }
         call.job.cancel()
         return false
       }
@@ -256,6 +320,14 @@ internal class LiveStreamingTools(
       finished.mutate { ids -> ids + call.callId }
       active.mutate { calls -> calls - call }
     }
+    // A new call under a failed call's id has not failed.
+    failed.mutate { ids -> ids - callId }
+    // A stream that ends on its own is owed a final answer too.
+    call.job.invokeOnCompletion { cause ->
+      if (cause == null) owed.mutate { calls -> calls + call }
+    }
+    // Repeats told the replaced call was running still wait on this stream's final answer.
+    call.repeatIds.mutate { ids -> ids + stale.flatMap { it.repeatIds.load() } }
     for (old in stale) {
       old.job.cancel()
     }
@@ -277,6 +349,7 @@ internal class LiveStreamingTools(
     } catch (e: Throwable) {
       // Exceptions and TODO()'s NotImplementedError reach the model unless stopped.
       if ((e is Error && e !is NotImplementedError) || !currentCoroutineContext().isActive) throw e
+      failed.mutate { ids -> ids + callId }
       reportFailure(tool, callId, e)
     }
   }
@@ -343,6 +416,21 @@ internal class LiveStreamingTools(
     private val STOP_TIMEOUT = 1.seconds
     private const val STATUS_KEY = "status"
     private const val ERROR_KEY = "error"
+
+    /**
+     * The answer recorded, when the run ends or hands over, for a call to [toolName], or a repeat
+     * of one, that it stopped or that never started.
+     */
+    private fun stoppedStatus(toolName: String) =
+      "$toolName stopped streaming when its live session ended; no more updates will arrive."
+
+    /** The answer recorded for a call to [toolName], or a repeat of one, whose stream finished. */
+    private fun finishedStatus(toolName: String) =
+      "$toolName finished streaming; no more updates will arrive."
+
+    /** The answer recorded for a call to [toolName], or a repeat of one, whose stream failed. */
+    private fun failedStatus(toolName: String) =
+      "$toolName stopped streaming after an error; no more updates will arrive."
 
     /** The answer a call that starts a streaming tool gets at once. */
     private const val PENDING_STATUS =
