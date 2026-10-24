@@ -634,6 +634,8 @@ internal class LlmAgentTurn(
           ?: throw IllegalArgumentException(
             "Agent '${agent.name}' is not allowed to transfer to the requested agent."
           )
+    // This agent's tools stopped before the handover; what they sent the caller goes first.
+    liveTools?.drainEvents()?.forEach { collector.emit(it) }
     collector.emitAll(target.runLive(context.forLiveChild(target)))
     return true
   }
@@ -1338,7 +1340,8 @@ internal class LlmAgentTurn(
     val content = event.content ?: return
     if (content.parts.none { it.functionResponse != null }) return
     queue.sendContent(content)
-    liveTools?.onAnswersQueued(content)
+    // A stream answered alongside a handover would only reach the next agent.
+    liveTools?.onAnswersQueued(content, mayStart = pendingHandover.load() == null)
   }
 
   /**

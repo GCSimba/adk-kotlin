@@ -98,6 +98,7 @@ import com.google.common.truth.Truth.assertThat
 import com.google.genai.kotlin.GenAiApiException
 import kotlin.random.Random
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -5093,6 +5094,51 @@ class LlmAgentTurnTest {
     }
 
   @Test
+  fun runLive_streamingCallInATransferResponseWithHeardInput_neverStarts() {
+    runBlocking {
+      val queue = LiveRequestQueue()
+      var started = false
+      val monitor =
+        DummyTool(name = "monitor") { _, _ ->
+          flow<String> {
+            started = true
+            awaitCancellation()
+          }
+        }
+      // The heard input's slow screening suspends between queuing the answers and the handover.
+      val transfer = transferWithHeardInput()
+      val content = checkNotNull(transfer.content)
+      val monitorCall = Part(functionCall = FunctionCall("monitor", id = "c1"))
+      val withMonitor =
+        transfer.copy(content = content.copy(parts = listOf(monitorCall) + content.parts))
+      val parentConn =
+        ScriptedConn("parent") {
+          emit(withMonitor)
+          it.closed.await()
+        }
+      val childModel =
+        RecordingLiveModel(
+          ScriptedConn("child") { it.closed.await() },
+          onConnect = { queue.close() },
+        )
+      val child = LlmAgent(name = "child", description = "c", model = childModel)
+      val parent =
+        LlmAgent(
+          name = "parent",
+          model = RecordingLiveModel(parentConn),
+          subAgents = listOf(child),
+          tools = listOf(monitor),
+          beforeModelCallbacks = listOf(slowScreening()),
+        )
+
+      parent.runLive(liveContextFor(parent, queue)).toList()
+
+      assertEquals(1, childModel.connectCalls)
+      assertFalse(started, "a stream answered alongside a transfer should never start")
+    }
+  }
+
+  @Test
   fun runLive_blockedReplyCutOffByADrop_isStillEmittedOnce() = runTest {
     val queue = LiveRequestQueue()
     queue.sendContent(userMessage("blocked"))
@@ -7060,6 +7106,71 @@ class LlmAgentTurnTest {
     assertEquals(1, model.connectCalls)
     val answer = connection.sentContent.flatMap { it.parts }.firstNotNullOf { it.functionResponse }
     assertEquals(mapOf("result" to "done"), answer.response)
+  }
+
+  @Test
+  fun runLive_sequentialStepCallsAStreamAndTaskCompletedTogether_neverStartsTheStream() {
+    runBlocking {
+      val collected = CompletableDeferred<Unit>()
+      val ticker =
+        DummyTool(name = "ticker") { _, _ ->
+          flow {
+            collected.complete(Unit)
+            emit("tick")
+            awaitCancellation()
+          }
+        }
+      // The heard input's slow screening suspends between queuing the answers and the step's end.
+      val step1Model =
+        DummyLiveModel(
+          listOf(
+            Respond(
+              LlmResponse(
+                content =
+                  Content(
+                    Role.MODEL,
+                    listOf(
+                      Part(functionCall = FunctionCall("ticker", id = "c1")),
+                      Part(functionCall = FunctionCall("task_completed", id = "tc1")),
+                    ),
+                  ),
+                inputTranscription = Transcription(text = "hi", finished = true),
+              )
+            )
+          )
+        )
+      val step2Model = DummyLiveModel(listOf(EndStream))
+      val sequence =
+        SequentialAgent(
+          name = "sequence",
+          subAgents =
+            listOf(
+              LlmAgent(
+                name = "step1",
+                description = "A sequential step.",
+                model = step1Model,
+                tools = listOf(ticker),
+                beforeModelCallbacks = listOf(slowScreening()),
+              ),
+              LlmAgent(name = "step2", description = "A sequential step.", model = step2Model),
+            ),
+        )
+      val runner = InMemoryRunner(agent = sequence)
+
+      val unused = runner.runLive("u", "s", LiveRequestQueue()).toList()
+
+      // The step is ending, so the stream it asked for in the same response never starts.
+      assertFalse(collected.isCompleted, "the stream started although the step was ending")
+      assertTrue(
+        step2Model.connections
+          .flatMap { it.sent }
+          .none { message ->
+            (message as? ContentInput)?.content?.parts?.any { it.functionResponse?.id == "c1" } ==
+              true
+          },
+        "the next step heard the never-started stream",
+      )
+    }
   }
 
   @Test

@@ -164,13 +164,13 @@ internal class LiveStreamingTools(
   /**
    * Starts the streams whose pending answers [content] carries, now that those answers are queued
    * ahead of anything the streams send. Cancels them instead when the queue is closed, since nobody
-   * would hear them.
+   * would hear them, or when [mayStart] is false, as during a handover.
    */
-  fun onAnswersQueued(content: Content) {
+  fun onAnswersQueued(content: Content, mayStart: Boolean = true) {
     val ids = content.parts.mapNotNullTo(mutableSetOf()) { it.functionResponse?.id }
     for (call in active.load()) {
       if (call.callId !in ids) continue
-      if (!queue.isClosed) call.job.start() else call.job.cancel()
+      if (mayStart && !queue.isClosed) call.job.start() else call.job.cancel()
     }
   }
 

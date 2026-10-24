@@ -65,6 +65,27 @@ class LiveStreamingToolsTest {
     )
 
   @Test
+  fun onAnswersQueued_mayNotStart_neverStartsTheStream() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      var started = false
+      val tool = DummyTool(name = "monitor") { _, _ -> flow<String> { started = true } }
+
+      try {
+        val unused = tools.run(tool, streamingToolContext("c1"), emptyMap())
+        tools.onAnswersQueued(answerTo("c1"), mayStart = false)
+        yield()
+      } finally {
+        withContext(NonCancellable) { tools.close() }
+      }
+
+      assertWithMessage("a stream answered alongside a handover should never start")
+        .that(started)
+        .isFalse()
+    }
+  }
+
+  @Test
   fun onAnswersQueued_callerHasHungUp_neverStartsTheStream(): Unit = runBlocking {
     val queue = LiveRequestQueue().apply { close() }
     val tools = LiveStreamingTools(queue, "agent", "invocation", coroutineContext)
