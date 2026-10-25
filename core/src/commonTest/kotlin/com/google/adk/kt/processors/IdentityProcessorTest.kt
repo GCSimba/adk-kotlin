@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
-@file:OptIn(FrameworkInternalApi::class)
+@file:OptIn(FrameworkInternalApi::class, ExperimentalWorkflowApi::class)
 
 package com.google.adk.kt.processors
 
+import com.google.adk.kt.agents.AgentMode
+import com.google.adk.kt.agents.AgentModeOverride
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.LlmAgent
+import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.testing.DummyAgent
@@ -88,11 +91,16 @@ class IdentityProcessorTest {
   }
 
   @Test
-  fun process_singleTurnNodeAgent_returnsRequestUnchanged() = runBlocking {
+  fun process_singleTurnNode_returnsRequestUnchanged() = runBlocking {
     val agent = LlmAgent(name = "test_agent", model = DummyModel("gemini"))
     val context =
       InvocationContext(session = testSession(), runConfig = null, agent = agent).let {
-        it.copy(frameworkData = it.frameworkData.copy(singleTurnNodeAgent = agent))
+        it.copy(
+          frameworkData =
+            it.frameworkData.copy(
+              agentModeOverride = AgentModeOverride(agent, AgentMode.SINGLE_TURN)
+            )
+        )
       }
 
     val processed = IdentityProcessor().process(context, LlmRequest())
@@ -106,7 +114,12 @@ class IdentityProcessorTest {
     val otherAgent = LlmAgent(name = "other", model = DummyModel("gemini"))
     val context =
       InvocationContext(session = testSession(), runConfig = null, agent = agent).let {
-        it.copy(frameworkData = it.frameworkData.copy(singleTurnNodeAgent = otherAgent))
+        it.copy(
+          frameworkData =
+            it.frameworkData.copy(
+              agentModeOverride = AgentModeOverride(otherAgent, AgentMode.SINGLE_TURN)
+            )
+        )
       }
 
     val processed = IdentityProcessor().process(context, LlmRequest())

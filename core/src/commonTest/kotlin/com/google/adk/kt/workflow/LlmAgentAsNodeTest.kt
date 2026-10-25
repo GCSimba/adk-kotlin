@@ -18,6 +18,7 @@
 
 package com.google.adk.kt.workflow
 
+import com.google.adk.kt.agents.AgentMode
 import com.google.adk.kt.agents.BaseAgent
 import com.google.adk.kt.agents.Context
 import com.google.adk.kt.agents.InvocationContext
@@ -1133,7 +1134,13 @@ class LlmAgentAsNodeTest {
     // Arrange: as in ADK Python, a single-turn agent is not told to hand the question over.
     val model = ScriptedModel(Content.fromText(Role.MODEL, "done"))
     val helper = LlmAgent(name = "helper", model = RecordingModel(mutableListOf()))
-    val router = LlmAgent(name = "router", model = model, subAgents = listOf(helper))
+    val router =
+      LlmAgent(
+        name = "router",
+        model = model,
+        subAgents = listOf(helper),
+        mode = AgentMode.SINGLE_TURN,
+      )
 
     // Act
     val unused = runNodeAsRoot(router, testInvocationContext(), { _, _ -> }, nodeInput = "go")

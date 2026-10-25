@@ -18,6 +18,7 @@ package com.google.adk.kt.processors
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.LlmAgent.IncludeContents
+import com.google.adk.kt.agents.isSingleTurnNode
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.LlmRequest
@@ -63,7 +64,7 @@ internal class ContentsProcessor : LlmRequestProcessor {
     val events = context.getEvents(currentInvocation = false, currentBranch = false)
     val agent = context.agent
     val frameworkData = context.frameworkData
-    val singleTurnNode = frameworkData.singleTurnNodeAgent === agent
+    val singleTurnNode = frameworkData.isSingleTurnNode(agent)
     val includeContents =
       when {
         agent !is LlmAgent -> IncludeContents.DEFAULT

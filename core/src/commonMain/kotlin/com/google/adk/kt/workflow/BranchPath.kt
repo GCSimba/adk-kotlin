@@ -57,6 +57,18 @@ internal object BranchPath {
   fun runIds(branch: String?): Set<String> =
     segmentsOf(branch).mapNotNull { it.substringAfterLast('@', "").ifEmpty { null } }.toSet()
 
+  /**
+   * The segments of [branch] below [base], e.g. `a@1.b@2.c@3` below `a@1` -> `[b@2, c@3]`; empty
+   * when [branch] is not strictly below [base].
+   */
+  fun segmentsBelow(branch: String?, base: String?): List<String> {
+    val segments = segmentsOf(branch)
+    val baseSegments = segmentsOf(base)
+    if (segments.size <= baseSegments.size) return emptyList()
+    if (segments.subList(0, baseSegments.size) != baseSegments) return emptyList()
+    return segments.drop(baseSegments.size)
+  }
+
   private fun segmentsOf(branch: String?): List<String> =
     if (branch.isNullOrEmpty()) emptyList() else branch.split(".")
 }

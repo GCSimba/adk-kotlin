@@ -16,6 +16,7 @@
 
 package com.google.adk.kt.agents
 
+import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.artifacts.ArtifactService
 import com.google.adk.kt.callbacks.BeforeToolCallbacksResult
@@ -919,13 +920,6 @@ data class ContextFrameworkData(
    */
   @FrameworkInternalApi val callbackContextData: MutableMap<String, Any> = concurrentMutableMapOf(),
   /**
-   * The agent this context copy runs as a single-turn workflow node. Keyed to that agent, so
-   * sub-agents and transfer targets that inherit the copy are not single-turn. The agent runs
-   * history-free unless it sets [LlmAgent.includeContents], and a schema mismatch in its output
-   * saves nothing to [LlmAgent.outputKey].
-   */
-  @FrameworkInternalApi val singleTurnNodeAgent: BaseAgent? = null,
-  /**
    * The workflow node path the agent runs at, or `null` outside a workflow. The contents processor
    * uses it to keep the agent's history to its own node path.
    */
@@ -935,6 +929,16 @@ data class ContextFrameworkData(
    * this exact scope reach the model, so `null` sees only unscoped events.
    */
   @FrameworkInternalApi val isolationScope: String? = null,
+  /**
+   * The mode [LlmAgent.runNode] sets for the agent it runs, keyed to that agent so sub-agents and
+   * transfer targets that inherit the copy do not take it; `null` outside a node run.
+   */
+  @FrameworkInternalApi val agentModeOverride: AgentModeOverride? = null,
+  /**
+   * The workflow node activation an agent node runs under, so its tools can run a sub-agent as a
+   * child node there; `null` outside a node run.
+   */
+  @FrameworkInternalApi val nodeContext: Context? = null,
 ) {
   /**
    * The live run this invocation belongs to, set by [openLiveRun], or `null` on a turn-based
@@ -980,6 +984,37 @@ internal fun toFinalResponseMap(payload: Any?): Map<String, Any?> {
   val map = if (payload is Map<*, *>) payload else mapOf(BaseTool.RESULT_KEY to payload)
   return buildMap { for ((key, value) in map) if (key is String) put(key, value) }
 }
+
+/**
+ * The mode a workflow node wrapper runs [agent] in, keyed to that agent so it does not leak to
+ * sub-agents or transfer targets when the invocation context is copied down. The type is public
+ * only because it is a [ContextFrameworkData] property type; its constructor and members are
+ * non-public.
+ */
+class AgentModeOverride
+internal constructor(internal val agent: BaseAgent, internal val mode: AgentMode)
+
+/** The mode override set for [agent], or null when none is. */
+@OptIn(FrameworkInternalApi::class)
+internal fun ContextFrameworkData.modeOverrideFor(agent: BaseAgent): AgentMode? =
+  agentModeOverride?.takeIf { it.agent === agent }?.mode
+
+/**
+ * Whether a node runs [agent] single-turn: it runs history-free unless it sets
+ * [LlmAgent.includeContents], and a schema mismatch in its output saves nothing to
+ * [LlmAgent.outputKey]. As in Python, only a node placement does this.
+ */
+@OptIn(ExperimentalWorkflowApi::class)
+internal fun ContextFrameworkData.isSingleTurnNode(agent: BaseAgent): Boolean =
+  modeOverrideFor(agent) == AgentMode.SINGLE_TURN
+
+/**
+ * Whether [agent] runs single-turn by its node's mode override or else its own mode, which decides
+ * its identity prompt, as Python checks `mode` there.
+ */
+@OptIn(ExperimentalWorkflowApi::class)
+internal fun ContextFrameworkData.runsSingleTurn(agent: BaseAgent): Boolean =
+  (modeOverrideFor(agent) ?: (agent as? LlmAgent)?.mode) == AgentMode.SINGLE_TURN
 
 /**
  * Per-invocation LLM-call counter for enforcing [RunConfig.maxLlmCalls]. The type is public only

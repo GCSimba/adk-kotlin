@@ -68,7 +68,8 @@ import kotlinx.coroutines.flow.onEach
  * inherited from `BaseAgent` - see that flag for the full dispatch rules.
  *
  * @property model The model to use for the agent.
- * @property tools Tools available to this agent.
+ * @param tools The tools configured for this agent; the [tools] property also holds one tool per
+ *   single-turn sub-agent.
  * @property toolsets Toolsets available to this agent.
  * @property generateContentConfig The additional content generation configurations.
  * @property instruction Instruction guiding the agent's behavior. Use one of:
@@ -122,8 +123,12 @@ import kotlinx.coroutines.flow.onEach
  * @property onModelErrorCallbacks List of callbacks to run when a model call fails.
  * @property onToolErrorCallbacks List of callbacks to run when a tool call fails.
  * @param includeContents History the model sees. [IncludeContents.NONE] sends only the current
- *   turn; null means [IncludeContents.DEFAULT], except that a parentless workflow node then runs
+ *   turn; null means [IncludeContents.DEFAULT], except that a single-turn workflow node then runs
  *   without history.
+ * @property mode How this agent converses as a workflow node or a sub-agent. Null means
+ *   [AgentMode.CHAT] for an agent with a parent or sub-agents, as in Python, and
+ *   [AgentMode.SINGLE_TURN] otherwise. A single-turn sub-agent is offered to its parent as a tool
+ *   rather than as a transfer target.
  * @property maxSteps The maximum number of steps this agent runs within a single invocation, where
  *   a step is one model call plus any tool calls or transfers it triggers. Once the cap is reached
  *   the agent stops emitting further events, even if it has not yet produced a final response.
@@ -144,7 +149,7 @@ class LlmAgent(
   afterAgentCallbacks: List<AfterAgentCallback> = emptyList(),
   disallowTransferToParent: Boolean = false,
   disallowTransferToPeers: Boolean = false,
-  val tools: List<BaseTool> = emptyList(),
+  tools: List<BaseTool> = emptyList(),
   val toolsets: List<Toolset> = emptyList(),
   val generateContentConfig: GenerateContentConfig? = null,
   val instruction: Instruction? = null,
@@ -160,6 +165,7 @@ class LlmAgent(
   val onToolErrorCallbacks: List<OnToolErrorCallback> = emptyList(),
   includeContents: IncludeContents? = null,
   val maxSteps: Int? = null,
+  @property:ExperimentalWorkflowApi val mode: AgentMode? = null,
 ) :
   BaseAgent(
     name = name,
@@ -181,10 +187,24 @@ class LlmAgent(
    */
   internal val includeContentsExplicit: Boolean = includeContents != null
 
+  /** The tools available to this agent: the configured ones, plus one per single-turn sub-agent. */
+  val tools: List<BaseTool> = buildList {
+    addAll(tools)
+    // A chat sub-agent is a transfer target, not a tool.
+    for (subAgent in subAgents) {
+      if ((subAgent as? LlmAgent)?.mode == AgentMode.SINGLE_TURN) add(SingleTurnAgentTool(subAgent))
+    }
+  }
+
   /** Always true, so a resumed agent node shows its model the answers to its long-running calls. */
   @ExperimentalWorkflowApi
   override val rerunOnResume: Boolean
     get() = true
+
+  // Chat nodes stay open across turns until they produce an output.
+  @ExperimentalWorkflowApi
+  override val waitForOutput: Boolean
+    get() = defaultMode() != AgentMode.SINGLE_TURN
 
   /**
    * Controls how prior conversation history is included in this agent's model request.
@@ -288,30 +308,59 @@ class LlmAgent(
       .onEach { if (it.content?.role != Role.USER) maybeSaveOutputToState(it, context) }
 
   /**
-   * Runs this agent as a graph node. Without a parent it runs a single turn in the node's isolation
-   * scope: the node input becomes its user turn, it runs without history unless [includeContents]
-   * was set explicitly, and its final model turn is the node's output. With a parent it runs with
-   * the session history and gives no node output.
+   * Runs this agent as a graph node in its [AgentMode]: a single turn on the node input, or a chat
+   * over the session history.
    */
   @ExperimentalWorkflowApi
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> =
-    if (parentAgent != null) super.runNode(context, nodeInput)
-    else runSingleTurn(context, nodeInput)
+    when (nodeMode(context.invocationContext)) {
+      AgentMode.SINGLE_TURN -> runSingleTurn(context, nodeInput)
+      AgentMode.CHAT -> runInChatMode(context)
+    }
 
-  @OptIn(FrameworkInternalApi::class)
+  /**
+   * This agent's mode when [mode] is unset: chat with a parent or sub-agents, as in Python,
+   * single-turn otherwise.
+   */
+  internal fun defaultMode(): AgentMode =
+    mode
+      ?: if (parentAgent != null || subAgents.isNotEmpty()) AgentMode.CHAT
+      else AgentMode.SINGLE_TURN
+
+  /**
+   * The mode this agent runs in as a node: any per-run override set for this agent, else
+   * [defaultMode].
+   */
+  private fun nodeMode(context: InvocationContext): AgentMode =
+    context.frameworkData.modeOverrideFor(this) ?: defaultMode()
+
+  /**
+   * Returns [context]'s invocation context for this agent's run in [mode]. The mode is keyed to
+   * this agent, the node's isolation scope also reaches its sub-agents, and the node context lets
+   * this agent's tools run sub-agents as child nodes.
+   */
+  private fun agentContext(context: Context, mode: AgentMode): InvocationContext {
+    val ic = context.invocationContext
+    return ic.copy(
+      frameworkData =
+        ic.frameworkData.copy(
+          agentModeOverride = AgentModeOverride(agent = this, mode = mode),
+          nodeContext = context,
+          nodePath = context.nodePath,
+          isolationScope = context.isolationScope,
+        )
+    )
+  }
+
+  /**
+   * Runs one turn on [nodeInput], fed to the agent as a user turn. The agent runs history-free
+   * unless [includeContents] was explicitly configured, sees only session events in the node's
+   * isolation scope, and its final model turn is the node's output.
+   */
   private fun runSingleTurn(context: Context, nodeInput: Any?): Flow<Any?> = flow {
     context.eventAuthor = name
     val injected = injectNodeInput(context, nodeInput)
-    val ic = context.invocationContext
-    val agentContext =
-      ic.copy(
-        frameworkData =
-          ic.frameworkData.copy(
-            singleTurnNodeAgent = this@LlmAgent,
-            nodePath = context.nodePath,
-            isolationScope = context.isolationScope,
-          )
-      )
+    val agentContext = agentContext(context, AgentMode.SINGLE_TURN)
     var outputMarked = false
     try {
       runAsync(agentContext).collect { event ->
@@ -323,7 +372,15 @@ class LlmAgent(
       }
     } finally {
       // The input is for this run only, so later nodes on the branch do not see it.
-      if (injected != null) ic.session.events.remove(injected)
+      if (injected != null) context.invocationContext.session.events.remove(injected)
+    }
+  }
+
+  /** Holds a conversation over the session history. */
+  private fun runInChatMode(context: Context): Flow<Any?> = flow {
+    runAsync(agentContext(context, AgentMode.CHAT)).collect { event ->
+      if (event.author.isNotEmpty()) context.eventAuthor = event.author
+      emit(event)
     }
   }
 
@@ -526,7 +583,7 @@ class LlmAgent(
 
     val result = textParts.joinToString(separator = "") { it.text.orEmpty() }
 
-    val nodeRun = context.frameworkData.singleTurnNodeAgent === this
+    val nodeRun = context.frameworkData.isSingleTurnNode(this)
     val schema = outputSchema
     val output: Any =
       when {
@@ -579,6 +636,7 @@ class LlmAgent(
     private var onToolErrorCallbacks: List<OnToolErrorCallback> = emptyList()
     private var includeContents: IncludeContents? = null
     private var maxSteps: Int? = null
+    private var mode: AgentMode? = null
 
     fun name(name: String): Builder = apply { this.name = name }
 
@@ -666,6 +724,8 @@ class LlmAgent(
 
     fun maxSteps(maxSteps: Int?): Builder = apply { this.maxSteps = maxSteps }
 
+    @ExperimentalWorkflowApi fun mode(mode: AgentMode?): Builder = apply { this.mode = mode }
+
     fun build(): LlmAgent =
       LlmAgent(
         name = checkNotNull(name) { "LlmAgent.Builder requires name to be set." },
@@ -692,6 +752,7 @@ class LlmAgent(
         onToolErrorCallbacks = onToolErrorCallbacks,
         includeContents = includeContents,
         maxSteps = maxSteps,
+        mode = mode,
       )
   }
 

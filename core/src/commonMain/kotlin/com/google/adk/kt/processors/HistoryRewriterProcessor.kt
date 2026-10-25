@@ -29,6 +29,7 @@ import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
+import com.google.adk.kt.workflow.BranchPath
 
 /**
  * Rewrites history events to be suitable for LLM context.
@@ -862,16 +863,10 @@ internal class HistoryRewriterProcessor {
     event: Event,
     agentName: String,
     toolCallIds: Set<String>,
-  ): Boolean {
-    val branch =
-      event.branch.orEmpty().ifEmpty {
-        return false
-      }
-    val segments = branch.split('.')
-    val base = currentBranch?.ifEmpty { null }?.split('.').orEmpty()
-    if (segments.size <= base.size || segments.subList(0, base.size) != base) return false
-    return segments.drop(base.size).any { isToolBranch(it, agentName, toolCallIds) }
-  }
+  ): Boolean =
+    BranchPath.segmentsBelow(event.branch, currentBranch).any {
+      isToolBranch(it, agentName, toolCallIds)
+    }
 
   /**
    * Check if an event belongs to the current branch.

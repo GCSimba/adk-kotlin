@@ -13,13 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-@file:OptIn(FrameworkInternalApi::class)
+@file:OptIn(FrameworkInternalApi::class, ExperimentalWorkflowApi::class)
 
 package com.google.adk.kt.processors
 
+import com.google.adk.kt.agents.AgentMode
+import com.google.adk.kt.agents.AgentModeOverride
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.LlmAgent.IncludeContents
+import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
@@ -1396,7 +1399,12 @@ class ContentsProcessorTest {
   fun process_singleTurnNodeWithoutExplicitIncludeContents_sendsCurrentTurnOnly() = runBlocking {
     val context =
       createLlmAgentTestContext(userEvent("a"), modelEvent("b"), userEvent("c")).let {
-        it.copy(frameworkData = it.frameworkData.copy(singleTurnNodeAgent = it.agent))
+        it.copy(
+          frameworkData =
+            it.frameworkData.copy(
+              agentModeOverride = AgentModeOverride(it.agent, AgentMode.SINGLE_TURN)
+            )
+        )
       }
 
     val request = ContentsProcessor().process(context, LlmRequest())
@@ -1413,7 +1421,14 @@ class ContentsProcessorTest {
           userEvent("c"),
           includeContents = IncludeContents.DEFAULT,
         )
-        .let { it.copy(frameworkData = it.frameworkData.copy(singleTurnNodeAgent = it.agent)) }
+        .let {
+          it.copy(
+            frameworkData =
+              it.frameworkData.copy(
+                agentModeOverride = AgentModeOverride(it.agent, AgentMode.SINGLE_TURN)
+              )
+          )
+        }
 
     val request = ContentsProcessor().process(context, LlmRequest())
 
@@ -1425,7 +1440,12 @@ class ContentsProcessorTest {
     val otherAgent = LlmAgent(name = "other", model = DummyModel("test-model"))
     val context =
       createLlmAgentTestContext(userEvent("a"), modelEvent("b"), userEvent("c")).let {
-        it.copy(frameworkData = it.frameworkData.copy(singleTurnNodeAgent = otherAgent))
+        it.copy(
+          frameworkData =
+            it.frameworkData.copy(
+              agentModeOverride = AgentModeOverride(otherAgent, AgentMode.SINGLE_TURN)
+            )
+        )
       }
 
     val request = ContentsProcessor().process(context, LlmRequest())
@@ -1449,7 +1469,10 @@ class ContentsProcessorTest {
         .let {
           it.copy(
             frameworkData =
-              it.frameworkData.copy(singleTurnNodeAgent = it.agent, nodePath = "wf@1/self@1")
+              it.frameworkData.copy(
+                agentModeOverride = AgentModeOverride(it.agent, AgentMode.SINGLE_TURN),
+                nodePath = "wf@1/self@1",
+              )
           )
         }
 
@@ -1475,7 +1498,10 @@ class ContentsProcessorTest {
           it.copy(
             branch = "self",
             frameworkData =
-              it.frameworkData.copy(singleTurnNodeAgent = it.agent, nodePath = "wf@1/self@1"),
+              it.frameworkData.copy(
+                agentModeOverride = AgentModeOverride(it.agent, AgentMode.SINGLE_TURN),
+                nodePath = "wf@1/self@1",
+              ),
           )
         }
 
@@ -1518,7 +1544,10 @@ class ContentsProcessorTest {
         .let {
           it.copy(
             frameworkData =
-              it.frameworkData.copy(singleTurnNodeAgent = it.agent, nodePath = "wf@1/self@1")
+              it.frameworkData.copy(
+                agentModeOverride = AgentModeOverride(it.agent, AgentMode.SINGLE_TURN),
+                nodePath = "wf@1/self@1",
+              )
           )
         }
 
@@ -1543,7 +1572,10 @@ class ContentsProcessorTest {
         .let {
           it.copy(
             frameworkData =
-              it.frameworkData.copy(singleTurnNodeAgent = it.agent, nodePath = "wf@1/self@1")
+              it.frameworkData.copy(
+                agentModeOverride = AgentModeOverride(it.agent, AgentMode.SINGLE_TURN),
+                nodePath = "wf@1/self@1",
+              )
           )
         }
 

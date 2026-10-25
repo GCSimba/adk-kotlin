@@ -20,7 +20,9 @@ import com.google.adk.kt.agents.BaseAgent
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.SequentialAgent
-import com.google.adk.kt.annotations.FrameworkInternalApi
+import com.google.adk.kt.agents.modeOverrideFor
+import com.google.adk.kt.agents.runsAsTool
+import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.tools.TransferToAgentTool
@@ -56,10 +58,13 @@ internal class AgentTransferProcessor : LlmRequestProcessor {
       .appendTools(listOf(transferTool))
   }
 
-  /** Whether the agent of [context] runs as a single-turn workflow node. */
-  @OptIn(FrameworkInternalApi::class)
-  private fun runsDelegated(context: InvocationContext): Boolean =
-    context.frameworkData.singleTurnNodeAgent === context.agent
+  /** Whether the agent of [context] runs as a single-turn agent. */
+  @OptIn(ExperimentalWorkflowApi::class)
+  private fun runsDelegated(context: InvocationContext): Boolean {
+    val agent = context.agent
+    val mode = context.frameworkData.modeOverrideFor(agent) ?: (agent as? LlmAgent)?.mode
+    return mode.runsAsTool
+  }
 
   private fun buildTargetAgentsInfo(targetAgent: BaseAgent) =
     """|Agent name: ${targetAgent.name}
@@ -112,13 +117,13 @@ internal fun offeredTransferTargets(agent: BaseAgent, context: InvocationContext
 
 /**
  * Returns the agents [agent] may transfer control to: its sub-agents, and (when permitted) its
- * parent and peers. Requests read it through [offeredTransferTargets], and a turn rejects a
- * transfer to any other agent.
+ * parent and peers. A single-turn agent is reached as a tool instead, so it is left out. Requests
+ * read it through [offeredTransferTargets], and a turn rejects a transfer to any other agent.
  */
 internal fun findTransferTargets(agent: BaseAgent): List<BaseAgent> {
   val targets = buildList {
-    // Sub-agents are always potential targets.
-    addAll(agent.subAgents)
+    // Sub-agents are potential targets unless they run as tools.
+    addAll(agent.subAgents.filter { it.isTransferTarget() })
 
     val parent = agent.parentAgent
     if (parent != null) {
@@ -129,7 +134,7 @@ internal fun findTransferTargets(agent: BaseAgent): List<BaseAgent> {
 
       // Peer agents are potential targets if allowed.
       if (!agent.disallowTransferToPeers) {
-        addAll(parent.subAgents.filter { it.name != agent.name })
+        addAll(parent.subAgents.filter { it.name != agent.name && it.isTransferTarget() })
       }
     }
   }
@@ -160,6 +165,10 @@ private fun requireUniqueNames(targets: List<BaseAgent>): List<BaseAgent> {
 internal fun liveTransferTargets(agent: BaseAgent): List<BaseAgent> {
   val targets =
     if (agent.parentAgent is LlmAgent) findTransferTargets(agent)
-    else requireUniqueNames(agent.subAgents)
+    else requireUniqueNames(agent.subAgents.filter { it.isTransferTarget() })
   return targets.filter { it is LlmAgent || it is SequentialAgent }
 }
+
+/** Whether this agent is reached by transfer, which a single-turn agent is not. */
+@OptIn(ExperimentalWorkflowApi::class)
+private fun BaseAgent.isTransferTarget(): Boolean = !(this as? LlmAgent)?.mode.runsAsTool
