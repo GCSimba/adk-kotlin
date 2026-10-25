@@ -102,6 +102,26 @@ private fun inputAnswer(interruptId: String, response: Map<String, Any?>) =
       ),
   )
 
+/** Runs `ask -> agent` resumably: the first turn pauses on the request, the second answers it. */
+private suspend fun runAgentAfterAnsweredRequest(agent: LlmAgent): List<Event> {
+  val ask = AskForInputNode("ask", "ask_1")
+  val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, ask), Edge(ask, agent)))
+  val runner =
+    InMemoryRunner(
+      app =
+        App(
+          appName = "app",
+          rootNode = workflow,
+          resumabilityConfig = ResumabilityConfig(isResumable = true),
+        )
+    )
+  val paused = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+  check(paused.isNotEmpty()) { "the first turn produced no events to resume from" }
+  return runner
+    .runAsync("u", "s", newMessage = inputAnswer("ask_1", mapOf("name" to "John")))
+    .toList()
+}
+
 /**
  * A minimal non-[LlmAgent] agent that emits one model turn, to exercise base [BaseAgent.runNode].
  */
@@ -172,6 +192,10 @@ private class ScriptedModel(private vararg val responses: Content) : Model {
     return flowOf(LlmResponse(content = content))
   }
 }
+
+/** The texts of every part of every content in [request]. */
+private fun textsOf(request: LlmRequest): List<String> =
+  request.contents.flatMap { it.parts }.mapNotNull { it.text }
 
 class LlmAgentAsNodeTest {
 
@@ -337,6 +361,53 @@ class LlmAgentAsNodeTest {
   }
 
   @Test
+  fun runAsync_firstNodeAgent_seesUserMessageOnce() = runBlocking {
+    // Arrange: runner and node both supply the user input, so a history-free agent sees it once.
+    val captured = mutableListOf<Content>()
+    val agent = LlmAgent(name = "process_request", model = RecordingModel(captured))
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, agent)))
+    val runner = InMemoryRunner(app = App("app", rootNode = workflow))
+
+    // Act
+    val unused =
+      runner
+        .runAsync("u", "s", newMessage = Content.fromText(Role.USER, "I want 3 days off"))
+        .toList()
+
+    // Assert
+    assertEquals(1, captured.size)
+    assertEquals(Role.USER, captured.single().role)
+    assertEquals(listOf("I want 3 days off"), captured.single().parts.mapNotNull { it.text })
+  }
+
+  @Test
+  fun runNode_defaultIncludeContents_runsHistoryFree() = runBlocking {
+    // Arrange: an agent added directly as a history-free node must not see prior root history.
+    val captured = mutableListOf<Content>()
+    val agent = LlmAgent(name = "worker", model = RecordingModel(captured))
+    val context = testInvocationContext()
+    context.session.events.add(
+      Event(
+        author = "user",
+        content = Content(role = Role.USER, parts = listOf(Part(text = "earlier question"))),
+      )
+    )
+    context.session.events.add(
+      Event(
+        author = "root",
+        content = Content(role = Role.MODEL, parts = listOf(Part(text = "earlier answer"))),
+      )
+    )
+
+    // Act: the LlmAgent runs as the node itself.
+    val unused = runNodeAsRoot(agent, context, { _, _ -> }, nodeInput = "current task")
+
+    // Assert: it saw only its injected node_input, not the prior root history.
+    val texts = captured.flatMap { it.parts }.mapNotNull { it.text }
+    assertEquals(listOf("current task"), texts)
+  }
+
+  @Test
   fun runNode_agentWithParent_keepsHistoryWithoutInjectingInput() = runBlocking {
     // Arrange: an agent with a parent converses with the session, as a sub-agent does.
     val captured = mutableListOf<Content>()
@@ -358,6 +429,77 @@ class LlmAgentAsNodeTest {
     val texts = captured.flatMap { it.parts }.mapNotNull { it.text }
     assertEquals(listOf("earlier question"), texts)
     assertNull(result.output)
+  }
+
+  @Test
+  fun runNode_explicitIncludeContentsDefault_preservesHistory() = runBlocking {
+    // Arrange: explicit includeContents DEFAULT keeps prior history rather than forcing NONE.
+    val captured = mutableListOf<Content>()
+    val agent =
+      LlmAgent(
+        name = "worker",
+        model = RecordingModel(captured),
+        includeContents = LlmAgent.IncludeContents.DEFAULT,
+      )
+    val context = testInvocationContext()
+    context.session.events.add(
+      Event(
+        author = "user",
+        content = Content(role = Role.USER, parts = listOf(Part(text = "earlier question"))),
+      )
+    )
+    context.session.events.add(
+      Event(
+        author = "worker",
+        content = Content(role = Role.MODEL, parts = listOf(Part(text = "earlier answer"))),
+      )
+    )
+
+    // Act
+    val unused = runNodeAsRoot(agent, context, { _, _ -> }, nodeInput = "current task")
+
+    // Assert: explicit DEFAULT preserves prior history alongside the injected user turn.
+    val texts = captured.flatMap { it.parts }.mapNotNull { it.text }
+    assertEquals(listOf("earlier question", "earlier answer", "current task"), texts)
+  }
+
+  @Test
+  fun runAsync_nodeAfterAnsweredRequest_seesOnlyAnswerAsUserTurn() = runBlocking {
+    // Arrange: the resuming answer is a function response a history-free agent cannot see alone.
+    val captured = mutableListOf<Content>()
+    val agent = LlmAgent(name = "writer", model = RecordingModel(captured, "hello John"))
+
+    // Act
+    val events = runAgentAfterAnsweredRequest(agent)
+
+    // Assert
+    val replies = events.filter { it.author == "writer" }.map { it.contentText() }
+    assertEquals(listOf("hello John"), replies.filter { it.isNotEmpty() })
+    assertEquals(
+      listOf("{\"name\":\"John\"}"),
+      captured.flatMap { it.parts }.mapNotNull { it.text },
+    )
+  }
+
+  @Test
+  fun runAsync_nodeWithHistoryAfterAnsweredRequest_endsOnAnswerAsUserTurn() = runBlocking {
+    // Arrange: with history, injected input stays last so the answer is not a dangling response.
+    val captured = mutableListOf<Content>()
+    val agent =
+      LlmAgent(
+        name = "writer",
+        model = RecordingModel(captured, "hello John"),
+        includeContents = LlmAgent.IncludeContents.DEFAULT,
+      )
+
+    // Act
+    val events = runAgentAfterAnsweredRequest(agent)
+
+    // Assert
+    val replies = events.filter { it.author == "writer" }.map { it.contentText() }
+    assertEquals(listOf("hello John"), replies.filter { it.isNotEmpty() })
+    assertEquals(Role.USER, captured.last().role)
+    assertEquals(listOf("{\"name\":\"John\"}"), captured.last().parts.mapNotNull { it.text })
   }
 
   @Test
@@ -785,6 +927,59 @@ class LlmAgentAsNodeTest {
 
     // Assert
     assertEquals(listOf("I want 3 days off"), captured.flatMap { it.parts }.mapNotNull { it.text })
+  }
+
+  @Test
+  fun runAsync_resumedNodeAfterLongRunningCall_seesItsCallAndAnswer() = runBlocking {
+    // Arrange: `prep -> agent`; the agent calls a long-running tool, which pauses turn 1.
+    val model =
+      ScriptedModel(
+        Content(
+          role = Role.MODEL,
+          parts = listOf(Part(functionCall = FunctionCall("approve", emptyMap(), id = "call_1"))),
+        ),
+        Content.fromText(Role.MODEL, "approved"),
+      )
+    val agent =
+      LlmAgent(
+        name = "agent",
+        model = model,
+        tools = listOf(DummyTool(name = "approve", isLongRunning = true, onRun = { _, _ -> Unit })),
+      )
+    val prep = Emitter("prep", "the task")
+    val runner =
+      InMemoryRunner(
+        app =
+          App(
+            "app",
+            rootNode = Workflow("wf", listOf(Edge(Start, prep), Edge(prep, agent))),
+            resumabilityConfig = ResumabilityConfig(isResumable = true),
+          )
+      )
+    val unused = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+    val answer =
+      Content(
+        role = Role.USER,
+        parts =
+          listOf(
+            Part(
+              functionResponse =
+                FunctionResponse(id = "call_1", name = "approve", response = mapOf("ok" to true))
+            )
+          ),
+      )
+
+    // Act
+    val resumed = runner.runAsync("u", "s", newMessage = answer).toList()
+
+    // Assert: the resumed turn starts at the user message, not the node input.
+    assertEquals(2, model.requests.size)
+    assertEquals(listOf("the task"), textsOf(model.requests[0]))
+    val second = model.requests[1].contents
+    assertEquals(listOf("go"), second.first().parts.mapNotNull { it.text })
+    assertTrue(second.any { c -> c.parts.any { it.functionCall?.id == "call_1" } })
+    assertTrue(second.any { c -> c.parts.any { it.functionResponse?.id == "call_1" } })
+    assertTrue(resumed.none { it.author == Role.USER && it.contentText() == "the task" })
   }
 
   @Test

@@ -18,6 +18,7 @@ package com.google.adk.kt.processors
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.LlmAgent.IncludeContents
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.types.Content
@@ -30,26 +31,32 @@ import com.google.adk.kt.types.Role
  * [Content] format expected by the LLM. It may also perform history rewriting or compaction before
  * sending the contents to the model.
  *
- * If the agent is an [LlmAgent] with [LlmAgent.includeContents] set to [IncludeContents.NONE], only
- * the current turn is sent (the most recent user input or other-agent reply, plus any tool
- * calls/responses from that turn). Otherwise the full filtered history is sent. Non-[LlmAgent]
- * agents always receive the full filtered history.
+ * If the agent is an [LlmAgent] with [LlmAgent.includeContents] set to [IncludeContents.NONE], or a
+ * single-turn workflow node that leaves it unset, only the current turn is sent (the most recent
+ * user input or other-agent reply, plus any tool calls/responses from that turn). Otherwise the
+ * full filtered history is sent. Non-[LlmAgent] agents always receive the full filtered history.
  */
 internal class ContentsProcessor : LlmRequestProcessor {
+  @OptIn(FrameworkInternalApi::class)
   override suspend fun process(
     context: InvocationContext,
     request: LlmRequest,
     emitEvent: suspend (Event) -> Unit,
   ): LlmRequest {
     val events = context.getEvents(currentInvocation = false, currentBranch = false)
-    // `includeContents` is declared on `LlmAgent`; for any other agent type we fall back to
-    // including the full history.
-    val includeContents = (context.agent as? LlmAgent)?.includeContents ?: IncludeContents.DEFAULT
+    val agent = context.agent
+    val singleTurnNode = context.frameworkData.singleTurnNodeAgent === agent
+    val includeContents =
+      when {
+        agent !is LlmAgent -> IncludeContents.DEFAULT
+        singleTurnNode && !agent.includeContentsExplicit -> IncludeContents.NONE
+        else -> agent.includeContents
+      }
     val history =
       HistoryRewriterProcessor()
         .rewrite(
           events = events,
-          agentName = context.agent.name,
+          agentName = agent.name,
           currentBranch = context.branch,
           includeContents = includeContents,
         )

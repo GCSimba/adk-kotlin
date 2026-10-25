@@ -121,12 +121,9 @@ import kotlinx.coroutines.flow.onEach
  *   then merges into the session state.
  * @property onModelErrorCallbacks List of callbacks to run when a model call fails.
  * @property onToolErrorCallbacks List of callbacks to run when a tool call fails.
- * @property includeContents Controls how prior conversation history is included in the model
- *   request. Defaults to [IncludeContents.DEFAULT], which includes the relevant conversation
- *   history. Set to [IncludeContents.NONE] to exclude prior history; the model then receives only
- *   the current turn (the most recent user input or other-agent reply, plus any tool
- *   calls/responses produced within that turn). The system instruction and tools are preserved in
- *   both modes.
+ * @param includeContents History the model sees. [IncludeContents.NONE] sends only the current
+ *   turn; null means [IncludeContents.DEFAULT], except that a parentless workflow node then runs
+ *   without history.
  * @property maxSteps The maximum number of steps this agent runs within a single invocation, where
  *   a step is one model call plus any tool calls or transfers it triggers. Once the cap is reached
  *   the agent stops emitting further events, even if it has not yet produced a final response.
@@ -161,7 +158,7 @@ class LlmAgent(
   val outputKey: String? = null,
   val onModelErrorCallbacks: List<OnModelErrorCallback> = emptyList(),
   val onToolErrorCallbacks: List<OnToolErrorCallback> = emptyList(),
-  val includeContents: IncludeContents = IncludeContents.DEFAULT,
+  includeContents: IncludeContents? = null,
   val maxSteps: Int? = null,
 ) :
   BaseAgent(
@@ -173,6 +170,16 @@ class LlmAgent(
     disallowTransferToParent = disallowTransferToParent,
     disallowTransferToPeers = disallowTransferToPeers,
   ) {
+  /**
+   * How prior history reaches the model. Reads [IncludeContents.DEFAULT] when unset, though a
+   * single-turn workflow node then runs with [IncludeContents.NONE].
+   */
+  val includeContents: IncludeContents = includeContents ?: IncludeContents.DEFAULT
+
+  /**
+   * Whether [includeContents] was set explicitly, so a single-turn node uses it instead of NONE.
+   */
+  internal val includeContentsExplicit: Boolean = includeContents != null
 
   /** Always true, so a resumed agent node shows its model the answers to its long-running calls. */
   @ExperimentalWorkflowApi
@@ -282,8 +289,9 @@ class LlmAgent(
 
   /**
    * Runs this agent as a graph node. Without a parent it runs a single turn: the node input becomes
-   * its user turn, and its final model turn is the node's output. With a parent it runs as any
-   * agent does and gives no node output.
+   * its user turn, it runs without history unless [includeContents] was set explicitly, and its
+   * final model turn is the node's output. With a parent it runs with the session history and gives
+   * no node output.
    */
   @ExperimentalWorkflowApi
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> =
@@ -560,7 +568,7 @@ class LlmAgent(
     private var outputKey: String? = null
     private var onModelErrorCallbacks: List<OnModelErrorCallback> = emptyList()
     private var onToolErrorCallbacks: List<OnToolErrorCallback> = emptyList()
-    private var includeContents: IncludeContents = IncludeContents.DEFAULT
+    private var includeContents: IncludeContents? = null
     private var maxSteps: Int? = null
 
     fun name(name: String): Builder = apply { this.name = name }
@@ -643,7 +651,7 @@ class LlmAgent(
       this.onToolErrorCallbacks = callbacks
     }
 
-    fun includeContents(includeContents: IncludeContents): Builder = apply {
+    fun includeContents(includeContents: IncludeContents?): Builder = apply {
       this.includeContents = includeContents
     }
 

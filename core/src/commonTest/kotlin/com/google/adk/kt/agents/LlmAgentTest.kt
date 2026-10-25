@@ -17,6 +17,7 @@
 package com.google.adk.kt.agents
 
 import com.google.adk.kt.agents.LlmAgent.IncludeContents
+import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.callbacks.AfterToolCallback
 import com.google.adk.kt.callbacks.BeforeModelCallback
 import com.google.adk.kt.callbacks.BeforeToolCallback
@@ -78,6 +79,22 @@ class LlmAgentTest {
     val agent = LlmAgent(name = "test_agent", model = testModel)
 
     assertEquals(IncludeContents.DEFAULT, agent.includeContents)
+  }
+
+  @Test
+  @OptIn(AdkJavaInteropApi::class)
+  fun builder_includeContents_isExplicitOnlyWhenSet() {
+    val unset = LlmAgent.builder().name("unset").model(testModel).build()
+    val set =
+      LlmAgent.builder()
+        .name("set")
+        .model(testModel)
+        .includeContents(IncludeContents.DEFAULT)
+        .build()
+
+    assertEquals(IncludeContents.DEFAULT, unset.includeContents)
+    assertFalse(unset.includeContentsExplicit)
+    assertTrue(set.includeContentsExplicit)
   }
 
   @Test

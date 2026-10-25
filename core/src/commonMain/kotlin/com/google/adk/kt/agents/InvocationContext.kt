@@ -920,8 +920,9 @@ data class ContextFrameworkData(
   @FrameworkInternalApi val callbackContextData: MutableMap<String, Any> = concurrentMutableMapOf(),
   /**
    * The agent this context copy runs as a single-turn workflow node. Keyed to that agent, so
-   * sub-agents and transfer targets that inherit the copy are not single-turn. A schema mismatch in
-   * its output saves nothing to [LlmAgent.outputKey].
+   * sub-agents and transfer targets that inherit the copy are not single-turn. The agent runs
+   * history-free unless it sets [LlmAgent.includeContents], and a schema mismatch in its output
+   * saves nothing to [LlmAgent.outputKey].
    */
   @FrameworkInternalApi val singleTurnNodeAgent: BaseAgent? = null,
 ) {
