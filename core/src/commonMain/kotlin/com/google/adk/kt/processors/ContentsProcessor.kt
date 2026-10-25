@@ -59,6 +59,8 @@ internal class ContentsProcessor : LlmRequestProcessor {
           agentName = agent.name,
           currentBranch = context.branch,
           includeContents = includeContents,
+          nodePath = context.frameworkData.nodePath,
+          singleTurnNode = singleTurnNode,
         )
 
     val newContents =

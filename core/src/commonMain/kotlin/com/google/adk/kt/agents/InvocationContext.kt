@@ -925,6 +925,11 @@ data class ContextFrameworkData(
    * saves nothing to [LlmAgent.outputKey].
    */
   @FrameworkInternalApi val singleTurnNodeAgent: BaseAgent? = null,
+  /**
+   * The workflow node path the agent runs at, or `null` outside a workflow. The contents processor
+   * uses it to keep the agent's history to its own node path.
+   */
+  @FrameworkInternalApi val nodePath: String? = null,
 ) {
   /**
    * The live run this invocation belongs to, set by [openLiveRun], or `null` on a turn-based

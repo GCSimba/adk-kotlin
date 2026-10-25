@@ -304,7 +304,10 @@ class LlmAgent(
     val injected = injectNodeInput(context, nodeInput)
     val ic = context.invocationContext
     val agentContext =
-      ic.copy(frameworkData = ic.frameworkData.copy(singleTurnNodeAgent = this@LlmAgent))
+      ic.copy(
+        frameworkData =
+          ic.frameworkData.copy(singleTurnNodeAgent = this@LlmAgent, nodePath = context.nodePath)
+      )
     var outputMarked = false
     try {
       runAsync(agentContext).collect { event ->

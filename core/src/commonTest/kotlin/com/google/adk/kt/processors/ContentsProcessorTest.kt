@@ -38,6 +38,7 @@ import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.Part
+import com.google.adk.kt.workflow.NodeInfo
 import com.google.common.truth.Truth.assertThat
 import kotlin.test.assertEquals
 import kotlinx.coroutines.runBlocking
@@ -1432,6 +1433,125 @@ class ContentsProcessorTest {
     assertThat(request.contents.map { it.parts[0].text }).containsExactly("a", "b", "c").inOrder()
   }
 
+  @Test
+  fun process_resumedSingleTurnNode_reachesPastAnotherNodesReply() = runBlocking {
+    val context =
+      createLlmAgentTestContext(
+          userEvent("go"),
+          Event(
+            author = "other",
+            content = modelMessage("another node's answer"),
+            nodeInfo = NodeInfo(path = "wf@1/other@1"),
+          ),
+          functionCallEvent("approve" to "c1").copy(nodeInfo = NodeInfo(path = "wf@1/self@1")),
+          functionResponseEvent("approve", "c1").copy(author = "user"),
+        )
+        .let {
+          it.copy(
+            frameworkData =
+              it.frameworkData.copy(singleTurnNodeAgent = it.agent, nodePath = "wf@1/self@1")
+          )
+        }
+
+    val request = ContentsProcessor().process(context, LlmRequest())
+
+    // Another node's reply does not start this node's turn, so the root message stays in it.
+    assertThat(request.contents.map { it.role })
+      .containsExactly("user", "model", "function")
+      .inOrder()
+    assertThat(request.contents[0].parts[0].text).isEqualTo("go")
+  }
+
+  @Test
+  fun process_singleTurnNode_otherBranchResultAfterItsInput_keepsTheInput() = runBlocking {
+    val context =
+      createLlmAgentTestContext(
+          userEvent("question"),
+          functionCallEvent("lookup" to "o1").copy(branch = "other"),
+          nodeInputEvent("task", path = "wf@1/self@1"),
+          functionResponseEvent("lookup", "o1").copy(author = "user", branch = "other"),
+        )
+        .let {
+          it.copy(
+            branch = "self",
+            frameworkData =
+              it.frameworkData.copy(singleTurnNodeAgent = it.agent, nodePath = "wf@1/self@1"),
+          )
+        }
+
+    val request = ContentsProcessor().process(context, LlmRequest())
+
+    // As in Python, the other branch's call and result are hidden, so they cannot move the turn.
+    assertThat(request.contents.map { it.parts[0].text }).containsExactly("task").inOrder()
+  }
+
+  @Test
+  fun process_userTurnInjectedForAnotherNode_isHidden() = runBlocking {
+    val context =
+      createLlmAgentTestContext(
+          userEvent("question"),
+          nodeInputEvent("for another node", path = "wf@1/other@1"),
+          nodeInputEvent("for this node", path = "wf@1/self@1"),
+        )
+        .let { it.copy(frameworkData = it.frameworkData.copy(nodePath = "wf@1/self@1")) }
+
+    val request = ContentsProcessor().process(context, LlmRequest())
+
+    assertThat(request.contents.map { it.parts[0].text })
+      .containsExactly("question", "for this node")
+      .inOrder()
+  }
+
+  @Test
+  fun process_singleTurnNode_seesRootAndOwnEventsOnly() = runBlocking {
+    val context =
+      createLlmAgentTestContext(
+          userEvent("question"),
+          Event(
+            author = "other",
+            content = modelMessage("another node's answer"),
+            nodeInfo = NodeInfo(path = "wf@1/other@1"),
+          ),
+          nodeInputEvent("task", path = "wf@1/self@1"),
+          includeContents = IncludeContents.DEFAULT,
+        )
+        .let {
+          it.copy(
+            frameworkData =
+              it.frameworkData.copy(singleTurnNodeAgent = it.agent, nodePath = "wf@1/self@1")
+          )
+        }
+
+    val request = ContentsProcessor().process(context, LlmRequest())
+
+    assertThat(request.contents.map { it.parts[0].text })
+      .containsExactly("question", "task")
+      .inOrder()
+  }
+
+  @Test
+  fun process_nodeRunWithHistory_dropsTrailingResponseWhoseCallIsHidden() = runBlocking {
+    // Another node's call is hidden, so its trailing response has no call left to pair with.
+    val context =
+      createLlmAgentTestContext(
+          nodeInputEvent("task", path = "wf@1/self@1"),
+          functionCallEvent("ask" to "c1")
+            .copy(author = "other", nodeInfo = NodeInfo(path = "wf@1/other@1")),
+          functionResponseEvent("ask", "c1").copy(author = "user"),
+          includeContents = IncludeContents.DEFAULT,
+        )
+        .let {
+          it.copy(
+            frameworkData =
+              it.frameworkData.copy(singleTurnNodeAgent = it.agent, nodePath = "wf@1/self@1")
+          )
+        }
+
+    val request = ContentsProcessor().process(context, LlmRequest())
+
+    assertThat(request.contents.map { it.parts[0].text }).isEqualTo(listOf("task"))
+  }
+
   // Helpers
 
   private suspend fun createTestContext(
@@ -1454,6 +1574,9 @@ class ContentsProcessorTest {
   }
 
   private fun userEvent(text: String) = Event(author = "user", content = userMessage(text))
+
+  private fun nodeInputEvent(text: String, path: String) =
+    Event(author = "user", content = userMessage(text), nodeInfo = NodeInfo(path = path))
 
   private fun modelEvent(text: String) = Event(author = "testAgent", content = modelMessage(text))
 

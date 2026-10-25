@@ -42,20 +42,36 @@ internal class HistoryRewriterProcessor {
     agentName: String,
     currentBranch: String?,
     includeContents: IncludeContents = IncludeContents.DEFAULT,
+    nodePath: String? = null,
+    singleTurnNode: Boolean = false,
   ): List<Content> {
     // A tool's own messages sit on a `<tool>@<call id>` branch named by a recorded call id.
     val toolCallIds = events.functionCallIds()
     val workingEvents =
       when (includeContents) {
         IncludeContents.DEFAULT -> events
-        IncludeContents.NONE -> getCurrentTurnEvents(events, agentName, currentBranch, toolCallIds)
+        IncludeContents.NONE ->
+          getCurrentTurnEvents(
+            filterSingleTurnNodeEvents(events, currentBranch, nodePath, singleTurnNode),
+            agentName,
+            currentBranch,
+            toolCallIds,
+            nodePath,
+          )
       }
 
-    val rewindFilteredEvents = applyRewinds(workingEvents)
+    val rewindFilteredEvents =
+      filterSingleTurnNodeEvents(
+        applyRewinds(workingEvents),
+        currentBranch,
+        nodePath,
+        singleTurnNode,
+        keepAncestors = true,
+      )
 
     // Filter raw events
     val rawFilteredEvents = rewindFilteredEvents.filter {
-      shouldIncludeEventInContext(currentBranch, it, agentName, toolCallIds)
+      shouldIncludeEventInContext(currentBranch, it, agentName, toolCallIds, nodePath)
     }
 
     // Replace each compaction event with its summary and drop the raw events it covers.
@@ -91,6 +107,8 @@ internal class HistoryRewriterProcessor {
 
     // Rearrange for latest function response (merge scenarios) and async function responses
     return filteredEvents
+      // Node filters can hide a call; elsewhere a trailing orphan still fails, unlike Python.
+      .let { if (nodePath != null) dropOrphanedFunctionResponses(it) else it }
       .let { rearrangeEventsForLatestFunctionResponse(it) }
       .let { rearrangeEventsForAsyncFunctionResponsesInHistory(it) }
       .mapNotNull { event ->
@@ -357,6 +375,7 @@ internal class HistoryRewriterProcessor {
     agentName: String,
     currentBranch: String?,
     toolCallIds: Set<String>,
+    nodePath: String?,
   ): List<Event> {
     // A posted-back result continues its call's turn, so the turn reaches back to that call.
     val unmatchedResultIds = mutableSetOf<String>()
@@ -376,13 +395,14 @@ internal class HistoryRewriterProcessor {
       ) {
         continue
       }
-      if (!isCurrentTurnBoundary(events[i], agentName, currentBranch, toolCallIds)) continue
-      val start = runStart(events, i, agentName, currentBranch, toolCallIds)
+      if (!isCurrentTurnBoundary(events[i], agentName, currentBranch, toolCallIds, nodePath))
+        continue
+      val start = runStart(events, i, agentName, currentBranch, toolCallIds, nodePath)
       // A blank spoken run is dropped by the merge, so it cannot start the turn.
       val kind = transcriptionKind(events[i])
       if (
         kind != null &&
-          runText(events, start, i, kind, agentName, currentBranch, toolCallIds).isBlank()
+          runText(events, start, i, kind, agentName, currentBranch, toolCallIds, nodePath).isBlank()
       ) {
         continue
       }
@@ -429,10 +449,12 @@ internal class HistoryRewriterProcessor {
     agentName: String,
     currentBranch: String?,
     toolCallIds: Set<String>,
+    nodePath: String?,
   ): Int {
     var start = end
     for (i in end - 1 downTo 0) {
-      if (!shouldIncludeEventInContext(currentBranch, events[i], agentName, toolCallIds)) continue
+      if (!shouldIncludeEventInContext(currentBranch, events[i], agentName, toolCallIds, nodePath))
+        continue
       if (!continuesTranscriptionRun(events[i], events[start])) break
       start = i
     }
@@ -448,10 +470,11 @@ internal class HistoryRewriterProcessor {
     agentName: String,
     currentBranch: String?,
     toolCallIds: Set<String>,
+    nodePath: String?,
   ): String =
     (start..end)
       .map { events[it] }
-      .filter { shouldIncludeEventInContext(currentBranch, it, agentName, toolCallIds) }
+      .filter { shouldIncludeEventInContext(currentBranch, it, agentName, toolCallIds, nodePath) }
       .joinToString("") { kind.textOf(it) }
 
   /**
@@ -470,8 +493,10 @@ internal class HistoryRewriterProcessor {
     agentName: String,
     currentBranch: String?,
     toolCallIds: Set<String>,
+    nodePath: String?,
   ): Boolean {
-    if (!shouldIncludeEventInContext(currentBranch, event, agentName, toolCallIds)) return false
+    if (!shouldIncludeEventInContext(currentBranch, event, agentName, toolCallIds, nodePath))
+      return false
     if (event.author == Role.USER) return true
     return isOtherAgentReply(agentName, event) &&
       (transcriptionKind(event) != null || presentOtherAgentMessage(event) != null)
@@ -556,8 +581,8 @@ internal class HistoryRewriterProcessor {
    * Determines if an event should be included in the LLM context.
    *
    * This filters out events that are considered empty (e.g., no text, function calls, or
-   * transcriptions), do not belong to the current agent's branch, or are internal events like
-   * authentication or confirmation requests.
+   * transcriptions), do not belong to the current agent's branch, are user turns that another
+   * workflow node injected, or are internal events like authentication or confirmation requests.
    *
    * Note: `adk_request_input` events are kept. Unlike credential/confirmation requests (whose
    * outcome the framework applies itself), request_input carries a free-form answer the model must
@@ -568,13 +593,76 @@ internal class HistoryRewriterProcessor {
     event: Event,
     agentName: String,
     toolCallIds: Set<String>,
+    nodePath: String?,
   ): Boolean {
     return !(containsEmptyContent(event) ||
       !isEventBelongsToBranch(currentBranch, event) ||
       isToolSubBranchEvent(currentBranch, event, agentName, toolCallIds) ||
+      isOtherNodeInput(event, nodePath) ||
       isAdkFrameworkEvent(event) ||
       isAuthEvent(event) ||
       isRequestConfirmationEvent(event))
+  }
+
+  /** Whether [event] is a user turn that a workflow node other than [nodePath] injected. */
+  private fun isOtherNodeInput(event: Event, nodePath: String?): Boolean {
+    val path = event.nodeInfo?.path
+    return event.author == Role.USER &&
+      event.functionResponses().isEmpty() &&
+      !path.isNullOrEmpty() &&
+      path != nodePath
+  }
+
+  /**
+   * For a single-turn node, keeps only the events of [currentBranch], and of those only root events
+   * and the events of [nodePath] and its descendants, and with [keepAncestors] those of its
+   * ancestors, so it does not see other branches' or other nodes' turns.
+   */
+  private fun filterSingleTurnNodeEvents(
+    events: List<Event>,
+    currentBranch: String?,
+    nodePath: String?,
+    singleTurnNode: Boolean,
+    keepAncestors: Boolean = false,
+  ): List<Event> {
+    if (!singleTurnNode) return events
+    val branchEvents = events.filter { isEventBelongsToBranch(currentBranch, it) }
+    if (nodePath == null) return branchEvents
+    return branchEvents.filter { event ->
+      val path = event.nodeInfo?.path
+      path.isNullOrEmpty() ||
+        path == nodePath ||
+        path.startsWith("$nodePath/") ||
+        (keepAncestors && nodePath.startsWith("$path/"))
+    }
+  }
+
+  /**
+   * Drops function responses that answer no earlier function call in [events]. A response without
+   * an id answers none, since the later steps pair calls and responses by id.
+   */
+  private fun dropOrphanedFunctionResponses(events: List<Event>): List<Event> {
+    val callIds = mutableSetOf<String>()
+    return events.mapNotNull { event ->
+      val content = event.content
+      val kept =
+        if (content == null || event.functionResponses().isEmpty()) {
+          event
+        } else {
+          val parts =
+            content.parts.filter { part ->
+              val response = part.functionResponse ?: return@filter true
+              response.id in callIds
+            }
+          when (parts.size) {
+            0 -> null
+            content.parts.size -> event
+            else -> event.copy(content = content.copy(parts = parts))
+          }
+        }
+      event.functionCalls().mapNotNullTo(callIds) { it.id }
+      kept
+    }
   }
 
   /**

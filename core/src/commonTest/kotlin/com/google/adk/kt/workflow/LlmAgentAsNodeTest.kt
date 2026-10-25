@@ -26,8 +26,10 @@ import com.google.adk.kt.agents.ResumabilityConfig
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.apps.App
 import com.google.adk.kt.callbacks.AfterAgentCallback
+import com.google.adk.kt.callbacks.BeforeAgentCallback
 import com.google.adk.kt.callbacks.CallbackChoice
 import com.google.adk.kt.events.Event
+import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.models.Model
@@ -50,7 +52,12 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
@@ -196,6 +203,69 @@ private class ScriptedModel(private vararg val responses: Content) : Model {
 /** The texts of every part of every content in [request]. */
 private fun textsOf(request: LlmRequest): List<String> =
   request.contents.flatMap { it.parts }.mapNotNull { it.text }
+
+/**
+ * A node that emits [note] as a model turn, if given, and then runs [run], which starts children.
+ */
+private class FanOutNode(
+  override val name: String,
+  private val note: String? = null,
+  private val run: suspend Context.() -> Unit,
+) : Node {
+  override val rerunOnResume = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    if (note != null) emit(Event(author = name, content = Content.fromText(Role.MODEL, note)))
+    context.run()
+  }
+}
+
+/** An agent that emits a user turn of its own, then runs [inner] as its sub-agent. */
+private class NoteThenRunAgent(private val inner: LlmAgent) :
+  BaseAgent(name = "noter", subAgents = listOf(inner)) {
+  override fun runAsyncImpl(context: InvocationContext): Flow<Event> = flow {
+    emit(
+      Event(
+        invocationId = context.invocationId,
+        author = Role.USER,
+        content = Content.fromText(Role.USER, "a note from my node"),
+      )
+    )
+    emitAll(inner.runAsync(context))
+  }
+}
+
+/** An agent that completes [done] when it finishes, and starts only after [after] completes. */
+private fun orderedWorker(
+  name: String,
+  model: Model,
+  includeContents: LlmAgent.IncludeContents,
+  done: CompletableDeferred<Unit>? = null,
+  after: CompletableDeferred<Unit>? = null,
+) =
+  LlmAgent(
+    name = name,
+    model = model,
+    includeContents = includeContents,
+    beforeAgentCallbacks =
+      listOfNotNull(
+        after?.let { gate ->
+          BeforeAgentCallback { _ ->
+            gate.await()
+            CallbackChoice.Continue(EventActions())
+          }
+        }
+      ),
+    afterAgentCallbacks =
+      listOfNotNull(
+        done?.let { signal ->
+          AfterAgentCallback { _ ->
+            signal.complete(Unit)
+            CallbackChoice.Continue(Unit)
+          }
+        }
+      ),
+  )
 
 class LlmAgentAsNodeTest {
 
@@ -345,6 +415,35 @@ class LlmAgentAsNodeTest {
 
     // Assert: the second agent's user turn is the first agent's answer.
     assertEquals(listOf("Paris"), secondRequest.flatMap { it.parts }.mapNotNull { it.text })
+  }
+
+  @Test
+  fun runAsync_fannedOutNodeWithFullHistory_doesNotSeeItsPredecessorsTurn() = runBlocking {
+    // Arrange: `first` fans out to two nodes, which puts `second` on its own sub-branch.
+    val secondRequest = mutableListOf<Content>()
+    val first = LlmAgent(name = "first", model = RecordingModel(mutableListOf(), "Paris"))
+    val second =
+      LlmAgent(
+        name = "second",
+        model = RecordingModel(secondRequest),
+        includeContents = LlmAgent.IncludeContents.DEFAULT,
+      )
+    val other = RanFlagNode("other")
+    val edges = listOf(Edge(Start, first), Edge(first, second), Edge(first, other))
+    val runner = InMemoryRunner(app = App("app", rootNode = Workflow("wf", edges)))
+
+    // Act
+    val unused =
+      runner
+        .runAsync("u", "s", newMessage = Content.fromText(Role.USER, "Capital of France?"))
+        .toList()
+
+    // Assert
+    assertTrue(other.ran)
+    assertEquals(
+      listOf("Capital of France?", "Paris"),
+      secondRequest.flatMap { it.parts }.mapNotNull { it.text },
+    )
   }
 
   @Test
@@ -1009,6 +1108,27 @@ class LlmAgentAsNodeTest {
   }
 
   @Test
+  fun runAsync_subAgentOfANonLlmAgentNode_seesAUserTurnItsNodeEmitted() = runBlocking {
+    // Arrange: the node's own user turn carries its node path, which its sub-agent must match.
+    val captured = mutableListOf<Content>()
+    val inner =
+      LlmAgent(
+        name = "inner",
+        model = RecordingModel(captured),
+        includeContents = LlmAgent.IncludeContents.DEFAULT,
+      )
+    val noter = NoteThenRunAgent(inner)
+    val runner =
+      InMemoryRunner(app = App("app", rootNode = Workflow("wf", listOf(Edge(Start, noter)))))
+
+    // Act
+    val unused = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+
+    // Assert
+    assertContains(captured.flatMap { it.parts }.mapNotNull { it.text }, "a note from my node")
+  }
+
+  @Test
   fun runNode_singleTurnAgentWithSubAgent_getsTheTransferToolWithoutInstructions() = runBlocking {
     // Arrange: as in ADK Python, a single-turn agent is not told to hand the question over.
     val model = ScriptedModel(Content.fromText(Role.MODEL, "done"))
@@ -1129,6 +1249,106 @@ class LlmAgentAsNodeTest {
     assertContains(message, "Slot")
     assertFalse(message.contains("secret-day"))
   }
+
+  @Test
+  fun runNode_parallelSingleTurnNodes_doNotSeeTheSiblingsTurn() = runBlocking {
+    for (sharedBranch in listOf(true, false)) {
+      for (includeContents in LlmAgent.IncludeContents.entries) {
+        // Act
+        val texts = workerBRequestTexts(includeContents, sharedBranch)
+
+        // Assert
+        val case = "sharedBranch=$sharedBranch, $includeContents"
+        assertContains(texts, "SECRET_FOR_B", case)
+        assertTrue(texts.none { "SECRET_FOR_A" in it || "REPLY_FROM_A" in it }, case)
+      }
+    }
+  }
+
+  @Test
+  fun runNode_singleTurnChildNodeWithFullHistory_seesItsAncestorsButNotItsSibling() = runBlocking {
+    for (useSubBranch in listOf(true, false)) {
+      // Act
+      val texts = targetRequestTexts(useSubBranch)
+
+      // Assert
+      assertTrue(texts.any { "ANCESTOR_CONTEXT_FACT" in it }, "useSubBranch=$useSubBranch")
+      assertContains(texts, "TARGET_INPUT", "useSubBranch=$useSubBranch")
+      assertTrue(
+        texts.none { "SIBLING_INPUT" in it || "SIBLING_ONLY_REPLY" in it },
+        "useSubBranch=$useSubBranch",
+      )
+    }
+  }
 }
 
 private data class Slot(val day: String)
+
+/**
+ * Runs single-turn `worker_a` and `worker_b` at once under one node, `worker_b` only after
+ * `worker_a` finished, either both on one branch or `worker_b` on a sub-branch, and returns the
+ * texts of `worker_b`'s only model request. Ported from ADK Python's
+ * `test_parallel_single_turn_nodes_in_branches_do_not_anchor_on_sibling_reply`.
+ */
+private suspend fun workerBRequestTexts(
+  includeContents: LlmAgent.IncludeContents,
+  sharedBranch: Boolean,
+): List<String> {
+  val aDone = CompletableDeferred<Unit>()
+  val modelA = ScriptedModel(Content.fromText(Role.MODEL, "REPLY_FROM_A"))
+  val modelB = ScriptedModel(Content.fromText(Role.MODEL, "REPLY_FROM_B"))
+  val workerA = orderedWorker("worker_a", modelA, includeContents, done = aDone)
+  val workerB = orderedWorker("worker_b", modelB, includeContents, after = aDone)
+  val branch = if (sharedBranch) "parent@1" else null
+  val fanOut =
+    FanOutNode("fanout") {
+      coroutineScope {
+        awaitAll(
+          async { runNode(workerA, "SECRET_FOR_A", runId = "a", overrideBranch = branch) },
+          async {
+            runNode(
+              workerB,
+              "SECRET_FOR_B",
+              runId = "b",
+              useSubBranch = !sharedBranch,
+              overrideBranch = branch,
+            )
+          },
+        )
+      }
+    }
+  val runner =
+    InMemoryRunner(app = App("app", rootNode = Workflow("wf", listOf(Edge(Start, fanOut)))))
+  val unused =
+    runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "root prompt")).toList()
+  return textsOf(modelB.requests.single())
+}
+
+/**
+ * Runs a parent node that emits a model turn and then starts single-turn `sibling_agent` and
+ * `target_agent`, with the full history, `target_agent` only after `sibling_agent` finished, and
+ * returns the texts of `target_agent`'s only model request. Ported from ADK Python's
+ * `test_single_turn_child_node_sees_ancestor_history_with_or_without_sub_branch`.
+ */
+private suspend fun targetRequestTexts(useSubBranch: Boolean): List<String> {
+  val siblingDone = CompletableDeferred<Unit>()
+  val siblingModel = ScriptedModel(Content.fromText(Role.MODEL, "SIBLING_ONLY_REPLY"))
+  val targetModel = ScriptedModel(Content.fromText(Role.MODEL, "TARGET_REPLY"))
+  val full = LlmAgent.IncludeContents.DEFAULT
+  val sibling = orderedWorker("sibling_agent", siblingModel, full, done = siblingDone)
+  val target = orderedWorker("target_agent", targetModel, full, after = siblingDone)
+  val parent =
+    FanOutNode("parent_node", "ANCESTOR_CONTEXT_FACT") {
+      coroutineScope {
+        awaitAll(
+          async { runNode(sibling, "SIBLING_INPUT", runId = "a", useSubBranch = useSubBranch) },
+          async { runNode(target, "TARGET_INPUT", runId = "b", useSubBranch = useSubBranch) },
+        )
+      }
+    }
+  val runner =
+    InMemoryRunner(app = App("app", rootNode = Workflow("wf", listOf(Edge(Start, parent)))))
+  val unused =
+    runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "root prompt")).toList()
+  return textsOf(targetModel.requests.single())
+}
