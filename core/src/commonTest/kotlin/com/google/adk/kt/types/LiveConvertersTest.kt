@@ -402,6 +402,7 @@ class LiveConvertersTest {
     // The converter must not invent these; `toGenaiSdk`'s KDoc says which are permanent.
     assertNull(sdk.httpOptions)
     assertNull(sdk.avatarConfig)
+    assertNull(sdk.labels)
   }
 
   @Test

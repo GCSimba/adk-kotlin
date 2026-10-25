@@ -917,20 +917,27 @@ data class ContextFrameworkData(
    * Per-invocation scratch data shared across the invocation's callbacks and its sub-agent/branch
    * context copies. Mirrors Java ADK's `InvocationContext.callbackContextData()`.
    */
-  @FrameworkInternalApi val callbackContextData: MutableMap<String, Any> = concurrentMutableMapOf()
+  @FrameworkInternalApi val callbackContextData: MutableMap<String, Any> = concurrentMutableMapOf(),
+  /**
+   * The agent this context copy runs as a single-turn workflow node. Keyed to that agent, so
+   * sub-agents and transfer targets that inherit the copy are not single-turn. A schema mismatch in
+   * its output saves nothing to [LlmAgent.outputKey].
+   */
+  @FrameworkInternalApi val singleTurnNodeAgent: BaseAgent? = null,
 ) {
   /**
    * The live run this invocation belongs to, set by [openLiveRun], or `null` on a turn-based
    * invocation.
    *
    * Declared as a body property so it stays off every public signature; contexts derived with
-   * [InvocationContext.copy] share this holder and therefore the same run.
+   * [InvocationContext.copy] share this holder and therefore the same run. A [copy] of the holder
+   * starts without one, so copy it only for a context that never runs live.
    */
   @Volatile internal var liveRun: LiveRun? = null
 
   /**
    * Paths of workflow nodes cancelled mid-run in this turn. Their events show progress rather than
-   * a result, so a retry runs them again.
+   * a result, so a retry runs them again. A [copy] of the holder starts with none.
    */
   internal val cancelledNodePaths: MutableMap<String, Unit> = concurrentMutableMapOf()
 }
