@@ -288,10 +288,10 @@ class LlmAgent(
       .onEach { if (it.content?.role != Role.USER) maybeSaveOutputToState(it, context) }
 
   /**
-   * Runs this agent as a graph node. Without a parent it runs a single turn: the node input becomes
-   * its user turn, it runs without history unless [includeContents] was set explicitly, and its
-   * final model turn is the node's output. With a parent it runs with the session history and gives
-   * no node output.
+   * Runs this agent as a graph node. Without a parent it runs a single turn in the node's isolation
+   * scope: the node input becomes its user turn, it runs without history unless [includeContents]
+   * was set explicitly, and its final model turn is the node's output. With a parent it runs with
+   * the session history and gives no node output.
    */
   @ExperimentalWorkflowApi
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> =
@@ -306,7 +306,11 @@ class LlmAgent(
     val agentContext =
       ic.copy(
         frameworkData =
-          ic.frameworkData.copy(singleTurnNodeAgent = this@LlmAgent, nodePath = context.nodePath)
+          ic.frameworkData.copy(
+            singleTurnNodeAgent = this@LlmAgent,
+            nodePath = context.nodePath,
+            isolationScope = context.isolationScope,
+          )
       )
     var outputMarked = false
     try {
@@ -337,6 +341,7 @@ class LlmAgent(
           it.invocationId == ic.invocationId &&
             it.author == Role.USER &&
             it.nodeInfo?.path.isNullOrEmpty() &&
+            it.isolationScope == context.isolationScope &&
             it.content == nodeInput
         }
     if (recorded) return null
@@ -347,6 +352,7 @@ class LlmAgent(
         content = nodeInputToUserContent(nodeInput),
         branch = ic.branch,
         nodeInfo = NodeInfo(path = context.nodePath),
+        isolationScope = context.isolationScope,
       )
     ic.session.events.add(event)
     return event

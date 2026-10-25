@@ -886,7 +886,7 @@ abstract class AbstractRunner : Runner {
         )
         .apply { applyStateDelta(this, stateDelta) }
         .let { applyRunConfigCustomMetadata(it, context.runConfig) }
-        .withBranchFromMatchingCall(currentContext)
+        .withContextFromMatchingCall(currentContext)
 
     // A live run stores user input from the turn as it arrives, so only turn-based runs call this.
     val unused = sessionService.appendEvent(context.session, event)
@@ -906,9 +906,17 @@ abstract class AbstractRunner : Runner {
     }
   }
 
-  private suspend fun Event.withBranchFromMatchingCall(context: InvocationContext): Event =
-    context.findMatchingFunctionCall(this)?.branch?.let { branch -> this.copy(branch = branch) }
-      ?: this
+  /**
+   * Gives a function-response message the branch and isolation scope of the call it answers, so the
+   * answer lands in the history of the branch and scope the call was made in.
+   */
+  private suspend fun Event.withContextFromMatchingCall(context: InvocationContext): Event {
+    val call = context.findMatchingFunctionCall(this) ?: return this
+    return copy(
+      branch = call.branch ?: branch,
+      isolationScope = isolationScope ?: call.isolationScope,
+    )
+  }
 
   /**
    * Sets up an [InvocationContext] for a brand new invocation.

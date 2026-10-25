@@ -23,6 +23,7 @@ import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Role
+import com.google.adk.kt.workflow.findUserMessageForInvocation
 
 /**
  * A processor that populates the LLM request with the conversation history.
@@ -35,8 +36,24 @@ import com.google.adk.kt.types.Role
  * single-turn workflow node that leaves it unset, only the current turn is sent (the most recent
  * user input or other-agent reply, plus any tool calls/responses from that turn). Otherwise the
  * full filtered history is sent. Non-[LlmAgent] agents always receive the full filtered history.
+ *
+ * Only events stamped with the invocation's isolation scope are sent, so an agent running in a
+ * scope sees its own scoped history and an unscoped agent sees only unscoped events.
  */
 internal class ContentsProcessor : LlmRequestProcessor {
+  /**
+   * The user message a scoped history opens with when no delegating call carries the task: the
+   * invocation's original message when [InvocationContext.userContent] answers calls by id, as on a
+   * resume, and the user content otherwise.
+   */
+  private fun taskOpeningMessage(context: InvocationContext): Content? {
+    val userContent = context.userContent ?: return null
+    if (userContent.parts.any { !it.functionResponse?.id.isNullOrEmpty() }) {
+      return findUserMessageForInvocation(context.session.events, context.invocationId)
+    }
+    return userContent
+  }
+
   @OptIn(FrameworkInternalApi::class)
   override suspend fun process(
     context: InvocationContext,
@@ -45,7 +62,8 @@ internal class ContentsProcessor : LlmRequestProcessor {
   ): LlmRequest {
     val events = context.getEvents(currentInvocation = false, currentBranch = false)
     val agent = context.agent
-    val singleTurnNode = context.frameworkData.singleTurnNodeAgent === agent
+    val frameworkData = context.frameworkData
+    val singleTurnNode = frameworkData.singleTurnNodeAgent === agent
     val includeContents =
       when {
         agent !is LlmAgent -> IncludeContents.DEFAULT
@@ -59,8 +77,10 @@ internal class ContentsProcessor : LlmRequestProcessor {
           agentName = agent.name,
           currentBranch = context.branch,
           includeContents = includeContents,
-          nodePath = context.frameworkData.nodePath,
+          nodePath = frameworkData.nodePath,
           singleTurnNode = singleTurnNode,
+          isolationScope = frameworkData.isolationScope,
+          userContent = frameworkData.isolationScope?.let { taskOpeningMessage(context) },
         )
 
     val newContents =

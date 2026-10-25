@@ -19,8 +19,10 @@ package com.google.adk.kt.events
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.TypedData
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.models.CacheMetadata
 import com.google.adk.kt.processors.generateRequestConfirmationEvent
+import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.sessions.InMemorySessionService
 import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.testing.DummyAgent
@@ -40,6 +42,7 @@ import com.google.adk.kt.types.VoiceActivity
 import com.google.adk.kt.types.VoiceActivityType
 import com.google.adk.kt.workflow.NodeInfo
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -210,6 +213,7 @@ class EventTest {
         cacheMetadata = CacheMetadata(fingerprint = "abc", contentsCount = 1),
         customMetadata = mapOf("key" to null),
         output = "result",
+        isolationScope = "task-1",
         nodeInfo = NodeInfo(path = "wf@1"),
         turnCompleteReason = TurnCompleteReason.NEED_MORE_INPUT,
         interactionStatus = InteractionStatus.IN_PROGRESS,
@@ -241,5 +245,33 @@ class EventTest {
     assertEquals(content, fromConstructor.content)
     assertEquals("", fromBuilder.author)
     assertEquals(content, fromBuilder.content)
+  }
+
+  @OptIn(FrameworkInternalApi::class)
+  @Test
+  fun serialization_roundTripsIsolationScope() {
+    // Arrange
+    val event = Event(author = "worker", isolationScope = "task-1")
+
+    // Act
+    val json = adkJson.encodeToString(Event.serializer(), event)
+    val decoded = adkJson.decodeFromString(Event.serializer(), json)
+
+    // Assert
+    assertContains(json, "\"isolationScope\":\"task-1\"")
+    assertEquals("task-1", decoded.isolationScope)
+  }
+
+  @OptIn(FrameworkInternalApi::class)
+  @Test
+  fun deserialization_snakeCaseIsolationScope_readsScope() {
+    // Arrange
+    val json = """{"author": "worker", "isolation_scope": "task-1"}"""
+
+    // Act
+    val decoded = adkJson.decodeFromString(Event.serializer(), json)
+
+    // Assert
+    assertEquals("task-1", decoded.isolationScope)
   }
 }

@@ -298,8 +298,16 @@ abstract class BaseAgent(
    */
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
     val ic = context.invocationContext
-    @OptIn(FrameworkInternalApi::class)
-    val agentContext = ic.copy(frameworkData = ic.frameworkData.copy(nodePath = context.nodePath))
+    // The agent and its sub-agents build their history from the node's path and isolation scope.
+    @OptIn(FrameworkInternalApi::class, ExperimentalWorkflowApi::class)
+    val agentContext =
+      ic.copy(
+        frameworkData =
+          ic.frameworkData.copy(
+            nodePath = context.nodePath,
+            isolationScope = context.isolationScope,
+          )
+      )
     runAsync(agentContext).collect { event ->
       if (event.author.isNotEmpty()) context.eventAuthor = event.author
       emit(event)

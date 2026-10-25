@@ -930,6 +930,11 @@ data class ContextFrameworkData(
    * uses it to keep the agent's history to its own node path.
    */
   @FrameworkInternalApi val nodePath: String? = null,
+  /**
+   * The isolation scope the contents processor filters session events by: only events stamped with
+   * this exact scope reach the model, so `null` sees only unscoped events.
+   */
+  @FrameworkInternalApi val isolationScope: String? = null,
 ) {
   /**
    * The live run this invocation belongs to, set by [openLiveRun], or `null` on a turn-based
