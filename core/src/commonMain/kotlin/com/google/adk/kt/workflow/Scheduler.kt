@@ -17,7 +17,9 @@
 package com.google.adk.kt.workflow
 
 import com.google.adk.kt.SchemaUtils
+import com.google.adk.kt.agents.AgentMode
 import com.google.adk.kt.agents.Context
+import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.TypedData
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.events.Event
@@ -149,6 +151,8 @@ internal class Scheduler(
     }
 
     private suspend fun scheduleReady() {
+      // As in Python ADK, no other node starts while a task node waits on the user.
+      if (hasWaitingTaskNode()) return
       for (nodeName in triggerQueue.queuedNodeNames) {
         if (nodeName in running) continue
         val state = nodeStates[nodeName]
@@ -206,6 +210,7 @@ internal class Scheduler(
             resumeInputs = interception.resumeInputs,
             useSubBranch = trigger.useSubBranch,
             overrideBranch = trigger.branch,
+            overrideIsolationScope = taskScopeFor(nodeName, runId),
           )
           .run(trigger.input)
       }
@@ -293,6 +298,19 @@ internal class Scheduler(
         )
       )
   }
+
+  /** Whether a task agent node is waiting, which for a task means waiting on the user. */
+  private fun hasWaitingTaskNode(): Boolean = nodeStates.any { (name, state) ->
+    state.status == NodeStatus.WAITING && (graph.node(name) as? LlmAgent)?.mode == AgentMode.TASK
+  }
+
+  /** A task agent's isolation scope: its own node path, which keeps its conversation apart. */
+  private fun taskScopeFor(nodeName: String, runId: String): String? =
+    if ((graph.node(nodeName) as? LlmAgent)?.mode == AgentMode.TASK) {
+      Context.buildNodePath(context.nodePath, nodeName, runId)
+    } else {
+      null
+    }
 
   private fun enqueueSuccessorNodeTriggers(nodeName: String, childContext: Context) {
     val successors = graph.nodesTriggeredBy(nodeName, childContext.routes)

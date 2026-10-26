@@ -28,6 +28,9 @@ enum class AgentMode {
 
   /** Holds a multi-turn conversation with the user over the shared session history. */
   @ExperimentalWorkflowApi CHAT,
+
+  /** Works on a delegated task in its own isolated history until it calls `finish_task`. */
+  @ExperimentalWorkflowApi TASK,
 }
 
 /**
@@ -35,4 +38,4 @@ enum class AgentMode {
  */
 @OptIn(ExperimentalWorkflowApi::class)
 internal val AgentMode?.runsAsTool: Boolean
-  get() = this == AgentMode.SINGLE_TURN
+  get() = this == AgentMode.TASK || this == AgentMode.SINGLE_TURN

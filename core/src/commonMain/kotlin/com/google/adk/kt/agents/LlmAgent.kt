@@ -51,14 +51,19 @@ import com.google.adk.kt.serialization.anyToJsonElement
 import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.tools.Toolset
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.GenerateContentConfig
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.Schema
 import com.google.adk.kt.workflow.NodeInfo
+import com.google.adk.kt.workflow.WorkflowConfigurationException
 import kotlin.jvm.JvmStatic
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.FlowCollector
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.transformWhile
 
 /**
  * LLM-based Agent.
@@ -68,8 +73,8 @@ import kotlinx.coroutines.flow.onEach
  * inherited from `BaseAgent` - see that flag for the full dispatch rules.
  *
  * @property model The model to use for the agent.
- * @param tools The tools configured for this agent; the [tools] property also holds one tool per
- *   single-turn sub-agent.
+ * @param tools The tools configured for this agent; the [tools] property also holds `finish_task`
+ *   for a task agent and one tool per task or single-turn sub-agent.
  * @property toolsets Toolsets available to this agent.
  * @property generateContentConfig The additional content generation configurations.
  * @property instruction Instruction guiding the agent's behavior. Use one of:
@@ -127,8 +132,9 @@ import kotlinx.coroutines.flow.onEach
  *   without history.
  * @property mode How this agent converses as a workflow node or a sub-agent. Null means
  *   [AgentMode.CHAT] for an agent with a parent or sub-agents, as in Python, and
- *   [AgentMode.SINGLE_TURN] otherwise. A single-turn sub-agent is offered to its parent as a tool
- *   rather than as a transfer target.
+ *   [AgentMode.SINGLE_TURN] otherwise. A [AgentMode.TASK] agent gains a `finish_task` tool, and a
+ *   task or single-turn sub-agent is offered to its parent as a tool rather than as a transfer
+ *   target.
  * @property maxSteps The maximum number of steps this agent runs within a single invocation, where
  *   a step is one model call plus any tool calls or transfers it triggers. Once the cap is reached
  *   the agent stops emitting further events, even if it has not yet produced a final response.
@@ -187,12 +193,19 @@ class LlmAgent(
    */
   internal val includeContentsExplicit: Boolean = includeContents != null
 
-  /** The tools available to this agent: the configured ones, plus one per single-turn sub-agent. */
+  /**
+   * The tools available to this agent: the configured ones, plus `finish_task` for a task agent and
+   * a tool for each task or single-turn sub-agent.
+   */
   val tools: List<BaseTool> = buildList {
     addAll(tools)
-    // A chat sub-agent is a transfer target, not a tool.
+    if (mode == AgentMode.TASK) add(FinishTaskTool(this@LlmAgent))
     for (subAgent in subAgents) {
-      if ((subAgent as? LlmAgent)?.mode == AgentMode.SINGLE_TURN) add(SingleTurnAgentTool(subAgent))
+      when ((subAgent as? LlmAgent)?.mode) {
+        AgentMode.SINGLE_TURN -> add(SingleTurnAgentTool(subAgent))
+        AgentMode.TASK -> add(TaskAgentTool(subAgent))
+        else -> {} // A chat sub-agent is a transfer target, not a tool.
+      }
     }
   }
 
@@ -201,7 +214,7 @@ class LlmAgent(
   override val rerunOnResume: Boolean
     get() = true
 
-  // Chat nodes stay open across turns until they produce an output.
+  // Chat and task nodes stay open across turns until they produce an output.
   @ExperimentalWorkflowApi
   override val waitForOutput: Boolean
     get() = defaultMode() != AgentMode.SINGLE_TURN
@@ -308,14 +321,15 @@ class LlmAgent(
       .onEach { if (it.content?.role != Role.USER) maybeSaveOutputToState(it, context) }
 
   /**
-   * Runs this agent as a graph node in its [AgentMode]: a single turn on the node input, or a chat
-   * over the session history.
+   * Runs this agent as a graph node in its [AgentMode]: a single turn on the node input, a chat
+   * that runs its task sub-agents, or a task that ends with `finish_task`.
    */
   @ExperimentalWorkflowApi
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> =
     when (nodeMode(context.invocationContext)) {
       AgentMode.SINGLE_TURN -> runSingleTurn(context, nodeInput)
       AgentMode.CHAT -> runInChatMode(context)
+      AgentMode.TASK -> runInTaskMode(context, nodeInput)
     }
 
   /**
@@ -376,13 +390,228 @@ class LlmAgent(
     }
   }
 
-  /** Holds a conversation over the session history. */
-  private fun runInChatMode(context: Context): Flow<Any?> = flow {
-    runAsync(agentContext(context, AgentMode.CHAT)).collect { event ->
-      if (event.author.isNotEmpty()) context.eventAuthor = event.author
-      emit(event)
+  /**
+   * Works on a delegated task until `finish_task` succeeds. A failed call's error reaches the
+   * model, which retries; the succeeding call's arguments become the node's output and [outputKey]
+   * value. The node input, when given, is the task's opening user turn if no delegating call
+   * carries it.
+   */
+  private fun runInTaskMode(context: Context, nodeInput: Any?): Flow<Any?> {
+    val agentContext = agentContext(context, AgentMode.TASK)
+    val taskContext =
+      agentContext.copy(
+        userContent = nodeInput?.let(::nodeInputToUserContent) ?: agentContext.userContent
+      )
+    return runWithDelegations(
+      context,
+      taskContext,
+      tools.filterIsInstance<FinishTaskTool>().first(),
+    )
+  }
+
+  /** Holds a conversation that runs its task sub-agents. */
+  private fun runInChatMode(context: Context): Flow<Any?> =
+    runWithDelegations(context, agentContext(context, AgentMode.CHAT), finishTool = null)
+
+  /**
+   * Runs this agent on [agentContext], running its task sub-agents along the way. Each round runs
+   * the agent until the model delegates tasks or ends. The delegated tasks then run as child nodes,
+   * in each call's own isolation scope, and their answers start the next round. With a
+   * [finishTool], the run ends once a `finish_task` call succeeds.
+   */
+  private fun runWithDelegations(
+    context: Context,
+    agentContext: InvocationContext,
+    finishTool: FinishTaskTool?,
+  ): Flow<Any?> = flow {
+    val toolsByName = tools.associateBy { it.name }
+    answerPendingDelegations(context, toolsByName, ownScopeOnly = finishTool != null)
+    val finish = finishTool?.let(::FinishState)
+    while (true) {
+      val round = DelegationRound()
+      emitAll(
+        runAsync(agentContext).transformWhile { event ->
+          emitRoundEvent(context, event, round, finish, toolsByName)
+        }
+      )
+      if (round.delegations.isEmpty()) return@flow
+      for (call in round.delegations) emitTaskResponse(context, call)
+      if (!canStartNextRound(round, agentContext)) return@flow
     }
   }
+
+  /** What one round of [runWithDelegations] has seen so far. */
+  private class DelegationRound {
+    /** The task delegations the model made this round; empty until it makes some. */
+    var delegations = emptyList<FunctionCall>()
+
+    /** Long-running calls of this round that no response has answered yet. */
+    val pendingLongRunningCalls = mutableSetOf<String>()
+  }
+
+  /** The `finish_task` tool of a task run and the arguments of its latest call. */
+  private class FinishState(val tool: FinishTaskTool) {
+    var args: Map<String, Any?>? = null
+  }
+
+  /**
+   * Emits [event] from a round and returns whether the round goes on. Once the model delegates
+   * tasks, the round only keeps that step's tool responses; a task run ends with its successful
+   * `finish_task` response.
+   */
+  private suspend fun FlowCollector<Any?>.emitRoundEvent(
+    context: Context,
+    event: Event,
+    round: DelegationRound,
+    finish: FinishState?,
+    toolsByName: Map<String, BaseTool>,
+  ): Boolean {
+    if (event.author.isNotEmpty()) context.eventAuthor = event.author
+    round.pendingLongRunningCalls += event.longRunningToolIds
+    for (response in event.functionResponses()) {
+      response.id?.let(round.pendingLongRunningCalls::remove)
+    }
+    if (round.delegations.isNotEmpty()) {
+      return emitDelegatingStepResponse(event, context.invocationContext.branch)
+    }
+    if (finish != null) {
+      when (val step = finishStepOf(event, finish, toolsByName)) {
+        is FinishStep.Call -> {
+          finish.args = step.args
+          emit(event)
+          return true
+        }
+        is FinishStep.Done -> {
+          val key = outputKey?.takeIf { it.isNotEmpty() }
+          if (key != null && step.output != null) context.updateState(key, step.output)
+          emit(event.copy(output = step.output))
+          return false
+        }
+        null -> {}
+      }
+    }
+    emit(event)
+    round.delegations = taskDelegationsIn(event, toolsByName)
+    return round.delegations.isEmpty() || hasEagerToolCalls(event, toolsByName)
+  }
+
+  /**
+   * Emits [event] after the model delegated tasks, and returns whether the round goes on. It keeps
+   * the tool responses of the step that delegated, and stops before the model starts another round.
+   */
+  private suspend fun FlowCollector<Any?>.emitDelegatingStepResponse(
+    event: Event,
+    branch: String?,
+  ): Boolean {
+    if (startsModelRound(event, branch)) return false
+    emit(withFinishTaskRejected(event))
+    return !isOwnStep(event, branch) || event.functionResponses().isEmpty()
+  }
+
+  /**
+   * Returns [event] with any `finish_task` response replaced by an error, as Python does: a turn
+   * that also delegated has not finished its task, so the model calls `finish_task` again later.
+   */
+  private fun withFinishTaskRejected(event: Event): Event {
+    val content = event.content ?: return event
+    if (content.parts.none { it.functionResponse?.name == FinishTaskTool.NAME }) return event
+    val parts =
+      content.parts.map { part ->
+        val response = part.functionResponse
+        if (response?.name != FinishTaskTool.NAME) part
+        else
+          part.copy(functionResponse = response.copy(response = FinishTaskTool.REJECTED_RESPONSE))
+      }
+    return event.copy(content = content.copy(parts = parts))
+  }
+
+  /** What an event of a task run means for finishing the task. */
+  private sealed interface FinishStep {
+    /** A `finish_task` call, whose arguments give the output once a response ends the task. */
+    class Call(val args: Map<String, Any?>) : FinishStep
+
+    /** The `finish_task` response that ends the task with [output]. */
+    class Done(val output: Any?) : FinishStep
+  }
+
+  /**
+   * Returns what [event] means for finishing the task of [finish], or null if it is unrelated. A
+   * `finish_task` call beside a task delegation does not count, as in Python.
+   */
+  private fun finishStepOf(
+    event: Event,
+    finish: FinishState,
+    toolsByName: Map<String, BaseTool>,
+  ): FinishStep? {
+    if (!event.partial) {
+      val call = event.functionCalls().firstOrNull { it.name == FinishTaskTool.NAME }
+      if (call != null && taskDelegationsIn(event, toolsByName).isEmpty()) {
+        return FinishStep.Call(call.args)
+      }
+    }
+    val args = finish.args
+    if (args == null || !FinishTaskTool.isTerminalResponse(event)) return null
+    return FinishStep.Done(finish.tool.taskOutput(args))
+  }
+
+  /** Answers the delegations an earlier turn left unanswered; a task resumes only its own. */
+  private suspend fun FlowCollector<Any?>.answerPendingDelegations(
+    context: Context,
+    toolsByName: Map<String, BaseTool>,
+    ownScopeOnly: Boolean,
+  ) {
+    val scope = if (ownScopeOnly) context.isolationScope else null
+    for (call in unresolvedTaskDelegations(context.session.events, name, toolsByName, scope)) {
+      emitTaskResponse(context, call)
+    }
+  }
+
+  /**
+   * Whether another round may start once this round's tasks have answered. A long-running call of
+   * the round that is still unanswered pauses the turn, and so does reaching [maxSteps].
+   */
+  private fun canStartNextRound(round: DelegationRound, agentContext: InvocationContext): Boolean {
+    if (round.pendingLongRunningCalls.isNotEmpty()) return false
+    val stepCap = maxSteps ?: return true
+    return stepsTaken(agentContext) < stepCap
+  }
+
+  /** The steps this agent has taken in its node run on [agentContext]. */
+  @OptIn(FrameworkInternalApi::class)
+  private fun stepsTaken(agentContext: InvocationContext): Int =
+    agentContext.frameworkData.agentModeOverride?.takeIf { it.agent === this }?.stepsTaken ?: 0
+
+  /** Runs the task agent a delegation [call] names and emits the response that answers the call. */
+  private suspend fun FlowCollector<Any?>.emitTaskResponse(context: Context, call: FunctionCall) {
+    val callId = checkNotNull(call.id) { "A task delegation call must have an id." }
+    val target =
+      rootAgent.findAgent(call.name)
+        ?: throw WorkflowConfigurationException("Task target agent '${call.name}' not found.")
+    val output =
+      context.runNode(
+        target,
+        nodeInput = call.args,
+        runId = callId,
+        useSubBranch = true,
+        overrideIsolationScope = callId,
+        raiseOnWait = true,
+      )
+    context.eventAuthor = Role.USER
+    emit(taskResponseEvent(call, output))
+    context.eventAuthor = name
+  }
+
+  /**
+   * Whether [event] starts a new model round on [branch] rather than finishing the current step.
+   */
+  private fun startsModelRound(event: Event, branch: String?): Boolean =
+    isOwnStep(event, branch) &&
+      event.content?.role == Role.MODEL &&
+      event.functionCalls().none { it.name == FunctionCall.REQUEST_CONFIRMATION_FUNCTION_CALL_NAME }
+
+  /** Whether [event] is this agent's own step on [branch], not one from a run on a sub-branch. */
+  private fun isOwnStep(event: Event, branch: String?): Boolean =
+    event.author == name && event.branch == branch
 
   /**
    * Feeds the node's input to the agent as its user turn: the user message for a first node, or the
@@ -500,18 +729,23 @@ class LlmAgent(
     }
   }
 
+  @OptIn(FrameworkInternalApi::class)
   private fun executeTurns(context: InvocationContext): Flow<Event> = flow {
     var lastEvent: Event?
-    var stepsCompleted = 0
+    // A chat or task node's delegation rounds share one step count.
+    val override = context.frameworkData.agentModeOverride?.takeIf { it.agent === this@LlmAgent }
+    var stepsCompleted = override?.stepsTaken ?: 0
     do {
       lastEvent = null
+      // Counted when it starts, since a delegation round can stop the flow mid-step.
+      stepsCompleted++
+      override?.stepsTaken = stepsCompleted
       LlmAgentTurn(this@LlmAgent, context, systemBeforeTurnProcessors, systemAfterTurnProcessors)
         .execute()
         .collect { event ->
           lastEvent = event
           emit(event)
         }
-      stepsCompleted++
       // Enforce the per-agent step cap. Checked after running the step so that maxSteps == N runs
       // exactly N steps, mirroring the Java ADK BaseLlmFlow.run loop.
       if (maxSteps != null && stepsCompleted >= maxSteps) {
@@ -573,6 +807,8 @@ class LlmAgent(
       return
     }
     val outputKey = outputKey?.takeIf { it.isNotEmpty() } ?: return
+    // A task agent's output comes from `finish_task`, not from a text turn.
+    if (mode == AgentMode.TASK) return
     if (!event.isFinalResponse) return
     val parts = event.content?.parts ?: return
 

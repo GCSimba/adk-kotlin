@@ -654,13 +654,13 @@ data class InvocationContext(
       // instead of re-invoking the model with an empty payload -- otherwise a tool that keeps
       // requesting input (e.g. request_input) loops. Every other value is emitted as a response.
       // Done before `runAfterToolCallbacks` to avoid wrapping `Unit` as `{result: Unit}`. See
-      // [BaseTool.isLongRunning].
-      if (tool.isLongRunning && toolResult === Unit) {
+      // [BaseTool.isLongRunning]. A task delegation's `Unit` defers too: its task node answers it.
+      if ((tool.isLongRunning || tool is TaskAgentTool) && toolResult === Unit) {
         return@withSpan null
       }
       // A regular tool's `Unit`, or a `null` leaked by a Java tool that breaks the non-null `run`
       // contract, is Python's `None`: it answers as `{"result": null}`, since the spec requires the
-      // response to be a map. Only a long-running tool's `Unit` defers (handled above).
+      // response to be a map. Only a long-running tool's or a task delegation's `Unit` defers.
       if (toolResult === Unit || (toolResult as Any?) == null) {
         toolResult = mapOf(BaseTool.RESULT_KEY to null)
       }
@@ -939,6 +939,11 @@ data class ContextFrameworkData(
    * child node there; `null` outside a node run.
    */
   @FrameworkInternalApi val nodeContext: Context? = null,
+  /**
+   * Whether the invocation's new message joined a paused task's invocation, so the message is the
+   * workflow's input rather than the invocation's first message.
+   */
+  @FrameworkInternalApi val continuesPausedTask: Boolean = false,
 ) {
   /**
    * The live run this invocation belongs to, set by [openLiveRun], or `null` on a turn-based
@@ -992,7 +997,10 @@ internal fun toFinalResponseMap(payload: Any?): Map<String, Any?> {
  * non-public.
  */
 class AgentModeOverride
-internal constructor(internal val agent: BaseAgent, internal val mode: AgentMode)
+internal constructor(internal val agent: BaseAgent, internal val mode: AgentMode) {
+  /** The steps [agent] has taken in this run, so `maxSteps` holds across its delegation rounds. */
+  internal var stepsTaken: Int = 0
+}
 
 /** The mode override set for [agent], or null when none is. */
 @OptIn(FrameworkInternalApi::class)

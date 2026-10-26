@@ -425,12 +425,13 @@ private constructor(
 
 /**
  * Returns the input for a root node: the user's message, or on resume, where the new message only
- * carries answers, the message that started the invocation.
+ * carries answers, the message that started the invocation. A message that joined a paused task
+ * stays the input, as in ADK Python.
  */
 private fun rootInput(context: InvocationContext): Content? {
   val message = context.userContent
   val isAnswer = message != null && message.parts.all { it.functionResponse != null }
-  if (!isAnswer) return message
+  if (!isAnswer || context.frameworkData.continuesPausedTask) return message
   return findUserMessageForInvocation(context.session.events, context.invocationId) ?: message
 }
 

@@ -579,7 +579,8 @@ open class Context(
    * @param useSubBranch When `true`, runs [node] on a sub-branch `<branch>.<node.name>@<runId>`.
    * @param overrideBranch Branch for [node] to run on instead of this node's branch.
    * @param overrideIsolationScope Isolation scope for [node] to run in instead of this node's
-   *   scope.
+   *   scope. When `null`, an [AgentMode.TASK] child of a node activation runs in a scope named by
+   *   its own node path.
    * @param raiseOnWait When `true` and [node] is a [Workflow] or sets [Node.waitForOutput] but
    *   finishes without an output, aborts this node's run like an interrupt, without recording one:
    *   this node completes with any output it already produced, or else waits only if it sets
@@ -794,7 +795,12 @@ open class Context(
         resumeInputs = interception.resumeInputs,
         useSubBranch = useSubBranch,
         overrideBranch = overrideBranch,
-        overrideIsolationScope = overrideIsolationScope,
+        // A task agent works in a scope of its own unless the caller picks one.
+        overrideIsolationScope =
+          overrideIsolationScope
+            ?: buildNodePath(nodePath, node.name, id).takeIf {
+              (node as? LlmAgent)?.mode == AgentMode.TASK
+            },
       )
       .run(input, validateInput = false)
   }

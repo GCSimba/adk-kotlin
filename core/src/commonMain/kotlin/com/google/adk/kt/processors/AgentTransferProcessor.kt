@@ -49,7 +49,7 @@ internal class AgentTransferProcessor : LlmRequestProcessor {
     }
 
     val transferTool = TransferToAgentTool(targets.map { it.name })
-    // A single-turn agent keeps the tool but is not told to hand the question over.
+    // A task or single-turn agent keeps the tool but is not told to hand the question over.
     if (runsDelegated(context)) return request.appendTools(listOf(transferTool))
     val transferInstructions = buildTransferInstructions(agent, targets)
 
@@ -58,7 +58,7 @@ internal class AgentTransferProcessor : LlmRequestProcessor {
       .appendTools(listOf(transferTool))
   }
 
-  /** Whether the agent of [context] runs as a single-turn agent. */
+  /** Whether the agent of [context] runs as a task or single-turn agent. */
   @OptIn(ExperimentalWorkflowApi::class)
   private fun runsDelegated(context: InvocationContext): Boolean {
     val agent = context.agent
@@ -117,8 +117,9 @@ internal fun offeredTransferTargets(agent: BaseAgent, context: InvocationContext
 
 /**
  * Returns the agents [agent] may transfer control to: its sub-agents, and (when permitted) its
- * parent and peers. A single-turn agent is reached as a tool instead, so it is left out. Requests
- * read it through [offeredTransferTargets], and a turn rejects a transfer to any other agent.
+ * parent and peers. A task or single-turn agent is reached as a tool instead, so it is left out.
+ * Requests read it through [offeredTransferTargets], and a turn rejects a transfer to any other
+ * agent.
  */
 internal fun findTransferTargets(agent: BaseAgent): List<BaseAgent> {
   val targets = buildList {
@@ -169,6 +170,6 @@ internal fun liveTransferTargets(agent: BaseAgent): List<BaseAgent> {
   return targets.filter { it is LlmAgent || it is SequentialAgent }
 }
 
-/** Whether this agent is reached by transfer, which a single-turn agent is not. */
+/** Whether this agent is reached by transfer, which a task or single-turn agent is not. */
 @OptIn(ExperimentalWorkflowApi::class)
 private fun BaseAgent.isTransferTarget(): Boolean = !(this as? LlmAgent)?.mode.runsAsTool
