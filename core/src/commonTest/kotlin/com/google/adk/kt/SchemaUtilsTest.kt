@@ -22,7 +22,12 @@ import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.serialization.jsonElementToAny
+import com.google.adk.kt.types.Blob
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.FileData
+import com.google.adk.kt.types.FunctionCall
+import com.google.adk.kt.types.FunctionDeclaration
+import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Schema
 import com.google.adk.kt.types.Type
@@ -34,6 +39,9 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
+import kotlin.time.Duration
+import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -76,6 +84,8 @@ private sealed class Shape {
 @Serializable private data class Reading(val value: JsonPrimitive)
 
 @JvmInline @Serializable private value class OrderId(val value: String)
+
+@Serializable private class RawAttachment(val data: ByteArray)
 
 class SchemaUtilsTest {
 
@@ -1613,5 +1623,76 @@ class SchemaUtilsTest {
 
     // Assert
     assertEquals(List(schemas.size) { Result.success(null) }, results)
+  }
+
+  @OptIn(ExperimentalUuidApi::class)
+  @Test
+  fun inferSchema_textArrayAndSpecialFieldTypes_describeTheirJsonForm() {
+    // Arrange
+    val types =
+      listOf(
+        typeOf<Duration>(),
+        typeOf<Uuid>(),
+        typeOf<IntArray>(),
+        typeOf<LongArray>(),
+        typeOf<RawAttachment>(),
+        typeOf<Box<Shape>>(),
+      )
+
+    // Act
+    val schemas = types.map { SchemaUtils.inferSchema(it) }
+    val blobData = SchemaUtils.inferSchema(typeOf<Blob>())?.properties?.get("data")
+
+    // Assert
+    val integers = Schema(type = Type.ARRAY, items = Schema(type = Type.INTEGER))
+    fun closedWith(name: String, property: Schema) =
+      Schema(
+        type = Type.OBJECT,
+        properties = mapOf(name to property),
+        required = listOf(name),
+        additionalProperties = false,
+      )
+    assertEquals(
+      listOf(
+        // Duration and Uuid are written as text.
+        Schema(type = Type.STRING),
+        Schema(type = Type.STRING),
+        // IntArray and LongArray are written as arrays.
+        integers,
+        integers,
+        // A ByteArray field takes its serializer's form, a number array by default.
+        closedWith("data", integers),
+        // A sealed field is unconstrained in a closed class.
+        closedWith("item", Schema()),
+      ),
+      schemas,
+    )
+    // A base64 serializer, as on Blob.data, makes the field text.
+    assertEquals(Schema(type = Type.STRING, nullable = true), blobData)
+  }
+
+  @Test
+  fun inferSchema_adkTypesThatContainASchema_haveNoSchema() {
+    // Act: a Schema holds Schemas, and a FunctionDeclaration's parameters are one.
+    val schemas =
+      listOf(typeOf<Schema>(), typeOf<FunctionDeclaration>()).map { SchemaUtils.inferSchema(it) }
+
+    // Assert
+    assertEquals(listOf(null, null), schemas)
+  }
+
+  @Test
+  fun inferSchema_adkModelTypes_areClosedObjects() {
+    // Arrange
+    val types =
+      listOf(typeOf<Blob>(), typeOf<FileData>(), typeOf<FunctionCall>(), typeOf<FunctionResponse>())
+
+    // Act
+    val shapes = types.associateWith {
+      SchemaUtils.inferSchema(it).let { schema -> schema?.type to schema?.additionalProperties }
+    }
+
+    // Assert
+    assertEquals(types.associateWith { Type.OBJECT to false }, shapes)
   }
 }

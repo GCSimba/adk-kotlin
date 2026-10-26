@@ -41,7 +41,12 @@ import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.JsonPrimitive
 
 @Serializable private data class CodecReading(val value: JsonPrimitive)
@@ -61,6 +66,17 @@ private enum class CodecPriority {
 @Serializable private data class CodecBox<T>(val item: T)
 
 private inline fun <reified T> codec() = ValueCodec<T>(typeOf<T>())
+
+/** A value whose hand-written serializer fails with an exception that is not a decoding error. */
+@Serializable(with = FaultySerializer::class) private class CodecFaulty
+
+private object FaultySerializer : KSerializer<CodecFaulty> {
+  override val descriptor = PrimitiveSerialDescriptor("CodecFaulty", PrimitiveKind.STRING)
+
+  override fun serialize(encoder: Encoder, value: CodecFaulty) = encoder.encodeString("faulty")
+
+  override fun deserialize(decoder: Decoder): CodecFaulty = throw NullPointerException()
+}
 
 /** A type whose classifier is a type parameter, as in a generic node or helper. */
 private fun <T> typeParameterType(): KType = checkNotNull(typeOf<List<T>>().arguments.single().type)
@@ -123,6 +139,18 @@ class ValueCodecTest {
     assertEquals(42, quoted)
     assertContains(outOfRange.message.orEmpty(), "input does not match kotlin.Int")
     assertContains(fraction.message.orEmpty(), "input does not match kotlin.Int")
+  }
+
+  /** A decode failure names the exception that caused it, without quoting the value. */
+  @Test
+  fun coerce_serializerThatThrows_namesTheExceptionClass() {
+    // Act
+    val error =
+      assertFailsWith<NodeInputValidationException> { codec<CodecFaulty>().coerce("x", "input") }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "input does not match")
+    assertContains(error.message.orEmpty(), "(NullPointerException).")
   }
 
   @Test

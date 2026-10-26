@@ -19,6 +19,7 @@
 package com.google.adk.kt.workflow
 
 import com.google.adk.kt.agents.Context
+import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.ResumabilityConfig
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
@@ -30,6 +31,7 @@ import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.serialization.jsonElementToAny
 import com.google.adk.kt.sessions.Session
 import com.google.adk.kt.sessions.SessionKey
+import com.google.adk.kt.testing.DummyModel
 import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Part
@@ -41,12 +43,14 @@ import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable private data class RelaxedOrder(val item: String, val quantity: Int)
@@ -67,6 +71,34 @@ private data class RelaxedNotedOrder(val item: String, val quantity: Int, val no
 @Serializable private data class RelaxedLine(val stock: RelaxedStock)
 
 @Serializable private data class RelaxedNeedLine(val stock: RelaxedStockNeed)
+
+@Serializable
+private data class RelaxedOptionalNoteOrder(
+  val item: String,
+  val quantity: Int,
+  val note: String? = null,
+)
+
+@Serializable private data class RelaxedDecimalOrder(val item: String, val quantity: Double)
+
+@Serializable
+private enum class RelaxedPriority {
+  LOW,
+  HIGH,
+}
+
+@Serializable
+private sealed interface RelaxedShape {
+  @Serializable @SerialName("Circle") data class Circle(val r: Double) : RelaxedShape
+
+  @Serializable @SerialName("Square") data class Square(val a: Double) : RelaxedShape
+}
+
+@Serializable private data class RelaxedShapeBox(val shape: RelaxedShape)
+
+@Serializable @JvmInline private value class RelaxedUserId(val raw: String)
+
+@Serializable private data class RelaxedTree(val label: String, val children: List<RelaxedTree>)
 
 /** Runs [workflow] through [InMemoryRunner] on the user [message]: its events and final session. */
 private fun runApp(workflow: Workflow, message: String = "go"): Pair<List<Event>, Session> =
@@ -566,6 +598,206 @@ class RelaxedInputsRunnerTest {
     // Assert
     assertEquals("1001", ticketId)
     assertEquals("7", digit)
+  }
+
+  @Test
+  fun edgeCheck_wideningEdge_buildsAndDeliversTheValue() {
+    // Arrange
+    val order = node<Any?, RelaxedOrder>("order") { _, _ -> RelaxedOrder("pen", 2) }
+    val cases =
+      listOf<Pair<Workflow, Any?>>(
+        // a class fits its nullable form.
+        chain(order, node("maybe_order") { _, o: RelaxedOrder? -> o?.item }) to "pen",
+        // a Long, even one beyond Int's range, fits a Double.
+        chain(
+          node<Any?, Long>("long") { _, _ -> 3_000_000_000L },
+          node("fraction") { _, d: Double -> d / 4_000_000_000 },
+        ) to 0.75,
+        // an enum fits a String.
+        chain(
+          node<Any?, RelaxedPriority>("priority") { _, _ -> RelaxedPriority.HIGH },
+          node("label") { _, s: String -> s },
+        ) to "HIGH",
+        // a class field widens from Int to Double.
+        chain(order, node("quarter") { _, o: RelaxedDecimalOrder -> o.quantity / 4 }) to 0.5,
+        // a Map<String, Any?> takes every field.
+        chain(order, node("fields") { _, m: Map<String, Any?> -> m }) to
+          mapOf("item" to "pen", "quantity" to 2L),
+        // a sealed type's concrete subclass is an ordinary class.
+        chain(
+          node<Any?, RelaxedShape.Circle>("circle") { _, _ -> RelaxedShape.Circle(1.5) },
+          node("radius") { _, c: RelaxedShape.Circle -> c.r },
+        ) to 1.5,
+        // a value class and the String it wraps fit each other both ways.
+        chain(
+          node<Any?, RelaxedUserId>("user") { _, _ -> RelaxedUserId("u1") },
+          node("raw") { _, s: String -> s },
+        ) to "u1",
+        chain(
+          node<Any?, String>("name") { _, _ -> "u2" },
+          node("user_id") { _, id: RelaxedUserId -> id.raw },
+        ) to "u2",
+      )
+
+    // Act
+    val outputs = cases.map { (workflow, _) -> lastOutput(workflow) }
+
+    // Assert
+    assertEquals(cases.map { it.second }, outputs)
+  }
+
+  @Test
+  fun edgeCheck_narrowingOrLossyEdge_failsAtBuild() {
+    // Arrange
+    val order = node<Any?, RelaxedOrder>("order") { _, _ -> RelaxedOrder("pen", 2) }
+    val orderReply =
+      Schema(
+        type = Type.OBJECT,
+        properties =
+          mapOf("item" to Schema(type = Type.STRING), "quantity" to Schema(type = Type.INTEGER)),
+        required = listOf("item", "quantity"),
+      )
+    val edges =
+      listOf<Pair<Node, Node>>(
+        // an Int is not a String.
+        node<Any?, Int>("count") { _, _ -> 1 } to node("text") { _, s: String -> s },
+        // list elements narrow from Double to Int.
+        node<Any?, List<Double>>("doubles") { _, _ -> listOf(1.5) } to
+          node("ints") { _, l: List<Int> -> l.sum() },
+        // a class field narrows from String? to String.
+        node<Any?, RelaxedOptionalNoteOrder>("maybe_noted") { _, _ ->
+          RelaxedOptionalNoteOrder("pen", 1)
+        } to node("noted") { _, o: RelaxedNotedOrder -> o.note },
+        // an Event is closed and lacks the order's fields.
+        order to node("read_event") { _, e: Event -> e.author },
+        // a Content lacks the fields an agent's output schema declares.
+        LlmAgent(name = "agent", model = DummyModel("model"), outputSchema = orderReply) to
+          node("read_reply") { _, c: Content -> c.text() },
+      )
+
+    // Act
+    val errors = edges.map { (from, to) ->
+      assertFailsWith<GraphValidationException> { runApp(chain(from, to)) }
+    }
+
+    // Assert
+    for ((error, edge) in errors.zip(edges)) {
+      assertContains(error.message.orEmpty(), "${edge.first.name} -> ${edge.second.name}")
+    }
+  }
+
+  @Test
+  fun handWrittenInputSchema_openOrClosed_keepsAnUnlistedFieldOrFailsAtBuild() {
+    // Arrange
+    val stock = node<Any?, RelaxedStock>("stock") { _, _ -> RelaxedStock("pen") }
+    val idOnly =
+      Schema(
+        type = Type.OBJECT,
+        properties = mapOf("id" to Schema(type = Type.STRING)),
+        required = listOf("id"),
+      )
+    fun check(schema: Schema) = node<Any?, Any?>("check", inputSchema = schema) { _, v -> v }
+
+    // Act
+    val open = lastOutput(chain(stock, check(idOnly)))
+    val closed =
+      assertFailsWith<GraphValidationException> {
+        runApp(chain(stock, check(idOnly.copy(additionalProperties = false))))
+      }
+
+    // Assert: an open schema passes the extra field through; a closed one fails at build.
+    assertEquals(mapOf("id" to "pen", "quantity" to 1L), open)
+    assertContains(closed.message.orEmpty(), "stock -> check")
+  }
+
+  @Test
+  fun typedPort_valueOutsideItsJsonForm_failsAtRun() {
+    // Arrange: an Any? producer declares no output schema, so only the port's decode checks it.
+    fun producing(value: Any) = node<Any?, Any?>("produce") { _, _ -> value }
+    val cases =
+      listOf<Pair<Node, Node>>(
+        // "on" is not a JSON boolean literal.
+        producing("on") to node("negate") { _, b: Boolean -> !b },
+        // a plain String is data, so it is not parsed as JSON.
+        producing("""{"item": "pen", "quantity": 2}""") to
+          node("quantity") { _, o: RelaxedOrder -> o.quantity },
+        // a ByteArray port takes base64 text, not a list of numbers.
+        producing(listOf(1, 2)) to node("size") { _, b: ByteArray -> b.size },
+      )
+
+    // Act
+    val errors = cases.map { (producer, port) ->
+      assertFailsWith<NodeInputValidationException> { runApp(chain(producer, port)) }
+    }
+
+    // Assert
+    for ((error, case) in errors.zip(cases)) {
+      assertContains(error.message.orEmpty(), "input of node '${case.second.name}' does not match")
+    }
+  }
+
+  @Test
+  fun sealedField_handWrittenMap_readsByItsDiscriminatorOrFails() {
+    // Arrange
+    val received = mutableListOf<RelaxedShapeBox>()
+    val readBox = node<RelaxedShapeBox, Unit>("read_box") { _, box -> received += box }
+    fun producing(shape: Map<String, Any>) =
+      node<Any?, Any?>("produce") { _, _ -> mapOf("shape" to shape) }
+
+    // Act
+    val unused = runApp(chain(producing(mapOf("type" to "Circle", "r" to 1.0)), readBox))
+    val missingType =
+      assertFailsWith<NodeInputValidationException> {
+        runApp(chain(producing(mapOf("r" to 1.0)), readBox))
+      }
+
+    // Assert: a map with a discriminator selects the subclass; one without it fails.
+    assertEquals(listOf(RelaxedShapeBox(RelaxedShape.Circle(1.0))), received)
+    assertContains(missingType.message.orEmpty(), "input of node 'read_box' does not match")
+  }
+
+  @Test
+  fun uncheckedSource_eventOutputOrRecursiveClass_isDecodedAtRun() {
+    // Arrange: neither producer has an output schema, so the edge builds and the port decides.
+    val event =
+      node<Any?, Event>("event") { _, _ -> Event(output = mapOf("item" to "pen", "quantity" to 2)) }
+    val quantity = node("quantity") { _, o: RelaxedOrder -> o.quantity }
+    val tree =
+      node<Any?, RelaxedTree>("tree") { _, _ ->
+        RelaxedTree("root", listOf(RelaxedTree("leaf", emptyList())))
+      }
+    val leaves = node("leaves") { _, t: RelaxedTree -> t.children.map { it.label } }
+    val treeJson = """{"label": "root", "children": [{"label": "leaf", "children": []}]}"""
+
+    // Act
+    val fromEvent = lastOutput(chain(event, quantity))
+    val fromTree = lastOutput(chain(tree, leaves))
+    val fromMessage = lastOutput(chain(leaves), treeJson)
+
+    // Assert
+    assertNull(event.outputSchema)
+    assertNull(tree.outputSchema)
+    assertNull(leaves.inputSchema)
+    assertEquals(2L, fromEvent)
+    assertEquals(listOf("leaf"), fromTree)
+    assertEquals(listOf("leaf"), fromMessage)
+  }
+
+  @Test
+  fun mapPort_stringKeysIntoIntKeys_failsAtRunOnANonNumericKey() {
+    // Arrange: a map schema does not describe its keys, so the edge builds either way.
+    fun names(vararg keys: String) =
+      node<Any?, Map<String, String>>("names") { _, _ -> keys.associateWith { "a" } }
+    val byNumber = node("by_number") { _, m: Map<Int, String> -> m.keys.sum() }
+
+    // Act
+    val numeric = lastOutput(chain(names("1", "2"), byNumber))
+    val error =
+      assertFailsWith<NodeInputValidationException> { runApp(chain(names("x"), byNumber)) }
+
+    // Assert
+    assertEquals(3L, numeric)
+    assertContains(error.message.orEmpty(), "key of input of node 'by_number' does not match")
   }
 }
 

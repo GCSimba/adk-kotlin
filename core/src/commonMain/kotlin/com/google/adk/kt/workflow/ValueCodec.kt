@@ -29,6 +29,7 @@ import com.google.adk.kt.serialization.jsonElementToAny
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Schema
 import com.google.genai.kotlin.types.ByteArrayAsBase64Serializer
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.reflect.KClass
 import kotlin.reflect.KType
 import kotlinx.serialization.KSerializer
@@ -171,12 +172,13 @@ internal class ValueCodec<T>(val kType: KType) : PortCodec<T> {
           serializer,
           readLiterals(jsonOf(value), serializer.descriptor),
         )
-      } catch (e: IllegalArgumentException) {
-        // Also catches SerializationException; its message can quote the value, so no cause.
-        throw NodeInputValidationException("validation error: $what does not match $kType.")
-      } catch (e: IndexOutOfBoundsException) {
-        // kotlinx throws this for an object read as a primitive, such as a Content's JSON form.
-        throw NodeInputValidationException("validation error: $what does not match $kType.")
+      } catch (e: CancellationException) {
+        throw e
+      } catch (e: Exception) {
+        // Any decode failure names the port and what threw; its message can quote the value.
+        throw NodeInputValidationException(
+          "validation error: $what does not match $kType (${e::class.simpleName})."
+        )
       }
     }
     val actualTypeName = value::class.simpleName ?: "unknown"
