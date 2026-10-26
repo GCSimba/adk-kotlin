@@ -28,9 +28,11 @@ import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.api.gax.paging.Page
 import com.google.cloud.storage.Blob as GcsBlob
+import com.google.cloud.storage.BlobId
 import com.google.cloud.storage.BlobInfo
 import com.google.cloud.storage.Storage
 import com.google.cloud.storage.Storage.BlobListOption
+import com.google.cloud.storage.StorageException
 import com.google.common.truth.Truth.assertThat
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -42,6 +44,7 @@ import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.doThrow
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
+import org.mockito.kotlin.never
 import org.mockito.kotlin.stub
 import org.mockito.kotlin.verify
 
@@ -160,7 +163,7 @@ class GcsArtifactServiceTest {
 
     val mockPage = mock<Page<GcsBlob>> { on { iterateAll() } doReturn emptyList() }
 
-    val storageException = com.google.cloud.storage.StorageException(412, "Precondition Failed")
+    val storageException = StorageException(412, "Precondition Failed: $FILENAME")
 
     storage.stub {
       on { list(eq(bucketName), any<BlobListOption>()) } doReturn mockPage
@@ -173,6 +176,136 @@ class GcsArtifactServiceTest {
         service.saveArtifact(SESSION_KEY, FILENAME, artifact)
       }
     assertThat(error).hasMessageThat().doesNotContain(FILENAME)
+    assertCausedBy(error, storageException)
+  }
+
+  @Test
+  fun saveArtifact_listFailsWithNon404_propagatesError() = runTest {
+    val artifact =
+      Part(inlineData = Blob(data = "test content".toByteArray(), mimeType = "text/plain"))
+    val storageException = listFailure()
+
+    storage.stub {
+      on { list(eq(bucketName), any<BlobListOption>()) } doThrow storageException
+    }
+
+    val error =
+      assertFailsWith<IllegalStateException> {
+        service.saveArtifact(SESSION_KEY, FILENAME, artifact)
+      }
+    assertThat(error).hasMessageThat().contains("HTTP 500")
+    assertThat(error).hasMessageThat().doesNotContain(FILENAME)
+    assertThat(error).hasMessageThat().doesNotContain(USER_ID)
+    assertThat(error).hasMessageThat().doesNotContain(SESSION_ID)
+    assertCausedBy(error, storageException)
+    verify(storage, never())
+      .create(any<BlobInfo>(), any<ByteArray>(), any<Storage.BlobTargetOption>())
+  }
+
+  @Test
+  fun loadArtifact_listFailsWithNon404_propagatesError() = runTest {
+    val storageException = listFailure()
+
+    storage.stub {
+      on { list(eq(bucketName), any<BlobListOption>()) } doThrow storageException
+    }
+
+    val error =
+      assertFailsWith<IllegalStateException> {
+        service.loadArtifact(SESSION_KEY, FILENAME, version = null)
+      }
+    assertThat(error).hasMessageThat().contains("HTTP 500")
+    assertThat(error).hasMessageThat().doesNotContain(FILENAME)
+    assertThat(error).hasMessageThat().doesNotContain(USER_ID)
+    assertThat(error).hasMessageThat().doesNotContain(SESSION_ID)
+    assertCausedBy(error, storageException)
+  }
+
+  @Test
+  fun deleteArtifact_listFailsWithNon404_propagatesError() = runTest {
+    val storageException = listFailure()
+
+    storage.stub {
+      on { list(eq(bucketName), any<BlobListOption>()) } doThrow storageException
+    }
+
+    val error =
+      assertFailsWith<IllegalStateException> {
+        service.deleteArtifact(SESSION_KEY, FILENAME)
+      }
+    assertThat(error).hasMessageThat().contains("HTTP 500")
+    assertThat(error).hasMessageThat().doesNotContain(FILENAME)
+    assertThat(error).hasMessageThat().doesNotContain(USER_ID)
+    assertThat(error).hasMessageThat().doesNotContain(SESSION_ID)
+    assertCausedBy(error, storageException)
+    verify(storage, never()).delete(any<Iterable<BlobId>>())
+  }
+
+  @Test
+  fun listVersions_listFailsWith404_returnsEmptyList() = runTest {
+    storage.stub {
+      on { list(eq(bucketName), any<BlobListOption>()) } doThrow
+        StorageException(404, "Not Found")
+    }
+
+    val versions = service.listVersions(SESSION_KEY, FILENAME)
+
+    assertThat(versions).isEmpty()
+  }
+
+  @Test
+  fun listVersions_listFailsWithNon404_propagatesError() = runTest {
+    val storageException = listFailure()
+
+    storage.stub {
+      on { list(eq(bucketName), any<BlobListOption>()) } doThrow storageException
+    }
+
+    val error =
+      assertFailsWith<IllegalStateException> {
+        service.listVersions(SESSION_KEY, FILENAME)
+      }
+    assertThat(error).hasMessageThat().contains("HTTP 500")
+    assertThat(error).hasMessageThat().doesNotContain(FILENAME)
+    assertThat(error).hasMessageThat().doesNotContain(USER_ID)
+    assertThat(error).hasMessageThat().doesNotContain(SESSION_ID)
+    // Coroutine stack trace recovery adds a different number of wrappers on different JDKs.
+    assertCausedBy(error, storageException)
+  }
+
+  @Test
+  fun saveAndReloadArtifact_listFailsWithNon404_propagatesError() = runTest {
+    val artifact =
+      Part(inlineData = Blob(data = "test content".toByteArray(), mimeType = "text/plain"))
+    val storageException = listFailure()
+
+    storage.stub {
+      on { list(eq(bucketName), any<BlobListOption>()) } doThrow storageException
+    }
+
+    val error =
+      assertFailsWith<IllegalStateException> {
+        service.saveAndReloadArtifact(SESSION_KEY, FILENAME, artifact)
+      }
+    assertThat(error).hasMessageThat().contains("HTTP 500")
+    assertThat(error).hasMessageThat().doesNotContain(FILENAME)
+    assertThat(error).hasMessageThat().doesNotContain(USER_ID)
+    assertThat(error).hasMessageThat().doesNotContain(SESSION_ID)
+    // Coroutine stack trace recovery adds a different number of wrappers on different JDKs.
+    assertCausedBy(error, storageException)
+    verify(storage, never())
+      .create(any<BlobInfo>(), any<ByteArray>(), any<Storage.BlobTargetOption>())
+  }
+
+  private fun listFailure(): StorageException =
+    StorageException(500, "Internal Server Error: $USER_ID/$SESSION_ID/$FILENAME")
+
+  private fun assertCausedBy(error: Throwable, expected: Throwable) {
+    var cause = error.cause
+    while (cause != null && cause !== expected) {
+      cause = cause.cause
+    }
+    assertThat(cause).isSameInstanceAs(expected)
   }
 
   private companion object {

@@ -227,7 +227,12 @@ class GcsArtifactService(private val bucketName: String, private val storageClie
         }
         .sorted()
     } catch (e: StorageException) {
-      emptyList()
+      if (e.code == 404) {
+        emptyList()
+      } else {
+        // Keep caller values out of the top-level message while preserving the cause.
+        throw IllegalStateException("Failed to list artifact versions from GCS (HTTP ${e.code})", e)
+      }
     }
   }
 }
