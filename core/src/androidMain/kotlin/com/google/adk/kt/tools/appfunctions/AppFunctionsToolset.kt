@@ -21,7 +21,7 @@ import android.os.Build
 import androidx.annotation.RequiresApi
 import androidx.appfunctions.AppFunctionException
 import androidx.appfunctions.AppFunctionManager
-import androidx.appfunctions.metadata.AppFunctionName
+import androidx.appfunctions.AppFunctionName
 import androidx.appfunctions.AppFunctionSearchSpec
 import androidx.appfunctions.AppFunctionState
 import androidx.appfunctions.ExecuteAppFunctionRequest

@@ -16,7 +16,7 @@
 
 package com.google.adk.kt.tools.appfunctions
 
-import androidx.appfunctions.metadata.AppFunctionName
+import androidx.appfunctions.AppFunctionName
 import androidx.appfunctions.metadata.AppFunctionAllOfTypeMetadata
 import androidx.appfunctions.metadata.AppFunctionArrayTypeMetadata
 import androidx.appfunctions.metadata.AppFunctionBooleanTypeMetadata

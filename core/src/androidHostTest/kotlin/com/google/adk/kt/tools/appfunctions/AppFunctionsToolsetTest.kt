@@ -30,7 +30,7 @@ import androidx.appfunctions.AppFunctionException
 import androidx.appfunctions.AppFunctionFunctionNotFoundException
 import androidx.appfunctions.AppFunctionInvalidArgumentException
 import androidx.appfunctions.AppFunctionLimitExceededException
-import androidx.appfunctions.metadata.AppFunctionName
+import androidx.appfunctions.AppFunctionName
 import androidx.appfunctions.AppFunctionNotSupportedException
 import androidx.appfunctions.AppFunctionPermissionRequiredException
 import androidx.appfunctions.AppFunctionSearchSpec

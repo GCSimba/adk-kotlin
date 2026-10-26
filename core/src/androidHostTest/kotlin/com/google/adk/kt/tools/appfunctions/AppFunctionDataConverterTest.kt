@@ -19,7 +19,7 @@ package com.google.adk.kt.tools.appfunctions
 import android.app.PendingIntent
 import android.content.Intent
 import androidx.appfunctions.AppFunctionData
-import androidx.appfunctions.metadata.AppFunctionName
+import androidx.appfunctions.AppFunctionName
 import androidx.appfunctions.ExecuteAppFunctionResponse
 import androidx.appfunctions.metadata.AppFunctionAllOfTypeMetadata
 import androidx.appfunctions.metadata.AppFunctionArrayTypeMetadata
