@@ -114,6 +114,18 @@ private class CountingTransferModel(private val target: String) : Model {
   }
 }
 
+/** An agent that asks for input on its first run and outputs [value] once answered. */
+private class AskingAgent(name: String, private val value: String) : BaseAgent(name = name) {
+  override val rerunOnResume: Boolean = true
+
+  override fun runAsyncImpl(context: InvocationContext): Flow<Event> = flow {}
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    if (context.resumeInputs.isEmpty()) emit(RequestInput(interruptId = "ask_$name"))
+    else emit(value)
+  }
+}
+
 /** Answers every call with [text] and counts the calls. */
 private class CountingReplyModel(private val text: String) : Model {
   var calls = 0
@@ -479,6 +491,161 @@ class AgentTransferLoopTest {
     val reply = events.single { it.author == "child" && it.contentText() == "approved" }
     assertEquals("wf@1/coordinator@1/child@1", reply.nodeInfo?.path)
     assertEquals(approval.branch, reply.branch)
+  }
+
+  @Test
+  fun runAsync_peerTransferTargetPausedThenAnswered_resumesTarget() = runBlocking {
+    // Arrange: the first sibling hands off to the second, which waits on a long-running approval.
+    val approve = DummyTool("approve", isLongRunning = true, onRun = { _, _ -> Unit })
+    val first = chatAgent("first", transferModel("second"))
+    val second =
+      LlmAgent(
+        name = "second",
+        model =
+          DummyModel.createSequential(
+            "m",
+            listOf(
+              modelFunctionCallResponse("approve"),
+              LlmResponse(content = Content.fromText(Role.MODEL, "approved by peer")),
+            ),
+          ),
+        tools = listOf(approve),
+        mode = AgentMode.CHAT,
+      )
+    val unusedRoot = chatAgent("root", replyModel("unused"), subAgents = listOf(first, second))
+    val runner =
+      InMemoryRunner(
+        app =
+          App(
+            appName = "app",
+            rootNode = Workflow(name = "wf", edges = listOf(Edge(Start, first))),
+            resumabilityConfig = ResumabilityConfig(isResumable = true),
+          )
+      )
+    val paused = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+    val approvalId = paused.flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+    val answer = userFunctionResponse("approve", id = approvalId, response = mapOf("ok" to true))
+
+    // Act
+    val events = runner.runAsync("u", "s", newMessage = answer).toList()
+
+    // Assert: the peer target picks up the answer and finishes under its node path.
+    val reply = events.single { it.author == "second" && it.contentText() == "approved by peer" }
+    assertEquals(paused.first().invocationId, reply.invocationId)
+    assertEquals("wf@1/second@1", reply.nodeInfo?.path)
+  }
+
+  @Test
+  fun runAsync_peerTargetAnsweredAfterPausing_outputsOnce() = runBlocking {
+    // Arrange: the first sibling hands off to `asker`, which asks for input and then outputs.
+    val first = chatAgent("first", transferModel("asker"))
+    val asker = AskingAgent("asker", "answered")
+    val unusedRoot = chatAgent("root", replyModel("unused"), subAgents = listOf(first, asker))
+    val runner =
+      InMemoryRunner(
+        app =
+          App(
+            appName = "app",
+            rootNode = Workflow(name = "wf", edges = listOf(Edge(Start, first))),
+            resumabilityConfig = ResumabilityConfig(isResumable = true),
+          )
+      )
+    val unused = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+    val answer =
+      userFunctionResponse(RequestInput.FUNCTION_CALL_NAME, "ask_asker", mapOf("ok" to true))
+
+    // Act
+    val events = runner.runAsync("u", "s", newMessage = answer).toList()
+
+    // Assert: the target's run on resume is not a replay, so its output is not re-emitted.
+    assertEquals(1, events.count { it.output == "answered" }, "${events.map { it.author }}")
+  }
+
+  @Test
+  fun runAsync_parentTransferTargetPausedThenAnswered_resumesTarget() = runBlocking {
+    // Arrange: coordinator -> child -> coordinator again, which then waits on an approval.
+    val approve = DummyTool("approve", isLongRunning = true, onRun = { _, _ -> Unit })
+    val child = chatAgent("child", transferModel("coordinator"))
+    val coordinator =
+      LlmAgent(
+        name = "coordinator",
+        model =
+          DummyModel.createSequential(
+            "m",
+            listOf(
+              transferResponse("child"),
+              modelFunctionCallResponse("approve"),
+              LlmResponse(content = Content.fromText(Role.MODEL, "approved by parent")),
+            ),
+          ),
+        subAgents = listOf(child),
+        tools = listOf(approve),
+        mode = AgentMode.CHAT,
+      )
+    val runner =
+      InMemoryRunner(
+        app =
+          App(
+            appName = "app",
+            rootNode = Workflow(name = "wf", edges = listOf(Edge(Start, coordinator))),
+            resumabilityConfig = ResumabilityConfig(isResumable = true),
+          )
+      )
+    val paused = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+    val approvalId = paused.flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+    val answer = userFunctionResponse("approve", id = approvalId, response = mapOf("ok" to true))
+
+    // Act
+    val events = runner.runAsync("u", "s", newMessage = answer).toList()
+
+    // Assert: the second coordinator run picks up the answer and finishes under its node path.
+    val reply = events.single {
+      it.author == "coordinator" && it.contentText() == "approved by parent"
+    }
+    assertEquals(paused.first().invocationId, reply.invocationId)
+    assertEquals("wf@1/coordinator@2", reply.nodeInfo?.path)
+  }
+
+  @Test
+  fun runAsync_finishedTransferTargetBeforeAPausedNode_letsThatNodeResume() = runBlocking {
+    // Arrange: `first` hands off to `second`, which finishes; the next node, `ask`, then pauses.
+    val first = chatAgent("first", transferModel("second"))
+    val second = OutputAgent("second", "X")
+    val unusedRoot = chatAgent("root", replyModel("unused"), subAgents = listOf(first, second))
+    val approve = DummyTool("approve", isLongRunning = true, onRun = { _, _ -> Unit })
+    val ask =
+      LlmAgent(
+        name = "ask",
+        model =
+          DummyModel.createSequential(
+            "m",
+            listOf(
+              modelFunctionCallResponse("approve"),
+              LlmResponse(content = Content.fromText(Role.MODEL, "approved")),
+            ),
+          ),
+        tools = listOf(approve),
+        mode = AgentMode.TASK,
+      )
+    val runner =
+      InMemoryRunner(
+        app =
+          App(
+            appName = "app",
+            rootNode = Workflow(name = "wf", edges = listOf(Edge(Start, first), Edge(first, ask))),
+            resumabilityConfig = ResumabilityConfig(isResumable = true),
+          )
+      )
+    val paused = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+    val approvalId = paused.flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+    val answer = userFunctionResponse("approve", id = approvalId, response = mapOf("ok" to true))
+
+    // Act
+    val events = runner.runAsync("u", "s", newMessage = answer).toList()
+
+    // Assert: `first` gets its target's output back, so `ask` resumes, and `second` runs once.
+    assertTrue(events.any { it.author == "ask" && it.contentText() == "approved" })
+    assertEquals(1, second.runs)
   }
 
   @Test

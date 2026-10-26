@@ -367,6 +367,7 @@ internal object ResumeScan {
         useAsOutput = useAsOutput,
       )
     val state = context.requireNodeState()
+    state.isReplay = true
     interception.output?.let { context.output = it }
     interception.route?.let {
       context.routes = it

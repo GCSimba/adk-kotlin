@@ -208,13 +208,14 @@ internal class Scheduler(
           interception.transferToAgent != null &&
             recoveredNode.interruptIds.isNotEmpty() &&
             recoveredNode.unresolved.isEmpty()
+        // A recorded transfer hands off again: a paused target resumes, a finished one gives its
+        // output back, and a plain node fails.
+        val followsTransfer = interception.transferToAgent != null
         if (!completesTransfer) replayed.add(nodeName)
         val replayContext =
           ResumeScan.replayContext(context, node, runId, useAsOutput, interception)
-        // An answered transfer hands off again, which fails for a node that is not an agent.
         running[nodeName] =
-          if (completesTransfer) dispatch(firstHop = replayContext)
-          else scope.async { replayContext }
+          if (followsTransfer) dispatch(firstHop = replayContext) else scope.async { replayContext }
         return completesTransfer
       }
       running[nodeName] = dispatch(firstHop = null)
@@ -228,7 +229,8 @@ internal class Scheduler(
 
   private suspend fun handleCompletion(nodeName: String, childContext: Context) {
     val state = nodeStates.getValue(nodeName)
-    val wasReplayed = replayed.remove(nodeName)
+    // A followed transfer whose last hop really ran is not a replay, even if the node was.
+    val wasReplayed = replayed.remove(nodeName) && childContext.requireNodeState().isReplay
 
     if (childContext.interruptIds.isNotEmpty()) {
       state.status = NodeStatus.WAITING

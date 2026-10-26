@@ -1017,6 +1017,9 @@ internal class NodeExecutionState(
   var routesEmitted: Boolean = false
   var failure: NodeExecutionFailure? = null
 
+  /** Whether this activation replays a recorded outcome from history instead of running. */
+  var isReplay: Boolean = false
+
   /** The node's output value, or `null` if none was produced. */
   val output: Any?
     get() =
