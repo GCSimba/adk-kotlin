@@ -57,6 +57,7 @@ import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.Schema
 import com.google.adk.kt.workflow.NodeInfo
 import com.google.adk.kt.workflow.WorkflowConfigurationException
+import com.google.adk.kt.workflow.isValidNodeName
 import kotlin.jvm.JvmStatic
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
@@ -134,7 +135,8 @@ import kotlinx.coroutines.flow.transformWhile
  *   [AgentMode.CHAT] for an agent with a parent or sub-agents, as in Python, and
  *   [AgentMode.SINGLE_TURN] otherwise. A [AgentMode.TASK] agent gains a `finish_task` tool, and a
  *   task or single-turn sub-agent is offered to its parent as a tool rather than as a transfer
- *   target.
+ *   target; it runs as a child node, so building the parent throws [IllegalArgumentException] if
+ *   the sub-agent's name contains `.`.
  * @property maxSteps The maximum number of steps this agent runs within a single invocation, where
  *   a step is one model call plus any tool calls or transfers it triggers. Once the cap is reached
  *   the agent stops emitting further events, even if it has not yet produced a final response.
@@ -176,7 +178,7 @@ class LlmAgent(
   BaseAgent(
     name = name,
     description = description,
-    subAgents = subAgents,
+    subAgents = subAgents.onEach(::requireValidChildNodeName),
     beforeAgentCallbacks = beforeAgentCallbacks,
     afterAgentCallbacks = afterAgentCallbacks,
     disallowTransferToParent = disallowTransferToParent,
@@ -1030,6 +1032,19 @@ class LlmAgent(
     @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
 
     private val logger = LoggerFactory.getLogger(LlmAgent::class)
+
+    /**
+     * Throws [IllegalArgumentException] if [agent] runs as a child node, as a task or single-turn
+     * sub-agent does, and its name can't be a node name. Runs before the parent links its
+     * sub-agents, so a rejected parent leaves them free to reuse.
+     */
+    private fun requireValidChildNodeName(agent: BaseAgent) {
+      if (!(agent as? LlmAgent)?.mode.runsAsTool) return
+      require(isValidNodeName(agent.name)) {
+        "Task or single-turn sub-agent '${agent.name}' runs as a node, so its name must not" +
+          " contain '.'."
+      }
+    }
   }
 }
 

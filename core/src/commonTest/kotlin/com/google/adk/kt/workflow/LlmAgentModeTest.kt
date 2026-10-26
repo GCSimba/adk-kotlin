@@ -1321,6 +1321,134 @@ class LlmAgentModeTest {
   }
 
   @Test
+  fun construction_dottedTaskSubAgent_throwsNamingTheAgent() {
+    // Arrange: a task sub-agent runs as a child node, so its name becomes part of a node path.
+    val worker = taskAgent("billing.desk", ModeScriptedModel(text("unused")))
+
+    // Act
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        coordinator(ModeScriptedModel(text("unused")), listOf(worker))
+      }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "'billing.desk'")
+  }
+
+  @Test
+  fun construction_dottedSingleTurnSubAgent_throwsNamingTheAgent() {
+    // Arrange
+    val helper =
+      LlmAgent("notes.writer", ModeScriptedModel(text("unused")), mode = AgentMode.SINGLE_TURN)
+
+    // Act
+    val error =
+      assertFailsWith<IllegalArgumentException> {
+        coordinator(ModeScriptedModel(text("unused")), listOf(helper))
+      }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "'notes.writer'")
+  }
+
+  @Test
+  fun construction_rejectedParent_leavesSiblingSubAgentFreeToReuse() {
+    // Arrange: the valid sibling comes first, so a late check would already have linked it.
+    val sibling = taskAgent("valid_worker", ModeScriptedModel(text("unused")))
+    val dotted = taskAgent("billing.desk", ModeScriptedModel(text("unused")))
+    val unused =
+      assertFailsWith<IllegalArgumentException> {
+        coordinator(ModeScriptedModel(text("unused")), listOf(sibling, dotted))
+      }
+
+    // Act
+    val parent = coordinator(ModeScriptedModel(text("unused")), listOf(sibling))
+
+    // Assert
+    assertEquals(listOf("valid_worker"), parent.subAgents.map { it.name })
+  }
+
+  @Test
+  fun construction_dottedChatOrUnsetModeSubAgent_isAllowed() {
+    // Arrange: transfer targets of a plain root agent run inline, so any agent name works.
+    val chat = LlmAgent("billing.desk", ModeScriptedModel(text("unused")), mode = AgentMode.CHAT)
+    val unset = LlmAgent("notes.writer", ModeScriptedModel(text("unused")))
+
+    // Act
+    val parent = coordinator(ModeScriptedModel(text("unused")), listOf(chat, unset))
+
+    // Assert
+    assertEquals(listOf("billing.desk", "notes.writer"), parent.subAgents.map { it.name })
+  }
+
+  @Test
+  fun graphOf_dottedTransferTargetUnderAgentNode_isRejected() {
+    // Arrange: inside a workflow, a transfer target runs as a child node of the agent node.
+    val target = LlmAgent("billing.desk", ModeScriptedModel(text("unused")))
+    val lead = coordinator(ModeScriptedModel(text("unused")), listOf(target))
+
+    // Act
+    val error =
+      assertFailsWith<GraphValidationException> { Workflow("wf", listOf(Edge(Start, lead))) }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "[billing.desk]")
+  }
+
+  @Test
+  fun graphOf_dottedSubAgentUnderSequentialAgentNode_isAllowed() {
+    // Arrange: a sequential agent runs its sub-agents inline, so their names stay off node paths.
+    val step = LlmAgent("billing.desk", ModeScriptedModel(text("unused")))
+    val pipeline = SequentialAgent(name = "pipeline", subAgents = listOf(step))
+
+    // Act: building the workflow does not throw.
+    val unused = Workflow("wf", listOf(Edge(Start, pipeline)))
+  }
+
+  @Test
+  fun graphOf_dottedGrandchildThroughLlmAgents_isRejected() {
+    // Arrange: a transfer target's own sub-agents are transfer targets too.
+    val grandchild = LlmAgent("billing.desk", ModeScriptedModel(text("unused")))
+    val child =
+      LlmAgent("support", ModeScriptedModel(text("unused")), subAgents = listOf(grandchild))
+    val lead = coordinator(ModeScriptedModel(text("unused")), listOf(child))
+
+    // Act
+    val error =
+      assertFailsWith<GraphValidationException> { Workflow("wf", listOf(Edge(Start, lead))) }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "[billing.desk]")
+  }
+
+  @Test
+  fun graphOf_dottedSubAgentOfParallelWrappedLlmAgent_isRejected() {
+    // Arrange: each item of a parallel node runs the wrapped agent, which runs transfers as nodes.
+    val target = LlmAgent("billing.desk", ModeScriptedModel(text("unused")))
+    val lead = coordinator(ModeScriptedModel(text("unused")), listOf(target))
+
+    // Act
+    val error =
+      assertFailsWith<GraphValidationException> {
+        Workflow("wf", listOf(Edge(Start, parallelNode(lead))))
+      }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "[billing.desk]")
+  }
+
+  @Test
+  fun graphOf_dottedChildOfSequentialTransferTarget_isAllowed() {
+    // Arrange: the sequential target runs as a node, but runs its own sub-agents inline.
+    val step = LlmAgent("billing.desk", ModeScriptedModel(text("unused")))
+    val pipeline = SequentialAgent(name = "pipeline", subAgents = listOf(step))
+    val lead = coordinator(ModeScriptedModel(text("unused")), listOf(pipeline))
+
+    // Act: building the workflow does not throw.
+    val unused = Workflow("wf", listOf(Edge(Start, lead)))
+  }
+
+  @Test
   fun graphOf_chatAgentAfterNonStartNode_isRejected() {
     // Arrange
     val chatter = LlmAgent("chatter", ModeScriptedModel(text("unused")), mode = AgentMode.CHAT)

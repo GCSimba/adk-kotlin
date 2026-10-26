@@ -897,11 +897,13 @@ class AgentTransferLoopTest {
 
   @Test
   fun runNode_transferToDottedAgentName_failsBeforeTheTargetRuns() = runBlocking {
-    // Arrange: an agent name may contain '.', which would corrupt the hop's node path.
+    // Arrange: an agent name may contain '.', which would corrupt the hop's node path. The agent is
+    // dispatched dynamically, so graph validation does not see its sub-agents.
     val target = chatAgent("billing.desk", replyModel("unused"))
     val coordinator =
       chatAgent("coordinator", transferModel("billing.desk"), subAgents = listOf(target))
-    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, coordinator)))
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, TransferDriverNode(coordinator))))
     val events = mutableListOf<Event>()
 
     // Act

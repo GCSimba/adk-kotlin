@@ -113,12 +113,16 @@ internal fun Node.validateInput(nodeInput: Any?): Any? = asBaseNode(this).valida
 /** Validates that [name] is non-empty and contains no '/', '@', or '.' characters. */
 internal fun validateNodeName(name: String) {
   require(name.isNotEmpty()) { "A node name must not be empty." }
-  // '/' and '@' form node-path segments and '.' separates branch-path segments, so all corrupt it.
-  require('/' !in name && '@' !in name && '.' !in name) {
+  require(isValidNodeName(name)) {
     "A node name must not contain '/', '@', or '.', but '$name' does. Agent names allow these" +
       " characters, so an agent used as a graph node needs one a node path can carry."
   }
 }
+
+/** Whether [name] can be a node name, which [validateNodeName] requires. */
+internal fun isValidNodeName(name: String): Boolean =
+  // '/' and '@' form node-path segments and '.' separates branch-path segments, so all corrupt it.
+  name.isNotEmpty() && '/' !in name && '@' !in name && '.' !in name
 
 /**
  * Validates an explicit [runId] for a child of [nodeName]. It forms the `name@runId` node-path
