@@ -960,6 +960,9 @@ data class ContextFrameworkData(
    * a result, so a retry runs them again. A [copy] of the holder starts with none.
    */
   internal val cancelledNodePaths: MutableMap<String, Unit> = concurrentMutableMapOf()
+
+  /** Run IDs of the nodes that run at the top of the invocation, beside its root node. */
+  internal val topLevelRunIds = ChildRunIds()
 }
 
 /**

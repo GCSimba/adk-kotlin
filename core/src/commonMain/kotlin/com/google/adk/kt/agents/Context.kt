@@ -45,6 +45,7 @@ import com.google.adk.kt.workflow.Route
 import com.google.adk.kt.workflow.ValueCodec
 import com.google.adk.kt.workflow.Workflow
 import com.google.adk.kt.workflow.requireJsonForm
+import com.google.adk.kt.workflow.resolveTransferTarget
 import com.google.adk.kt.workflow.schemaForm
 import com.google.adk.kt.workflow.validateInput
 import com.google.adk.kt.workflow.validateNodeName
@@ -555,7 +556,9 @@ open class Context(
     get() = requireNodeState().isolationScope
 
   /**
-   * Executes [node] as a child of this node activation and returns its output.
+   * Executes [node] as a child of this node activation and returns its output. When [node] is an
+   * agent that hands off with `transfer_to_agent`, the handoffs are followed and the last agent's
+   * output is returned.
    *
    * Child events are recorded under `<thisNodePath>/<node.name>@<runId>`. If [node] fails, this
    * call throws [DynamicNodeFailedException], which fails this node unless the caller catches it.
@@ -588,9 +591,11 @@ open class Context(
    * @throws IllegalStateException if called outside a node activation, if this node does not set
    *   `rerunOnResume = true`, or if this node already produced or delegated its output and
    *   [useAsOutput] is `true`.
-   * @throws IllegalArgumentException if [node]'s name or [runId] is invalid, or if [nodeInput]
-   *   fails [node]'s input schema. A [node][com.google.adk.kt.workflow.node] child's input check
-   *   throws
+   * @throws IllegalArgumentException if [node]'s name or [runId] is invalid, if [nodeInput] fails
+   *   [node]'s input schema, or if a handoff can't be followed: a node that is not an agent
+   *   requests one, or an agent requests one to itself, to an agent its transfer flags forbid, to a
+   *   task or single-turn agent, or to an agent that is not its child, parent or peer. A
+   *   [node][com.google.adk.kt.workflow.node] child's input check throws
    *   [NodeInputValidationException][com.google.adk.kt.workflow.NodeInputValidationException]
    *   instead. A [parallelNode][com.google.adk.kt.workflow.parallelNode] checks each item instead,
    *   and a rejected item fails it.
@@ -701,7 +706,9 @@ open class Context(
 
   /**
    * Runs [node] as a child activation and returns its [Context], replaying a completed or waiting
-   * child on resume.
+   * child on resume. If [node] requests a `transfer_to_agent` handoff, follows the transfer loop
+   * and returns the final agent's [Context]. Calls with the same run ID share one run, handoffs
+   * included.
    */
   @ExperimentalWorkflowApi
   internal suspend fun runNodeForContext(
@@ -723,9 +730,9 @@ open class Context(
         validateRunId(runId, node.name)
         runId
       }
+    val childKey = BranchPath.segment(node.name, id)
     // Input validation runs in the caller so a rejected input fails this node.
     val input = node.validateInput(nodeInput)
-    val childKey = BranchPath.segment(node.name, id)
     // One run per child: concurrent calls and later attempts of this node share its outcome.
     val run = CompletableDeferred<Context>()
     while (true) {
@@ -738,12 +745,20 @@ open class Context(
       }
     }
     try {
-      val childContext =
-        runChild(
+      val first =
+        runDispatchedChild(
           node,
           input,
           id,
-          childKey,
+          useAsOutput,
+          useSubBranch,
+          overrideBranch,
+          overrideIsolationScope,
+        )
+      val childContext =
+        followTransfers(
+          node,
+          first,
           useAsOutput,
           useSubBranch,
           overrideBranch,
@@ -755,7 +770,10 @@ open class Context(
         run.cancel()
         return childContext
       }
-      if (!childContext.keepsItsRun()) ns.childRuns.release(childKey, run)
+      // The first hop decides, so a handoff to a target still waiting for output keeps the run.
+      if (!first.keepsItsRun() || childContext.requireNodeState().failure != null) {
+        ns.childRuns.release(childKey, run)
+      }
       run.complete(childContext)
       return childContext
     } catch (e: Throwable) {
@@ -765,34 +783,154 @@ open class Context(
     }
   }
 
+  /**
+   * Runs the graph node [node] for the workflow scheduler, which already checked it against history
+   * and worked out its [resumeInputs], then follows any `transfer_to_agent` handoff it requests and
+   * returns the context of the agent that ends the loop. If [firstHop] is set, it is a finished run
+   * of [node] with a recorded transfer: [node] does not run again, and the loop starts from that
+   * transfer. [node] validates its own input.
+   */
   @ExperimentalWorkflowApi
-  private suspend fun runChild(
+  internal suspend fun runGraphNode(
     node: Node,
-    input: Any?,
-    id: String,
-    childKey: String,
+    nodeInput: Any?,
+    runId: String,
+    useAsOutput: Boolean,
+    useSubBranch: Boolean,
+    overrideBranch: String?,
+    overrideIsolationScope: String?,
+    resumeInputs: Map<String, Any?>,
+    firstHop: Context?,
+  ): Context {
+    val first =
+      firstHop
+        ?: runChild(
+          node,
+          nodeInput,
+          runId,
+          useAsOutput,
+          useSubBranch,
+          overrideBranch,
+          overrideIsolationScope,
+          resumeInputs = resumeInputs,
+          validateInput = true,
+        )
+    return followTransfers(
+      node,
+      first,
+      useAsOutput,
+      useSubBranch,
+      overrideBranch,
+      overrideIsolationScope,
+    )
+  }
+
+  /**
+   * Follows the `transfer_to_agent` handoffs that [first], a run of [node] under this activation,
+   * requests, and returns the context of the agent that ends the loop.
+   */
+  @ExperimentalWorkflowApi
+  private suspend fun followTransfers(
+    node: Node,
+    first: Context,
     useAsOutput: Boolean,
     useSubBranch: Boolean,
     overrideBranch: String?,
     overrideIsolationScope: String?,
   ): Context {
-    val recovered = recoveredChildren[childKey]
+    var parentContext: Context? = this
+    var current = node
+    var childContext = first
+    while (true) {
+      val childState = childContext.requireNodeState()
+      if (childState.failure != null || childState.interruptIds.isNotEmpty()) return childContext
+      val targetName = childContext.actions.transferToAgent ?: return childContext
+      require(current is BaseAgent) { "Only agents can request an agent transfer." }
+      val target = resolveTransferTarget(targetName, current, childContext, parentContext)
+      val parent = target.parent
+      parentContext = parent
+      current = target.agent
+      validateNodeName(current.name)
+      if (parent == null) {
+        childContext =
+          NodeRunner.runAtTopLevel(current, generateSequence(this) { it.parent }.last())
+        continue
+      }
+      val id = parent.requireNodeState().nextChildRunId(current.name)
+      childContext =
+        parent.runDispatchedChild(
+          node = current,
+          input = null,
+          id = id,
+          // Only a run under this node can stand in for this node's output.
+          useAsOutput = useAsOutput && parent === this,
+          useSubBranch = useSubBranch,
+          overrideBranch = overrideBranch,
+          overrideIsolationScope = overrideIsolationScope,
+        )
+    }
+  }
+
+  /**
+   * Runs the dispatched child [node] under this activation, or replays it when history shows it
+   * finished or waits. Its caller already validated [input].
+   */
+  @ExperimentalWorkflowApi
+  private suspend fun runDispatchedChild(
+    node: Node,
+    input: Any?,
+    id: String,
+    useAsOutput: Boolean,
+    useSubBranch: Boolean,
+    overrideBranch: String?,
+    overrideIsolationScope: String?,
+  ): Context {
+    val childKey = BranchPath.segment(node.name, id)
     val interception =
       ResumeScan.intercept(
         node,
-        recovered,
+        recoveredChildren[childKey],
         dynamic = true,
         cancelledMidRun = isCancelledMidRun(childKey),
       )
     if (!interception.shouldRun) {
       return ResumeScan.replayContext(this, node, id, useAsOutput, interception)
     }
-    return NodeRunner(
+    return runChild(
+      node,
+      input,
+      id,
+      useAsOutput,
+      useSubBranch,
+      overrideBranch,
+      overrideIsolationScope,
+      resumeInputs = interception.resumeInputs,
+      validateInput = false,
+    )
+  }
+
+  /**
+   * Runs [node] under this activation with [resumeInputs]. With [validateInput], as for a graph
+   * node, [node] validates [input] itself.
+   */
+  @ExperimentalWorkflowApi
+  private suspend fun runChild(
+    node: Node,
+    input: Any?,
+    id: String,
+    useAsOutput: Boolean,
+    useSubBranch: Boolean,
+    overrideBranch: String?,
+    overrideIsolationScope: String?,
+    resumeInputs: Map<String, Any?>,
+    validateInput: Boolean,
+  ): Context =
+    NodeRunner(
         node = node,
         parent = this,
         runId = id,
         useAsOutput = useAsOutput,
-        resumeInputs = interception.resumeInputs,
+        resumeInputs = resumeInputs,
         useSubBranch = useSubBranch,
         overrideBranch = overrideBranch,
         // A task agent works in a scope of its own unless the caller picks one.
@@ -802,8 +940,7 @@ open class Context(
               (node as? LlmAgent)?.mode == AgentMode.TASK
             },
       )
-      .run(input, validateInput = false)
-  }
+      .run(input, validateInput = validateInput)
 
   /**
    * Whether this finished child's run stays shared: a failed child runs again, and so does a

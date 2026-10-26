@@ -189,6 +189,20 @@ internal class Scheduler(
           recoveredNode,
           cancelledMidRun = context.isCancelledMidRun(childKey),
         )
+      // Follows an agent node's transfer_to_agent too.
+      fun dispatch(firstHop: Context?) = scope.async {
+        context.runGraphNode(
+          node = node,
+          nodeInput = trigger.input,
+          runId = runId,
+          useAsOutput = useAsOutput,
+          useSubBranch = trigger.useSubBranch,
+          overrideBranch = trigger.branch,
+          overrideIsolationScope = taskScopeFor(nodeName, runId),
+          resumeInputs = interception.resumeInputs,
+          firstHop = firstHop,
+        )
+      }
       if (recoveredNode != null && !interception.shouldRun) {
         val completesTransfer =
           interception.transferToAgent != null &&
@@ -197,23 +211,13 @@ internal class Scheduler(
         if (!completesTransfer) replayed.add(nodeName)
         val replayContext =
           ResumeScan.replayContext(context, node, runId, useAsOutput, interception)
-        running[nodeName] = scope.async { replayContext }
+        // An answered transfer hands off again, which fails for a node that is not an agent.
+        running[nodeName] =
+          if (completesTransfer) dispatch(firstHop = replayContext)
+          else scope.async { replayContext }
         return completesTransfer
       }
-
-      running[nodeName] = scope.async {
-        NodeRunner(
-            node = node,
-            parent = context,
-            runId = runId,
-            useAsOutput = useAsOutput,
-            resumeInputs = interception.resumeInputs,
-            useSubBranch = trigger.useSubBranch,
-            overrideBranch = trigger.branch,
-            overrideIsolationScope = taskScopeFor(nodeName, runId),
-          )
-          .run(trigger.input)
-      }
+      running[nodeName] = dispatch(firstHop = null)
       return true
     }
   }

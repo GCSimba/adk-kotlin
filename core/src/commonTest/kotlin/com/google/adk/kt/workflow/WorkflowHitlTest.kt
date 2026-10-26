@@ -18,7 +18,9 @@
 
 package com.google.adk.kt.workflow
 
+import com.google.adk.kt.agents.BaseAgent
 import com.google.adk.kt.agents.Context
+import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.ResumabilityConfig
 import com.google.adk.kt.agents.TypedData
@@ -34,6 +36,7 @@ import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.runners.InMemoryRunner
 import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.sessions.SessionKey
+import com.google.adk.kt.testing.DummyAgent
 import com.google.adk.kt.testing.DummyModel
 import com.google.adk.kt.testing.DummyTool
 import com.google.adk.kt.testing.modelFunctionCallResponse
@@ -299,11 +302,16 @@ private class MessageOutput(
   }
 }
 
-/** Pauses on a long-running call and asks to transfer to another agent in the same event. */
-private class TransferAfterInterrupt(override val name: String) : Node {
-  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+/**
+ * An agent that pauses on a long-running call and hands off to its sub-agent `other` in the same
+ * event.
+ */
+private class TransferAfterInterrupt(name: String) :
+  BaseAgent(name = name, subAgents = listOf(DummyAgent("other"))) {
+  override fun runAsyncImpl(context: InvocationContext): Flow<Event> = flow {
     emit(
       Event(
+        author = name,
         content =
           Content(
             role = Role.MODEL,

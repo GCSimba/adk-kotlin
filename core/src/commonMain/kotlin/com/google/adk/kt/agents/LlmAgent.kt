@@ -377,13 +377,19 @@ class LlmAgent(
     val agentContext = agentContext(context, AgentMode.SINGLE_TURN)
     var outputMarked = false
     try {
-      runAsync(agentContext).collect { event ->
-        if (event.author.isNotEmpty()) context.eventAuthor = event.author
-        // Only the first final turn is the output; later content is not a second one.
-        val marked = if (outputMarked) event else markOutputIfFinalTurn(event)
-        outputMarked = outputMarked || marked !== event
-        emit(marked)
-      }
+      emitAll(
+        runAsync(agentContext).transformWhile { event ->
+          if (event.author.isNotEmpty()) context.eventAuthor = event.author
+          // Only the first final turn is the output; later content is not a second one.
+          val marked = if (outputMarked) event else markOutputIfFinalTurn(event)
+          outputMarked = outputMarked || marked !== event
+          emit(marked)
+          // Leave the handoff to the dispatch loop, so the target runs once, as a node.
+          if (event.actions.transferToAgent == null) return@transformWhile true
+          endRunAtHandoff(agentContext)
+          false
+        }
+      )
     } finally {
       // The input is for this run only, so later nodes on the branch do not see it.
       if (injected != null) context.invocationContext.session.events.remove(injected)
@@ -417,7 +423,8 @@ class LlmAgent(
    * Runs this agent on [agentContext], running its task sub-agents along the way. Each round runs
    * the agent until the model delegates tasks or ends. The delegated tasks then run as child nodes,
    * in each call's own isolation scope, and their answers start the next round. With a
-   * [finishTool], the run ends once a `finish_task` call succeeds.
+   * [finishTool], the run ends once a `finish_task` call succeeds; a `transfer_to_agent` ends it
+   * too, so the dispatch loop runs the target as a node.
    */
   private fun runWithDelegations(
     context: Context,
@@ -431,10 +438,10 @@ class LlmAgent(
       val round = DelegationRound()
       emitAll(
         runAsync(agentContext).transformWhile { event ->
-          emitRoundEvent(context, event, round, finish, toolsByName)
+          emitRoundEvent(context, agentContext, event, round, finish, toolsByName)
         }
       )
-      if (round.delegations.isEmpty()) return@flow
+      if (round.transferred || round.delegations.isEmpty()) return@flow
       for (call in round.delegations) emitTaskResponse(context, call)
       if (!canStartNextRound(round, agentContext)) return@flow
     }
@@ -447,6 +454,9 @@ class LlmAgent(
 
     /** Long-running calls of this round that no response has answered yet. */
     val pendingLongRunningCalls = mutableSetOf<String>()
+
+    /** Whether the round ended at a `transfer_to_agent` handoff. */
+    var transferred = false
   }
 
   /** The `finish_task` tool of a task run and the arguments of its latest call. */
@@ -461,6 +471,7 @@ class LlmAgent(
    */
   private suspend fun FlowCollector<Any?>.emitRoundEvent(
     context: Context,
+    agentContext: InvocationContext,
     event: Event,
     round: DelegationRound,
     finish: FinishState?,
@@ -491,6 +502,7 @@ class LlmAgent(
       }
     }
     emit(event)
+    if (event.actions.transferToAgent != null) return endRoundAtHandoff(agentContext, round)
     round.delegations = taskDelegationsIn(event, toolsByName)
     return round.delegations.isEmpty() || hasEagerToolCalls(event, toolsByName)
   }
@@ -552,6 +564,28 @@ class LlmAgent(
     val args = finish.args
     if (args == null || !FinishTaskTool.isTerminalResponse(event)) return null
     return FinishStep.Done(finish.tool.taskOutput(args))
+  }
+
+  /**
+   * Leaves a `transfer_to_agent` handoff to the dispatch loop, so the target runs once, as a node.
+   * Ends this agent's run when the invocation is resumable, and returns false to end the round.
+   */
+  private suspend fun FlowCollector<Any?>.endRoundAtHandoff(
+    agentContext: InvocationContext,
+    round: DelegationRound,
+  ): Boolean {
+    round.transferred = true
+    endRunAtHandoff(agentContext)
+    return false
+  }
+
+  /**
+   * Ends this agent's run at a handoff when [context] is resumable, so a resume does not rerun it.
+   */
+  private suspend fun FlowCollector<Any?>.endRunAtHandoff(context: InvocationContext) {
+    if (!context.isResumable) return
+    context.setAgentState(name, endOfAgent = true)
+    emitEndOfAgent(context)
   }
 
   /** Answers the delegations an earlier turn left unanswered; a task resumes only its own. */

@@ -368,6 +368,19 @@ private constructor(
 
   companion object {
     /**
+     * Runs [node] at the top of the invocation, beside the root node that [root] ran, and returns
+     * its context.
+     */
+    suspend fun runAtTopLevel(node: Node, root: Context): Context =
+      NodeRunner(
+          node = node,
+          invocationContext = root.invocationContext,
+          eventSink = root.requireNodeState().eventSink,
+          runId = root.invocationContext.frameworkData.topLevelRunIds.next(node.name),
+        )
+        .run(nodeInput = null)
+
+    /**
      * Runs [node] as the root of [context]; only the [com.google.adk.kt.runners.Runner] should
      * collect it. Each non-partial event suspends the emitting node until the Runner persists and
      * emits it, so a successor sees committed state deltas and an error event is stored before its
@@ -379,6 +392,7 @@ private constructor(
     @Suppress("UnsafeCoroutineCrossing")
     fun runRoot(node: Node, context: InvocationContext): Flow<Event> = flow {
       validateNodeName(node.name)
+      val runId = context.frameworkData.topLevelRunIds.next(node.name)
       val failure = coroutineScope {
         val channel = Channel<QueuedEvent>(Channel.BUFFERED)
         val failureDeferred = async {
@@ -388,7 +402,7 @@ private constructor(
               channel.send(QueuedEvent(event, processed, nodeFailure))
               processed?.await()
             }
-            NodeRunner(node = node, invocationContext = context, eventSink = sink)
+            NodeRunner(node = node, invocationContext = context, eventSink = sink, runId = runId)
               .run(nodeInput = rootInput(context))
               .requireNodeState()
               .failure

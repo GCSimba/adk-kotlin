@@ -172,4 +172,4 @@ internal fun liveTransferTargets(agent: BaseAgent): List<BaseAgent> {
 
 /** Whether this agent is reached by transfer, which a task or single-turn agent is not. */
 @OptIn(ExperimentalWorkflowApi::class)
-private fun BaseAgent.isTransferTarget(): Boolean = !(this as? LlmAgent)?.mode.runsAsTool
+internal fun BaseAgent.isTransferTarget(): Boolean = !(this as? LlmAgent)?.mode.runsAsTool
