@@ -215,9 +215,7 @@ private constructor(
     val interruptId = "$CONFIRMATION_INTERRUPT_PREFIX${context.nodePath}"
     val answer = context.resumeInputs[interruptId]
     if (answer == null) {
-      // A present but null answer asks again without deciding again.
-      val decide = interruptId !in context.resumeInputs && !requireConfirmation
-      if (decide && confirmationPredicate?.invoke(context, input) != true) return null
+      if (!requireConfirmation && confirmationPredicate?.invoke(context, input) != true) return null
       requestInput(
         interruptId = interruptId,
         message = "Please approve or reject the tool call $name().",
