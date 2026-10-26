@@ -16,21 +16,13 @@
 
 package com.google.adk.kt.events
 
-import com.google.adk.kt.sessions.State
-import com.google.adk.kt.types.Content
-import com.google.adk.kt.types.Part
 import com.google.common.truth.Truth.assertThat
-import java.util.concurrent.ConcurrentHashMap
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.JUnit4
 
 @RunWith(JUnit4::class)
 class EventActionsCommonTest {
-
-  private val PART = Part(text = "text", inlineData = null, fileData = null)
-  private val CONTENT = Content(role = null, parts = listOf(PART))
-  private val TOOL_CONFIRMATION = ToolConfirmation(hint = "hint", confirmed = true)
 
   @Test
   fun defaultConstructor_initializesWithDefaultValues() {
@@ -43,27 +35,5 @@ class EventActionsCommonTest {
     assertThat(eventActions.escalate).isFalse()
     assertThat(eventActions.requestedToolConfirmations).isEmpty()
     assertThat(eventActions.compaction).isNull()
-  }
-
-  @Test
-  fun copy_createsCopyWithSameValues() {
-    val eventActions =
-      EventActions(
-        skipSummarization = true,
-        artifactDelta = ConcurrentHashMap(mutableMapOf("a1" to 1)),
-      )
-
-    val copied = eventActions.copy()
-
-    assertThat(copied).isEqualTo(eventActions)
-  }
-
-  @Test
-  fun removeStateByKey_marksKeyAsRemoved() {
-    val eventActions = EventActions()
-    eventActions.stateDelta["key1"] = "value1"
-    eventActions.removeStateByKey("key1")
-
-    assertThat(eventActions.stateDelta).containsExactly("key1", State.REMOVED)
   }
 }

@@ -28,12 +28,10 @@ import com.google.adk.kt.testing.DummyMemoryService
 import com.google.adk.kt.testing.testInvocationContext
 import com.google.adk.kt.testing.testSession
 import com.google.adk.kt.testing.userMessage
-import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Part
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -221,17 +219,6 @@ class CallbackContextTest {
     callbackContext.endInvocation()
 
     assertTrue(context.isEndOfInvocation)
-  }
-
-  @Test
-  fun callbackContext_creation_setsDefaultValues() = runBlocking {
-    val context =
-      testInvocationContext(userContent = Content(role = "user"), invocationId = "invocation-id")
-    val callbackContext = context.toCallbackContext()
-
-    callbackContext.updateState("key", "value")
-    assertEquals("value", callbackContext.state["key"])
-    assertNotNull(callbackContext.eventActions.stateDelta["key"])
   }
 
   @Test

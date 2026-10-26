@@ -178,11 +178,6 @@ class EventActionsTest {
   }
 
   @Test
-  fun defaultConstructor_compactionIsNull() {
-    assertNull(EventActions().compaction)
-  }
-
-  @Test
   fun snapshot_isIndependentOfOriginal() {
     val original =
       EventActions(
