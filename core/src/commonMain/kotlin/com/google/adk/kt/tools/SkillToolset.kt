@@ -26,6 +26,7 @@ import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.skills.Frontmatter
 import com.google.adk.kt.skills.SkillSource
 import com.google.adk.kt.skills.SkillSourceException
+import com.google.adk.kt.skills.isSingleSegmentSkillName
 import com.google.adk.kt.tools.environment.DEFAULT_MAX_OUTPUT_CHARS
 import com.google.adk.kt.tools.environment.toEnvironmentErrorResponse
 import com.google.adk.kt.tools.environment.truncateOutput
@@ -123,9 +124,13 @@ internal class LoadSkillTool(private val toolset: SkillToolset) :
   }
 
   override suspend fun run(context: ToolContext, args: Map<String, Any?>): Map<String, Any?> {
-    val skillName =
-      args[SkillToolset.PARAM_SKILL_NAME] as? String
-        ?: return errorResponse("Skill name is required.")
+    val skillName = args[SkillToolset.PARAM_SKILL_NAME] as? String
+    if (skillName.isNullOrEmpty()) return errorResponse("Skill name is required.")
+    if (!isSingleSegmentSkillName(skillName)) {
+      return errorResponse(
+        "Invalid `${SkillToolset.PARAM_SKILL_NAME}`: $skillName must name a single skill."
+      )
+    }
 
     val frontmatter =
       toolset.source.loadFrontmatter(skillName).getOrElse { e ->
@@ -178,9 +183,13 @@ internal class LoadSkillResourceTool(private val toolset: SkillToolset) :
   }
 
   override suspend fun run(context: ToolContext, args: Map<String, Any?>): Map<String, Any?> {
-    val skillName =
-      args[SkillToolset.PARAM_SKILL_NAME] as? String
-        ?: return errorResponse("Skill name is required.")
+    val skillName = args[SkillToolset.PARAM_SKILL_NAME] as? String
+    if (skillName.isNullOrEmpty()) return errorResponse("Skill name is required.")
+    if (!isSingleSegmentSkillName(skillName)) {
+      return errorResponse(
+        "Invalid `${SkillToolset.PARAM_SKILL_NAME}`: $skillName must name a single skill."
+      )
+    }
 
     val resourcePath =
       args[SkillToolset.PARAM_PATH] as? String ?: return errorResponse("Resource path is required.")
@@ -215,13 +224,6 @@ internal class LoadSkillResourceTool(private val toolset: SkillToolset) :
     return result
   }
 }
-
-/**
- * Whether [skillName] names a single directory, so that `skills/<skill_name>` stays inside the
- * skills directory.
- */
-private fun isSingleSegmentSkillName(skillName: String): Boolean =
-  skillName != "." && skillName != ".." && '/' !in skillName && '\\' !in skillName
 
 /**
  * Resolves [filePath] to a path under a skill's `scripts/` directory, or returns `null` if it does

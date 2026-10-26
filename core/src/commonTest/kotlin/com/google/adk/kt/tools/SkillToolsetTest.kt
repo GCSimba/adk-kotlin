@@ -22,6 +22,7 @@ import com.google.adk.kt.skills.SkillSourceException
 import com.google.adk.kt.testing.testToolContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
@@ -433,5 +434,96 @@ class SkillToolsetTest {
     val instruction = SkillToolset(brokenSource).getSkillCatalogInstruction()
 
     kotlin.test.assertNull(instruction)
+  }
+
+  @Test
+  fun loadSkillTool_run_emptySkillName_returnsRequired() = runTest {
+    val tool = skillToolset.getTools(null).first { it.name == SkillToolset.TOOL_NAME_LOAD_SKILL }
+
+    val result =
+      tool.run(testToolContext(), mapOf(SkillToolset.PARAM_SKILL_NAME to "")) as Map<*, *>
+
+    assertEquals("Skill name is required.", result[SkillToolset.KEY_ERROR])
+  }
+
+  @Test
+  fun loadSkillTool_run_invalidSkillNames_returnsErrorWithoutCallingSource() = runTest {
+    var sourceCalled = false
+    val source =
+      object : SkillSource by mockSource {
+        override suspend fun loadFrontmatter(skillName: String): Result<Frontmatter> {
+          sourceCalled = true
+          return Result.failure(SkillSourceException("unexpected source call"))
+        }
+
+        override suspend fun loadInstructions(skillName: String): Result<String> {
+          sourceCalled = true
+          return Result.failure(SkillSourceException("unexpected source call"))
+        }
+      }
+    val tool =
+      SkillToolset(source).getTools(null).first {
+        it.name == SkillToolset.TOOL_NAME_LOAD_SKILL
+      }
+
+    for (name in listOf("../x", "a/b", "a\\b", "..", "C:")) {
+      val result =
+        tool.run(testToolContext(), mapOf(SkillToolset.PARAM_SKILL_NAME to name)) as Map<*, *>
+
+      assertTrue((result[SkillToolset.KEY_ERROR] as String).contains("must name a single skill"))
+      assertFalse(sourceCalled)
+    }
+  }
+
+  @Test
+  fun loadSkillResourceTool_run_emptySkillName_returnsRequired() = runTest {
+    val tool =
+      skillToolset.getTools(null).first {
+        it.name == SkillToolset.TOOL_NAME_LOAD_SKILL_RESOURCE
+      }
+
+    val result =
+      tool.run(
+        testToolContext(),
+        mapOf(
+          SkillToolset.PARAM_SKILL_NAME to "",
+          SkillToolset.PARAM_PATH to "references/ref.md",
+        ),
+      ) as Map<*, *>
+
+    assertEquals("Skill name is required.", result[SkillToolset.KEY_ERROR])
+  }
+
+  @Test
+  fun loadSkillResourceTool_run_invalidSkillNames_returnsErrorWithoutCallingSource() = runTest {
+    var sourceCalled = false
+    val source =
+      object : SkillSource by mockSource {
+        override suspend fun loadResource(
+          skillName: String,
+          resourcePath: String,
+        ): Result<ByteArray> {
+          sourceCalled = true
+          return Result.failure(SkillSourceException("unexpected source call"))
+        }
+      }
+    val tool =
+      SkillToolset(source).getTools(null).first {
+        it.name == SkillToolset.TOOL_NAME_LOAD_SKILL_RESOURCE
+      }
+
+    for (name in listOf("../x", "a/b", "a\\b", "..", "C:")) {
+      val result =
+        tool.run(
+          testToolContext(),
+          mapOf(
+            SkillToolset.PARAM_SKILL_NAME to name,
+            SkillToolset.PARAM_PATH to "references/ref.md",
+          ),
+        ) as Map<*, *>
+
+      assertTrue((result[SkillToolset.KEY_ERROR] as String).contains("must name a single skill"))
+      assertFalse(sourceCalled)
+    }
   }
 }

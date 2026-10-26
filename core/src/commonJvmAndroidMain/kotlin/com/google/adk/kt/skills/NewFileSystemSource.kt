@@ -56,7 +56,7 @@ class NewFileSystemSource(private val skillsBaseDir: String) : SkillSource {
     resourceDirectoryPath: String,
   ): Result<List<String>> = sourceRunCatching {
     validateBaseDir()
-    val skillDirPath = Paths.get(skillsBaseDir).resolve(skillName)
+    val skillDirPath = resolveSkillDir(skillName)
     // Validates the skill.
     val unused = parseSkillFromDir(skillDirPath)
 
@@ -96,18 +96,18 @@ class NewFileSystemSource(private val skillsBaseDir: String) : SkillSource {
 
   override suspend fun loadFrontmatter(skillName: String): Result<Frontmatter> = sourceRunCatching {
     validateBaseDir()
-    parseSkillFromDir(Paths.get(skillsBaseDir).resolve(skillName)).first
+    parseSkillFromDir(resolveSkillDir(skillName)).first
   }
 
   override suspend fun loadInstructions(skillName: String): Result<String> = sourceRunCatching {
     validateBaseDir()
-    parseSkillFromDir(Paths.get(skillsBaseDir).resolve(skillName)).second
+    parseSkillFromDir(resolveSkillDir(skillName)).second
   }
 
   override suspend fun loadResource(skillName: String, resourcePath: String): Result<ByteArray> =
     sourceRunCatching {
       validateBaseDir()
-      val skillDirPath = Paths.get(skillsBaseDir).resolve(skillName)
+      val skillDirPath = resolveSkillDir(skillName)
       // Validates the skill.
       val unused = parseSkillFromDir(skillDirPath)
 
@@ -139,6 +139,31 @@ class NewFileSystemSource(private val skillsBaseDir: String) : SkillSource {
     }
 
   /**
+   * Resolves [skillName] to a directory directly under the skills base directory.
+   *
+   * Rejects names that are not a single path segment and any lexical path that escapes the base
+   * directory. Symbolic links are followed, matching ADK Java and ADK Python: an operator may
+   * intentionally link a shared skill directory into the skills root, and the model only controls
+   * [skillName].
+   */
+  private fun resolveSkillDir(skillName: String): Path {
+    if (!isSingleSegmentSkillName(skillName)) {
+      throw SkillSourceException("Invalid skill name: $skillName")
+    }
+    val baseDirPath = Paths.get(skillsBaseDir).toAbsolutePath().normalize()
+    val skillDirPath =
+      try {
+        baseDirPath.resolve(skillName).normalize()
+      } catch (e: java.nio.file.InvalidPathException) {
+        throw SkillSourceException("Invalid skill name: $skillName", e)
+      }
+    if (skillDirPath.parent != baseDirPath) {
+      throw SkillSourceException("Invalid skill name: $skillName")
+    }
+    return skillDirPath
+  }
+
+  /**
    * Verifies that [skillsBaseDir] points to an existing directory, throwing [SkillSourceException]
    * otherwise.
    */
@@ -163,7 +188,6 @@ private fun parseSkillFromDir(skillDirPath: Path): Pair<Frontmatter, String> {
   if (!skillMdPath.exists()) {
     throw SkillSourceException("Skill $skillName is malformed: missing $SKILL_FILE_NAME.")
   }
-
   val content =
     try {
       skillMdPath.readText()

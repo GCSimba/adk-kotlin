@@ -31,6 +31,21 @@ class SkillSourceException @JvmOverloads constructor(message: String, cause: Thr
   Exception(message, cause)
 
 /**
+ * Whether [skillName] names a single directory directly under the skills directory, so that
+ * `skills/<skill_name>` cannot escape it.
+ *
+ * Colons are rejected because Windows treats `C:` and `D:other` as drive-qualified or
+ * drive-relative paths even though they contain no path separators.
+ */
+internal fun isSingleSegmentSkillName(skillName: String): Boolean =
+  skillName.isNotEmpty() &&
+    skillName != "." &&
+    skillName != ".." &&
+    '/' !in skillName &&
+    '\\' !in skillName &&
+    ':' !in skillName
+
+/**
  * Core interface for accessing skill components.
  *
  * Implementations are expected to be safe for concurrent use by multiple coroutines.
