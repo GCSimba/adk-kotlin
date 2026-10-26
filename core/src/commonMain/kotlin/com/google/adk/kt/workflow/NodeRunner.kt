@@ -257,9 +257,17 @@ private constructor(
      * when a `useAsOutput` child holds this node's output.
      */
     private suspend fun dispatch(event: Event) {
-      val outputKept = track(event)
-      val outgoing = if (outputKept) event else withoutDroppedOutput(event)
+      val checked = withCheckedStateDelta(event)
+      val outputKept = track(checked)
+      val outgoing = if (outputKept) checked else withoutDroppedOutput(checked)
       if (outgoing != null) send(outgoing)
+    }
+
+    /** Returns [event] with its state delta as the state schema reads it. */
+    private fun withCheckedStateDelta(event: Event): Event {
+      val delta = context.checkedStateDelta(event.actions.stateDelta)
+      return if (delta === event.actions.stateDelta) event
+      else event.copy(actions = event.actions.copy(stateDelta = delta))
     }
 
     /**
@@ -274,7 +282,6 @@ private constructor(
           event.isMessageAsOutput -> nodeState.produceOutput(event.content)
           else -> true
         }
-      context.validateStateDelta(event.actions.stateDelta)
       if (event.longRunningToolIds.isNotEmpty()) nodeState.addInterruptIds(event.longRunningToolIds)
       // Only apply routing from this node's own events; events from nested nodes were already
       // handled at their own level.

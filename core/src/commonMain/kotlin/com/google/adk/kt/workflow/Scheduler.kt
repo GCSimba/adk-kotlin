@@ -20,6 +20,7 @@ import com.google.adk.kt.SchemaUtils
 import com.google.adk.kt.agents.AgentMode
 import com.google.adk.kt.agents.Context
 import com.google.adk.kt.agents.LlmAgent
+import com.google.adk.kt.agents.NodeExecutionState
 import com.google.adk.kt.agents.TypedData
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.events.Event
@@ -284,6 +285,23 @@ internal class Scheduler(
       )
   }
 
+  /** Sends this workflow's checked output as its own event, for every node it counts for. */
+  private suspend fun emitOutput(state: NodeExecutionState) {
+    state.eventSink.send(
+      Event(
+        author = workflow.name,
+        invocationId = context.invocationContext.invocationId,
+        branch = context.invocationContext.branch,
+        output = context.output,
+        nodeInfo = NodeInfo(path = context.nodePath, outputFor = state.outputFor),
+      )
+    )
+  }
+
+  /** Whether a node that is not a workflow takes this workflow's output through `useAsOutput`. */
+  private fun NodeExecutionState.isDelegatedToANode(): Boolean =
+    generateSequence(outputParent) { it.outputParent }.any { it.node !is Workflow }
+
   /** Marks a clean finish, so a resumable session can tell the workflow ran to completion. */
   private suspend fun emitEndOfAgent() {
     if (!isResumable) return
@@ -389,11 +407,14 @@ internal class Scheduler(
       val schema = workflow.outputSchema
       val side = "output of workflow '${workflow.name}'"
       context.output =
-        if (schema == null) output else SchemaUtils.validateValue(output, schema, side).getOrThrow()
+        if (schema == null) output else SchemaUtils.checkedValue(output, schema, side)
       // Validation can read a Content as JSON null, which is no output; the terminal node's raw
       // output then no longer counts for delegating ancestors either.
       val state = context.requireNodeState()
       if (context.hasProducedOutput) {
+        // Sent only when the check changed the value. A node that delegated to this workflow
+        // replays the checked value from this event on resume or retry.
+        if (context.output != output && state.isDelegatedToANode()) emitOutput(state)
         state.markOutputEmitted()
       } else if (output != null) {
         state.clearDelegatedOutput(output)
