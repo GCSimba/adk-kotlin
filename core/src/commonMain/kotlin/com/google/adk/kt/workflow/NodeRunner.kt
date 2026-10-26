@@ -252,19 +252,28 @@ private constructor(
       }
     }
 
-    /** Records the event's output and routing on [context], then stamps and forwards the event. */
+    /**
+     * Records the event on [context], then sends it, or what [withoutDroppedOutput] leaves of it
+     * when a `useAsOutput` child holds this node's output.
+     */
     private suspend fun dispatch(event: Event) {
-      track(event)
-      send(event)
+      val outputKept = track(event)
+      val outgoing = if (outputKept) event else withoutDroppedOutput(event)
+      if (outgoing != null) send(outgoing)
     }
 
-    /** Updates [context] with any output, interrupts, or routing carried by [event]. */
-    private fun track(event: Event) {
-      when {
-        event.output != null -> context.output = event.output
-        // A final message-as-output event has no separate output; its content is the node's output.
-        event.isMessageAsOutput -> context.output = event.content
-      }
+    /**
+     * Updates [context] with any output, interrupts, or routing carried by [event]. Returns false
+     * if a `useAsOutput` child holds this node's output, so the event's own output was dropped.
+     */
+    private fun track(event: Event): Boolean {
+      val outputKept =
+        when {
+          event.output != null -> nodeState.produceOutput(event.output)
+          // A final message-as-output event has no separate output; its content is the output.
+          event.isMessageAsOutput -> nodeState.produceOutput(event.content)
+          else -> true
+        }
       context.validateStateDelta(event.actions.stateDelta)
       if (event.longRunningToolIds.isNotEmpty()) nodeState.addInterruptIds(event.longRunningToolIds)
       // Only apply routing from this node's own events; events from nested nodes were already
@@ -277,6 +286,21 @@ private constructor(
         }
         event.actions.transferToAgent?.let { context.actions.transferToAgent = it }
       }
+      return outputKept
+    }
+
+    /**
+     * Returns [event] without the output this node produced after delegating its output, or null if
+     * the event has no content, long-running tool ids or actions to send without it. A
+     * message-as-output event becomes a plain message, so its text is not read back as the output.
+     */
+    private fun withoutDroppedOutput(event: Event): Event? {
+      val carriesMore =
+        event.content != null ||
+          event.longRunningToolIds.isNotEmpty() ||
+          event.actions != EventActions()
+      if (!carriesMore) return null
+      return event.copy(output = null, nodeInfo = event.nodeInfo?.copy(messageAsOutput = false))
     }
 
     /** Stamps the event, flushes any pending deltas onto it (unless partial), and sends it. */

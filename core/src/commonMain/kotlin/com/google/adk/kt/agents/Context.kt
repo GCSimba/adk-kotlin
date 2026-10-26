@@ -51,6 +51,7 @@ import com.google.adk.kt.workflow.validateInput
 import com.google.adk.kt.workflow.validateNodeName
 import com.google.adk.kt.workflow.validateRunId
 import com.google.errorprone.annotations.CanIgnoreReturnValue
+import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.reflect.KType
@@ -321,13 +322,14 @@ open class Context(
   /**
    * Sets this node's [output] to [value]'s JSON form under [T]'s serializer, or to a `Content` as
    * it is, so a successor typed [T] reads it back, live and after a session reload. Can be called
-   * at most once per activation. Use it from a custom node for a typed value, since emitting that
-   * value directly fails the node.
+   * at most once per activation, and drops [value] if [runNode] already delegated output to a child
+   * with `useAsOutput`. Use it from a custom node for a typed value, since emitting that value
+   * directly fails the node.
    *
    * @throws IllegalArgumentException if [T] has no serializer or [value] has no JSON form, an
    *   `Event` included.
-   * @throws IllegalStateException if an output was already produced or delegated, or if called from
-   *   a `node {}` body, whose return value is its output.
+   * @throws IllegalStateException if an output was already produced, or if called from a `node {}`
+   *   body, whose return value is its output.
    */
   @ExperimentalWorkflowApi
   // typeOf<T>() is a compiler intrinsic and does not require kotlin-reflect.
@@ -573,12 +575,13 @@ open class Context(
    *   attempt, or an earlier turn, returns it without running again; one that finished without an
    *   output may run again. When `null` or empty, the child gets the next number for its name,
    *   which follows call order, so concurrent children need explicit IDs.
-   * @param useAsOutput When `true`, delegates this node's output to [node]: this node must not
-   *   produce an output of its own afterwards, even if [node] finishes without one. The claim is
-   *   released only if [node] fails before emitting an output, so a caller that catches the failure
-   *   may fall back to its own output. Once [node] has emitted, its output is this node's output
-   *   and successors receive it. A `node {}` outputs it encoded under its output type, as if it had
-   *   returned it, and fails if it does not decode.
+   * @param useAsOutput When `true`, delegates this node's output to [node]. The first output this
+   *   node produces afterwards (such as returning [node]'s result) is dropped, even if [node]
+   *   produces none. A second output fails this node. The claim is released only if [node] fails
+   *   before emitting an output, so a caller that catches the failure may fall back to its own
+   *   output. Once [node] has emitted, its output is this node's output and successors receive it.
+   *   A `node {}` outputs it encoded under its output type, as if it had returned it, and fails if
+   *   it does not decode.
    * @param useSubBranch When `true`, runs [node] on a sub-branch `<branch>.<node.name>@<runId>`.
    * @param overrideBranch Branch for [node] to run on instead of this node's branch.
    * @param overrideIsolationScope Isolation scope for [node] to run in instead of this node's
@@ -1008,6 +1011,8 @@ internal class NodeExecutionState(
 
   private val interruptIdsRef = AtomicReference<Set<String>>(emptySet())
   private val outputStateRef = AtomicReference<OutputState>(OutputState.None)
+  // Set once this activation drops its own output because a `useAsOutput` child holds the output.
+  private val droppedOwnOutput = AtomicBoolean(false)
 
   /** Interrupt IDs this activation is waiting on. */
   val interruptIds: Set<String>
@@ -1028,6 +1033,7 @@ internal class NodeExecutionState(
         OutputState.Delegated -> null
         is OutputState.Produced -> s.value
         is OutputState.Emitted -> s.value
+        is OutputState.DelegateProduced -> s.value
         is OutputState.DelegateEmitted -> s.value
       }
 
@@ -1043,18 +1049,31 @@ internal class NodeExecutionState(
       outputStateRef.load().let { it is OutputState.Emitted || it is OutputState.DelegateEmitted }
 
   /**
-   * Records this activation's output value. Assigning `null` before any output is a no-op; any
-   * assignment after an output was produced or delegated throws [IllegalStateException].
+   * Records this activation's output and returns true. Returns false and drops the value if a
+   * `useAsOutput` child holds the output, as adk-python does. Assigning `null` before any output is
+   * a no-op; a second output of its own throws [IllegalStateException], even if the first was
+   * dropped.
    */
-  fun produceOutput(value: Any?) {
+  @CanIgnoreReturnValue
+  fun produceOutput(value: Any?): Boolean {
     while (true) {
       when (val current = outputStateRef.load()) {
         OutputState.None -> {
-          if (value == null) return
-          if (outputStateRef.compareAndSet(current, OutputState.Produced(value))) return
+          check(!droppedOwnOutput.load()) { secondOutputMessage() }
+          if (value == null) return true
+          if (outputStateRef.compareAndSet(current, OutputState.Produced(value))) return true
         }
         OutputState.Delegated,
-        is OutputState.DelegateEmitted -> error(delegatedOutputMessage())
+        is OutputState.DelegateProduced,
+        is OutputState.DelegateEmitted -> {
+          // As in adk-python, a dropped output still counts, so a later one fails as a second.
+          if (value == null) {
+            check(!droppedOwnOutput.load()) { secondOutputMessage() }
+          } else {
+            check(droppedOwnOutput.compareAndSet(false, true)) { secondOutputMessage() }
+          }
+          return false
+        }
         is OutputState.Produced,
         is OutputState.Emitted -> error(secondOutputMessage())
       }
@@ -1064,21 +1083,25 @@ internal class NodeExecutionState(
   /** Marks the produced output as emitted and records it on every delegating ancestor. */
   fun markOutputEmitted() {
     while (true) {
-      when (val current = outputStateRef.load()) {
-        is OutputState.Produced -> {
-          if (!outputStateRef.compareAndSet(current, OutputState.Emitted(current.value))) continue
-          var ancestor = outputParent
-          while (ancestor != null) {
-            ancestor.recordDelegatedOutput(current.value)
-            ancestor = ancestor.outputParent
-          }
-          return
+      val current = outputStateRef.load()
+      val (value, emitted) =
+        when (current) {
+          is OutputState.Produced -> current.value to OutputState.Emitted(current.value)
+          // It stays delegated, so an output this activation produces afterwards is still dropped.
+          is OutputState.DelegateProduced ->
+            current.value to OutputState.DelegateEmitted(current.value)
+          is OutputState.Emitted,
+          is OutputState.DelegateEmitted -> error("Node '${node.name}' output was already emitted.")
+          OutputState.None,
+          OutputState.Delegated -> error("Node '${node.name}' has no produced output to emit.")
         }
-        is OutputState.Emitted,
-        is OutputState.DelegateEmitted -> error("Node '${node.name}' output was already emitted.")
-        OutputState.None,
-        OutputState.Delegated -> error("Node '${node.name}' has no produced output to emit.")
+      if (!outputStateRef.compareAndSet(current, emitted)) continue
+      var ancestor = outputParent
+      while (ancestor != null) {
+        ancestor.recordDelegatedOutput(value)
+        ancestor = ancestor.outputParent
       }
+      return
     }
   }
 
@@ -1100,7 +1123,9 @@ internal class NodeExecutionState(
    * so [NodeRunner] emits it for this attempt.
    */
   fun adoptReplayedOutput(value: Any) {
-    check(outputStateRef.compareAndSet(OutputState.Delegated, OutputState.Produced(value))) {
+    check(
+      outputStateRef.compareAndSet(OutputState.Delegated, OutputState.DelegateProduced(value))
+    ) {
       "Node '${node.name}' adopted a replayed output without a pending delegation."
     }
   }
@@ -1112,10 +1137,10 @@ internal class NodeExecutionState(
   fun replaceDelegatedOutput(value: Any) {
     while (true) {
       val current = outputStateRef.load()
-      check(current is OutputState.DelegateEmitted || current is OutputState.Produced) {
+      check(current is OutputState.DelegateEmitted || current is OutputState.DelegateProduced) {
         "Node '${node.name}' has no delegated output to replace."
       }
-      if (outputStateRef.compareAndSet(current, OutputState.Produced(value))) return
+      if (outputStateRef.compareAndSet(current, OutputState.DelegateProduced(value))) return
     }
   }
 
@@ -1165,6 +1190,7 @@ internal class NodeExecutionState(
       when (val current = outputStateRef.load()) {
         OutputState.None -> if (outputStateRef.compareAndSet(current, OutputState.Delegated)) return
         OutputState.Delegated,
+        is OutputState.DelegateProduced,
         is OutputState.DelegateEmitted ->
           error("Node '${node.name}' already delegated its output to a useAsOutput child.")
         is OutputState.Produced,
@@ -1187,10 +1213,6 @@ internal class NodeExecutionState(
 
   private fun secondOutputMessage() =
     "Node '${node.name}' produced a second output; a node produces at most one output."
-
-  private fun delegatedOutputMessage() =
-    "Node '${node.name}' delegated its output to a useAsOutput child and must not produce one of" +
-      " its own."
 }
 
 /** Runs of a node's children keyed by `name@runId`, kept across the node's attempts. */

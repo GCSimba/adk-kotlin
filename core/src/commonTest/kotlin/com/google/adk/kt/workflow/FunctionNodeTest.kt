@@ -454,6 +454,31 @@ class FunctionNodeTest {
     assertEquals<Any?>(42L, received)
   }
 
+  /**
+   * A body that returns its delegate's result, as adk-python's delegating functions do, leaves the
+   * child's event the node's only output.
+   */
+  @Test
+  fun nodeBody_returningTheDelegatedOutput_sendsOnlyTheChildEvent() {
+    // Arrange
+    val child = node<Any?, String>("child") { _, _ -> "from_child" }
+    val router =
+      node<Any?, String?>("router", rerunOnResume = true) { ctx, _ ->
+        ctx.runNode(child, useAsOutput = true) as String?
+      }
+    var received: Any? = null
+    val reply = node<Any?, Unit>("reply") { _, value -> received = value }
+    val workflow = Workflow("wf", listOf(Edge(Start, router), Edge(router, reply)))
+
+    // Act
+    val events = runWorkflowThroughRunner(workflow)
+
+    // Assert
+    val routerOutput = events.single { it.nodeInfo?.outputFor?.contains("wf@1/router@1") == true }
+    assertEquals("wf@1/router@1/child@1", routerOutput.nodeInfo?.path)
+    assertEquals<Any?>("from_child", received)
+  }
+
   /** A child whose output already is O's JSON form leaves its event the node's only output. */
   @Test
   fun nodeBody_delegatedOutputAlreadyEncoded_sendsOnlyTheChildEvent() {

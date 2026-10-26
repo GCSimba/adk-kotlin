@@ -194,8 +194,7 @@ private constructor(
       context.requireNodeState().replaceDelegatedOutput(encoded)
     }
     // An event marks a confirmed run that output nothing as finished, so a later resume skips it.
-    if (confirmation != null && delegated == null && (result == null || result == Unit))
-      emit(Event())
+    if (confirmation != null && !context.hasProducedOutput && result !is Event) emit(Event())
   }
 
   /**

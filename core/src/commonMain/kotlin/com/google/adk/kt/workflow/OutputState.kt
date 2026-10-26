@@ -16,7 +16,10 @@
 
 package com.google.adk.kt.workflow
 
-/** Where a node activation's output stands. One value, so every transition is a single CAS. */
+/**
+ * Where a node activation's output stands. One value, so every transition is a single CAS. A
+ * separate flag in `NodeExecutionState` records whether the activation dropped its own output.
+ */
 internal sealed interface OutputState {
   /** No output and no delegation yet. */
   data object None : OutputState
@@ -32,6 +35,15 @@ internal sealed interface OutputState {
    */
   data class Emitted(val value: Any) : OutputState
 
-  /** A `useAsOutput` descendant recorded [value] as this activation's output. */
+  /**
+   * A delegated output that this activation sends on its own event, such as a replayed child's; it
+   * is not marked emitted yet.
+   */
+  data class DelegateProduced(val value: Any) : OutputState
+
+  /**
+   * [value], a delegated output, was marked emitted by a `useAsOutput` descendant or by this
+   * activation.
+   */
   data class DelegateEmitted(val value: Any) : OutputState
 }

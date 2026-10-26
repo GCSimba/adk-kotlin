@@ -34,6 +34,7 @@ import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlinx.coroutines.CancellationException
@@ -71,8 +72,8 @@ private class EchoChild(override val name: String, private val prefix: String) :
 
 /**
  * A node that dynamically dispatches [child] via [Context.runNode], then emits [ownOutput] if
- * given, else whatever the child returned, unless [emitResult] is false. With [useAsOutput] the
- * child's output is this node's, so emitting one of its own fails the node.
+ * given, else whatever the child returned, unless [emitResult] is false. With [useAsOutput], the
+ * child's output is this node's, so an output this node emits itself is dropped.
  */
 private class Dispatcher(
   override val name: String,
@@ -143,11 +144,16 @@ private class ConcurrentDispatcher(
   }
 }
 
-/** Dispatches [child], then fails on its first attempt only; its retry policy runs it again. */
+/**
+ * Dispatches [child], fails on its first attempt, and emits the child's result on the retry its
+ * retry policy runs. With [childRunId], the retry shares the child's run.
+ */
 private class FailsFirstAttemptDispatcher(
   override val name: String,
   private val child: Node,
   private val childInput: Any? = null,
+  private val childRunId: String? = null,
+  private val useAsOutput: Boolean = false,
 ) : Node {
   override val rerunOnResume: Boolean = true
   override val config: NodeConfig =
@@ -156,7 +162,8 @@ private class FailsFirstAttemptDispatcher(
     )
 
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
-    val result = context.runNode(child, nodeInput = childInput)
+    val result =
+      context.runNode(child, nodeInput = childInput, runId = childRunId, useAsOutput = useAsOutput)
     if (context.attemptCount == 1) throw NodeExecutionException("RuntimeError", "first attempt")
     emit(result)
   }
@@ -190,13 +197,30 @@ private class DelegatingEventEmitter(
   }
 }
 
-/** Delegates its output to [child], then assigns an output of its own. */
-private class DelegatingAssigner(override val name: String, private val child: Node) : Node {
+/**
+ * Delegates its output to [child], then assigns an output of its own, and emits [secondOutput] if
+ * non-null.
+ */
+private class DelegatingAssigner(
+  override val name: String,
+  private val child: Node,
+  private val secondOutput: Any? = null,
+) : Node {
   override val rerunOnResume: Boolean = true
 
   override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
     context.runNode(child, useAsOutput = true)
     context.output = "OWN"
+    if (secondOutput != null) emit(secondOutput)
+  }
+}
+
+/** Sets [value] as its caller's output, as if produced by the running caller, then fails. */
+private class SetCallerOutputThenFailChild(override val name: String, private val value: Any) :
+  Node {
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    checkNotNull(context.parent).output = value
+    throw NodeExecutionException("RuntimeError", "failed before emitting its output")
   }
 }
 
@@ -505,20 +529,32 @@ class DynamicDispatchTest {
   }
 
   @Test
-  fun runNode_useAsOutputThenParentReturnsChildOutput_failsParent() {
-    // Arrange
-    val dispatcher = Dispatcher("dispatcher", Emitter("child", "CHILD_OUT"), useAsOutput = true)
-    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+  fun runner_useAsOutputThenParentReturnsChildOutput_storesOnlyTheChildsOutputEvent() {
+    // Arrange: the dispatcher emits the child's result, like an adk-python delegating function.
+    val dispatcher =
+      Dispatcher("dispatcher", EchoChild("child", "echo"), childInput = "in", useAsOutput = true)
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
 
     // Act
-    val error = assertFailsWith<IllegalStateException> { runWorkflow(workflow) }
+    val session = runWorkflowAsApp(workflow)
 
-    // Assert
-    assertContains(error.message!!, "delegated its output")
+    // Assert: only the child's event carries the output, and the successor receives it.
+    val outputEvents = session.events.filter { it.output != null }
+    assertEquals(
+      listOf("wf@1/dispatcher@1/child@1", "wf@1/after@1"),
+      outputEvents.map { it.nodeInfo?.path },
+    )
+    assertEquals(
+      listOf("wf@1/dispatcher@1/child@1", "wf@1/dispatcher@1"),
+      outputEvents[0].nodeInfo?.outputFor,
+    )
+    assertEquals("after:echo:in", outputEvents[1].output)
   }
 
   @Test
-  fun runNode_useAsOutputThenParentEmitsOutput_failsParent() {
+  fun runNode_useAsOutputThenParentEmitsOutput_dropsIt() {
     // Arrange: the dispatcher delegates its output, then emits one of its own anyway.
     val dispatcher =
       Dispatcher(
@@ -527,13 +563,45 @@ class DynamicDispatchTest {
         useAsOutput = true,
         ownOutput = "DISPATCHER_OWN",
       )
-    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
 
     // Act
-    val error = assertFailsWith<IllegalStateException> { runWorkflow(workflow) }
+    val events = runWorkflow(workflow)
+
+    // Assert: the dispatcher's output-only event is not sent; the successor gets the child's.
+    assertTrue(events.none { it.nodeInfo?.path == "wf@1/dispatcher@1" })
+    assertEquals("after:CHILD_OUT", events.single { it.nodeInfo?.path == "wf@1/after@1" }.output)
+  }
+
+  @Test
+  fun runNode_useAsOutputCallerRetriedThenReturnsChildOutput_emitsTheSharedOutputOnce() {
+    // Arrange: the retry adopts its shared delegate's output, then emits that output again.
+    val dispatcher =
+      FailsFirstAttemptDispatcher(
+        "dispatcher",
+        Emitter("child", "CHILD_OUT"),
+        childRunId = "c",
+        useAsOutput = true,
+      )
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
+
+    // Act
+    val events = runWorkflow(workflow)
 
     // Assert
-    assertContains(error.message!!, "delegated its output")
+    val outputs = events.filter { it.output != null }.map { it.nodeInfo?.path to it.output }
+    assertEquals(
+      listOf(
+        "wf@1/dispatcher@1/child@c" to "CHILD_OUT",
+        "wf@1/dispatcher@1" to "CHILD_OUT",
+        "wf@1/after@1" to "after:CHILD_OUT",
+      ),
+      outputs,
+    )
   }
 
   @Test
@@ -888,19 +956,24 @@ class DynamicDispatchTest {
   }
 
   @Test
-  fun runNode_useAsOutputThenParentEmitsMessageAsOutput_failsParent() {
+  fun runNode_useAsOutputThenParentEmitsMessageAsOutput_sendsItAsAPlainMessage() {
     // Arrange: a message-as-output event's content is the node's output.
     val content = Content(parts = listOf(Part(text = "own text")))
     val ownEvent =
       Event(author = "", content = content, nodeInfo = NodeInfo(messageAsOutput = true))
     val dispatcher = DelegatingEventEmitter("dispatcher", Emitter("child", "CHILD_OUT"), ownEvent)
-    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
 
     // Act
-    val error = assertFailsWith<IllegalStateException> { runWorkflow(workflow) }
+    val events = runWorkflow(workflow)
 
-    // Assert
-    assertContains(error.message!!, "delegated its output")
+    // Assert: the text still goes out, but not as an output, so the successor gets the child's.
+    val message = events.single { it.nodeInfo?.path == "wf@1/dispatcher@1" }
+    assertEquals(content, message.content)
+    assertEquals(NodeInfo(path = "wf@1/dispatcher@1"), message.nodeInfo)
+    assertEquals("after:CHILD_OUT", events.single { it.nodeInfo?.path == "wf@1/after@1" }.output)
   }
 
   @Test
@@ -922,16 +995,72 @@ class DynamicDispatchTest {
   }
 
   @Test
-  fun runNode_useAsOutputThenCallerAssignsOutput_failsCaller() {
+  fun runNode_useAsOutputThenParentEmitsOutputWithStateWrite_sendsTheStateWriteAlone() {
+    // Arrange: the caller's event carries an output of its own and a state write.
+    val stateWrite = EventActions(stateDelta = mutableMapOf("written" to "yes"))
+    val ownEvent = Event(author = "", output = "OWN", actions = stateWrite)
+    val dispatcher = DelegatingEventEmitter("dispatcher", Emitter("child", "CHILD_OUT"), ownEvent)
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
+
+    // Act
+    val events = runWorkflow(workflow)
+
+    // Assert
+    val dispatcherEvent = events.single { it.nodeInfo?.path == "wf@1/dispatcher@1" }
+    assertEquals(mapOf<String, Any>("written" to "yes"), dispatcherEvent.actions.stateDelta.toMap())
+    assertNull(dispatcherEvent.output)
+    assertEquals("after:CHILD_OUT", events.single { it.nodeInfo?.path == "wf@1/after@1" }.output)
+  }
+
+  @Test
+  fun runNode_useAsOutputThenParentEmitsOutputWithRoute_sendsTheRouteAlone() {
+    // Arrange: the route must reach the session, where a resumed run reads it back.
+    val ownEvent = Event(author = "", output = "OWN", actions = EventActions(route = listOf(yes())))
+    val dispatcher = DelegatingEventEmitter("dispatcher", Emitter("child", "CHILD_OUT"), ownEvent)
+    val onYes = EchoChild("on_yes", "yes")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, onYes, yes())))
+
+    // Act
+    val events = runWorkflow(workflow)
+
+    // Assert
+    val dispatcherEvent = events.single { it.nodeInfo?.path == "wf@1/dispatcher@1" }
+    assertEquals(listOf(yes()), dispatcherEvent.actions.route)
+    assertNull(dispatcherEvent.output)
+    assertEquals("yes:CHILD_OUT", events.single { it.nodeInfo?.path == "wf@1/on_yes@1" }.output)
+  }
+
+  @Test
+  fun runNode_useAsOutputThenCallerAssignsOutput_ignoresIt() {
     // Arrange: the caller delegates its output, then assigns one of its own anyway.
     val dispatcher = DelegatingAssigner("dispatcher", Emitter("child", "CHILD_OUT"))
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
+
+    // Act
+    val events = runWorkflow(workflow)
+
+    // Assert
+    assertTrue(events.none { it.output == "OWN" })
+    assertEquals("after:CHILD_OUT", events.single { it.nodeInfo?.path == "wf@1/after@1" }.output)
+  }
+
+  @Test
+  fun runNode_useAsOutputThenCallerProducesTwoOutputs_failsCaller() {
+    // Arrange: the caller delegates its output, then assigns one of its own and emits another.
+    val dispatcher =
+      DelegatingAssigner("dispatcher", Emitter("child", "CHILD_OUT"), secondOutput = "SECOND")
     val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
 
     // Act
     val error = assertFailsWith<IllegalStateException> { runWorkflow(workflow) }
 
-    // Assert
-    assertContains(error.message!!, "delegated its output")
+    // Assert: the dropped first output still counts, as in adk-python.
+    assertContains(error.message!!, "produced a second output")
   }
 
   @Test
@@ -964,6 +1093,20 @@ class DynamicDispatchTest {
       "after:FALLBACK",
       events.single { it.nodeInfo?.path == "wf@1/after@1" && it.output != null }.output,
     )
+  }
+
+  @Test
+  fun runNode_callerOutputDroppedThenDelegateFailsBeforeEmitting_failsTheFallback() {
+    // Arrange: the caller's early output is dropped; its delegate then fails, so it falls back.
+    val child = SetCallerOutputThenFailChild("child", "EARLY")
+    val dispatcher = FailureCatchingDispatcher("dispatcher", child, "FALLBACK", useAsOutput = true)
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+
+    // Act
+    val error = assertFailsWith<IllegalStateException> { runWorkflow(workflow) }
+
+    // Assert: the dropped output still counts after the release, as in adk-python.
+    assertContains(error.message!!, "produced a second output")
   }
 
   @Test
@@ -1008,17 +1151,23 @@ class DynamicDispatchTest {
   }
 
   @Test
-  fun runNode_delegateFailsAfterEmittingOutput_callerCannotFallBack() {
+  fun runNode_delegateFailsAfterEmittingOutput_dropsTheCallersFallback() {
     // Arrange: the delegate already emitted its output for the caller when it fails.
     val child = EmitThenFailChild("child", "CHILD_OUT")
     val dispatcher = FailureCatchingDispatcher("dispatcher", child, "FALLBACK", useAsOutput = true)
-    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
 
     // Act
-    val error = assertFailsWith<IllegalStateException> { runWorkflow(workflow) }
+    val events = runWorkflow(workflow)
 
     // Assert: the caller's output is already the one the delegate emitted.
-    assertContains(error.message!!, "delegated its output")
+    assertTrue(events.none { it.output == "FALLBACK" })
+    assertEquals(
+      "after:CHILD_OUT",
+      events.single { it.nodeInfo?.path == "wf@1/after@1" && it.output != null }.output,
+    )
   }
 
   @Test
@@ -1155,7 +1304,7 @@ class DynamicDispatchTest {
   }
 
   @Test
-  fun runNode_useAsOutputWorkflowFailsAfterTerminalEmits_callerCannotFallBack() {
+  fun runNode_useAsOutputWorkflowFailsAfterTerminalEmits_dropsTheCallersFallback() {
     // Arrange: the inner workflow's terminal node already emitted its output for the caller before
     // failing.
     val innerWf =
@@ -1165,13 +1314,19 @@ class DynamicDispatchTest {
       )
     val dispatcher =
       FailureCatchingDispatcher("dispatcher", innerWf, "FALLBACK", useAsOutput = true)
-    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
 
     // Act
-    val error = assertFailsWith<IllegalStateException> { runWorkflow(workflow) }
+    val events = runWorkflow(workflow)
 
     // Assert
-    assertContains(error.message!!, "delegated its output")
+    assertTrue(events.none { it.output == "FALLBACK" })
+    assertEquals(
+      "after:CHILD_OUT",
+      events.single { it.nodeInfo?.path == "wf@1/after@1" && it.output != null }.output,
+    )
   }
 
   @Test
@@ -1199,7 +1354,7 @@ class DynamicDispatchTest {
   }
 
   @Test
-  fun runNode_delegateCancelledAfterEmittingOutput_callerCannotFallBack() {
+  fun runNode_delegateCancelledAfterEmittingOutput_dropsTheCallersFallback() {
     // Arrange: the delegate cancels itself after emitting its output; the caller wrongly catches
     // that CancellationException and tries to fall back.
     val child = EmitThenCancelChild("child", "CHILD_OUT")
@@ -1211,27 +1366,36 @@ class DynamicDispatchTest {
         useAsOutput = true,
         catching = CancellationException::class,
       )
-    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
 
     // Act
-    val error = assertFailsWith<IllegalStateException> { runWorkflow(workflow) }
+    val events = runWorkflow(workflow)
 
     // Assert
-    assertContains(error.message!!, "delegated its output")
+    assertTrue(events.none { it.output == "FALLBACK" })
+    assertEquals(
+      "after:CHILD_OUT",
+      events.single { it.nodeInfo?.path == "wf@1/after@1" && it.output != null }.output,
+    )
   }
 
   @Test
-  fun runNode_useAsOutputChildProducesNoOutputThenParentEmits_failsParent() {
-    // Arrange
+  fun runNode_useAsOutputChildProducesNoOutputThenParentEmits_dropsIt() {
+    // Arrange: the delegation holds even though the child finishes without an output.
     val dispatcher =
       Dispatcher("dispatcher", StubNode("child"), useAsOutput = true, ownOutput = "OWN")
-    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher)))
+    val after = EchoChild("after", "after")
+    val workflow =
+      Workflow(name = "wf", edges = listOf(Edge(Start, dispatcher), Edge(dispatcher, after)))
 
     // Act
-    val error = assertFailsWith<IllegalStateException> { runWorkflow(workflow) }
+    val events = runWorkflow(workflow)
 
-    // Assert
-    assertContains(error.message!!, "delegated its output")
+    // Assert: the dispatcher has no output, so its successor gets no input.
+    assertTrue(events.none { it.output == "OWN" })
+    assertEquals("after:null", events.single { it.nodeInfo?.path == "wf@1/after@1" }.output)
   }
 
   @Test

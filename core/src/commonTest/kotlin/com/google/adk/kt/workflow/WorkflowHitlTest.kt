@@ -1670,6 +1670,41 @@ class WorkflowHitlTest {
   }
 
   @Test
+  fun resume_delegatingNodeReturningItsReplayedChildsOutput_outputsItOnce() {
+    // Arrange: `router` returns its delegate's result and then asks, so turn 2 reruns it.
+    val child = node<Any?, String>("child") { _, _ -> "CHILD_OUT" }
+    val router =
+      node<Any?, String?>("router", rerunOnResume = true) { ctx, _ ->
+        val result = ctx.runNode(child, useAsOutput = true) as String?
+        if (ctx.resumeInputs["ask_1"] == null) requestInput(interruptId = "ask_1")
+        result
+      }
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, router), Edge(router, CaptureInput("reply"))),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val answered = session.turn(answer("ask_1", mapOf("ok" to true)))
+
+    // Assert: the rerun sends the replayed output once, as its own, and the successor gets it.
+    assertTrue(answered.none { it.errorCode != null }, "expected no failed node")
+    assertEquals(
+      listOf<Any?>("CHILD_OUT"),
+      answered
+        .filter { it.nodeInfo?.path == "wf@1/router@1" && it.output != null }
+        .map { it.output },
+    )
+    assertEquals(
+      mapOf("received" to "CHILD_OUT"),
+      answered.single { it.nodeInfo?.path == "wf@1/reply@1" }.output,
+    )
+  }
+
+  @Test
   fun resumableWorkflow_run_checkpointsEachNodeAndEndsWithEndOfAgent() {
     // Arrange
     val prep = Emitter("prep", "prep_out")
@@ -3596,6 +3631,38 @@ class WorkflowHitlTest {
       parentEvents.map { it.nodeInfo?.path to it.output },
     )
     assertEquals(1, runs)
+  }
+
+  @Test
+  fun requireConfirmation_confirmedNodeWhoseOnlyOutputIsDropped_isNotRerunWhenALaterNodeResumes() {
+    // Arrange: once confirmed, it delegates to a child with no output; its own fallback is dropped.
+    var runs = 0
+    var childRuns = 0
+    val child =
+      node<Any?, String?>("child") { _, _ ->
+        childRuns += 1
+        null
+      }
+    val parent =
+      node<Any?, String?>("parent", requireConfirmation = true) { ctx, _ ->
+        runs += 1
+        val unused = ctx.runNode(child, useAsOutput = true)
+        "fallback"
+      }
+    val review = Ask("review", RequestInput(interruptId = "review", message = "Review?"))
+    val session =
+      WorkflowSession(
+        Workflow(name = "wf", edges = listOf(Edge(Start, parent), Edge(parent, review)))
+      )
+    session.advance(userMessage("go"))
+    session.advance(answer("wf_tool_confirmation:wf@1/parent@1", mapOf("confirmed" to true)))
+
+    // Act
+    session.advance(answer("review", mapOf("ok" to true)))
+
+    // Assert
+    assertEquals(1, runs)
+    assertEquals(1, childRuns)
   }
 
   @Test
