@@ -16,10 +16,6 @@
 
 package com.google.adk.kt.agents
 
-import com.google.adk.kt.collections.concurrentMutableMapOf
-import com.google.adk.kt.sessions.Session
-import com.google.adk.kt.sessions.SessionKey
-import com.google.adk.kt.sessions.State
 import com.google.adk.kt.testing.DummyAgent
 import com.google.adk.kt.testing.testInvocationContext
 import com.google.adk.kt.testing.userMessage
@@ -51,24 +47,10 @@ class ReadonlyContextImplTest {
 
   @Test
   fun readonlyContext_state_isDefensiveCopy() {
-    val state = State(concurrentMutableMapOf<String, Any>().apply { put("key", "value") })
-    val session =
-      Session(
-        key = SessionKey(appName = "app-name", userId = "user-id", id = "session-id"),
-        state = state,
-        events = mutableListOf(),
-      )
-    val context =
-      testInvocationContext(
-        session = session,
-        agent = DummyAgent("agent"),
-        invocationId = "test-id",
-      )
+    val context = testInvocationContext(agent = DummyAgent("agent"), invocationId = "test-id")
     val readonlyContext = context.toReadonlyContext()
-    val copyState = readonlyContext.state.toMutableMap()
 
-    copyState["key"] = "new-value"
-    assertEquals("value", context.session.state["key"])
+    assertNotSame(context.session.state, readonlyContext.state)
   }
 
   @Test
