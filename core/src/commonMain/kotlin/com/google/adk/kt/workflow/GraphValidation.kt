@@ -21,12 +21,16 @@ package com.google.adk.kt.workflow
 import com.google.adk.kt.agents.AgentMode
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
+import com.google.adk.kt.annotations.FrameworkInternalApi
+import com.google.adk.kt.fitsInto
+import com.google.adk.kt.serialization.adkJson
+import com.google.adk.kt.types.Schema
 
 /**
  * Checks a graph is runnable, throwing [GraphValidationException] on the first problem.
  *
- * Every rule here rejects a graph that would otherwise fail confusingly at run time, or not fail at
- * all: a node nothing reaches never runs, and an unconditional cycle never terminates.
+ * It rejects an unreachable node, an unconditional cycle, and an edge where some value its source
+ * admits does not fit its target's input schema.
  */
 internal fun validateGraph(nodes: List<Node>, edges: List<Edge>) {
   val nodeNames = validateUniqueNames(nodes)
@@ -37,6 +41,7 @@ internal fun validateGraph(nodes: List<Node>, edges: List<Edge>) {
   validateDefaultRoutes(edges)
   validateNoUnconditionalCycles(edges, nodeNames)
   validateChatAgentWiring(edges)
+  validateStaticSchemas(edges)
 }
 
 private fun fail(message: String): Nothing =
@@ -171,3 +176,25 @@ internal fun validateChatAgentWiring(edges: List<Edge>) {
     )
   }
 }
+
+/**
+ * Rejects an edge whose source output schema and target input schema are both set and some value
+ * the source admits does not fit the target, as [fitsInto] decides.
+ */
+private fun validateStaticSchemas(edges: List<Edge>) {
+  for (edge in edges) {
+    val output = edge.from.outputSchema ?: continue
+    val target = edge.to
+    val input =
+      (if (target is FunctionNode<*, *>) target.edgeInputSchema else target.inputSchema) ?: continue
+    if (!output.fitsInto(input)) {
+      fail(
+        "Schema mismatch on edge ${edge.from.name} -> ${edge.to.name}. Output schema" +
+          " ${output.toJson()} does not fit input schema ${input.toJson()}."
+      )
+    }
+  }
+}
+
+@OptIn(FrameworkInternalApi::class)
+private fun Schema.toJson(): String = adkJson.encodeToString(Schema.serializer(), this)

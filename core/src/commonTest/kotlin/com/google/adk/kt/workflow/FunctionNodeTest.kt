@@ -298,20 +298,46 @@ class FunctionNodeTest {
   }
 
   @Test
-  fun node_frameworkTypes_haveAClosedInputSchemaButNoOutputSchema() {
+  fun node_frameworkTypes_haveClosedSchemasExceptAnEventOutput() {
     // Arrange
     val readMessage = node("read_message") { _, message: Content -> message.text() }
     val readEvent = node("read_event") { _, event: Event -> event.author }
     val echoMessage = node<Any?, Content>("echo_message") { _, _ -> startMessage }
+    val echoEvent = node<Any?, Event>("echo_event") { _, _ -> Event(author = "a") }
 
     // Act
     val messageSchema = assertNotNull(readMessage.inputSchema)
+    val returnedMessageSchema = assertNotNull(echoMessage.outputSchema)
 
     // Assert
     assertEquals(setOf("role", "parts"), messageSchema.properties?.keys)
     assertEquals(false, messageSchema.additionalProperties)
+    assertEquals(setOf("role", "parts"), returnedMessageSchema.properties?.keys)
+    assertEquals(false, returnedMessageSchema.additionalProperties)
     assertNotNull(readEvent.inputSchema)
-    assertNull(echoMessage.outputSchema)
+    assertNull(echoEvent.outputSchema)
+  }
+
+  /** The edge check rejects a class whose properties a closed `Content` schema does not declare. */
+  @Test
+  fun workflow_objectIntoContentPort_failsAtBuild() {
+    // Arrange
+    val produceOrder =
+      node<Any?, PortOrder>("produce_order") { _, _ -> PortOrder(id = "o1", note = secret) }
+    val readMessage = node("read_message") { _, message: Content -> message.text() }
+
+    // Act
+    val error =
+      assertFailsWith<GraphValidationException> {
+        Workflow(
+            name = "wf",
+            edges = listOf(Edge(Start, produceOrder), Edge(produceOrder, readMessage)),
+          )
+          .graph
+      }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "Schema mismatch on edge produce_order -> read_message")
   }
 
   /** Reads the user's message by the first node's input type: text, or JSON with literals. */

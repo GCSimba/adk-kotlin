@@ -236,6 +236,15 @@ private constructor(
   }
 
   /**
+   * The schema an edge into this node must fit: a `Content` port's explicit schema checks the
+   * message's text, which only a run sees, so the edge checks the port's `Content` schema instead.
+   */
+  internal val edgeInputSchema: Schema?
+    get() =
+      if (explicitInputSchema != null && inputCodec.classifier == Content::class) inputCodec.schema
+      else inputSchema
+
+  /**
    * Checks [nodeInput] against an explicit [inputSchema] as it arrives, then makes the checked
    * value an [I]; a `Content` port receives the message itself. A parallel node passes it through,
    * and its item node checks each item.
@@ -592,9 +601,16 @@ private val FRAMEWORK_TYPES: Set<KClass<*>> = setOf(Content::class, Event::class
  */
 private val SERIALIZER_FREE_TYPES: Set<KClass<*>> = FRAMEWORK_TYPES + setOf(Any::class, Unit::class)
 
-/** Infers an output port's schema, except for framework types, which pass through as they are. */
+/**
+ * Infers an output port's schema; an [Event] output passes through as it is, so it has none. A
+ * serialized `Content` omits unset fields, so its schema requires none.
+ */
 private fun inferredOutputSchema(codec: PortCodec<*>): Schema? =
-  if (codec.classifier in FRAMEWORK_TYPES) null else codec.outputSchema
+  when (codec.classifier) {
+    Event::class -> null
+    Content::class -> codec.schema
+    else -> codec.outputSchema
+  }
 
 /**
  * Returns [value] as a node outputs it and a schema checks it: a framework value as it is, and
@@ -609,8 +625,15 @@ internal fun PortCodec<*>.schemaForm(value: Any?, what: String): Any? =
 
 /**
  * Creates a [FunctionNode] that runs [block], which uses `context.state`, `context.updateState` and
- * [requestInput]. Its inferred output schema requires every field, its inferred input schema only
- * fields without defaults. Explicit schemas apply each run.
+ * [requestInput]. An edge into it builds only if the predecessor's output schema fits its input
+ * schema; inferred output schemas require every field, inferred input schemas only fields without
+ * defaults.
+ *
+ * For example, an output `DefOrder(id, total, qty = 1)` feeds an input `ReqOrder(id, total, qty)`:
+ * the output always carries `qty`, which the input requires.
+ *
+ * Explicit schemas apply each run, except to a rejected confirmation's output and to a
+ * [requestInput] answer used as the output.
  *
  * The block's return value, a [Content] included, is the node's output; emitting an event with an
  * output or calling `Context.setOutput` fails the node. A node that talks to an agent node sends

@@ -53,7 +53,20 @@ import kotlinx.serialization.Serializable
 
 @Serializable @JvmInline private value class RelaxedTicketId(val raw: String)
 
+@Serializable
+private data class RelaxedNotedOrder(val item: String, val quantity: Int, val note: String)
+
 @Serializable private data class RelaxedQuery(val project: String, val maxResults: Int = 5)
+
+@Serializable private data class RelaxedStock(val id: String, val quantity: Int = 1)
+
+@Serializable private data class RelaxedStockNeed(val id: String, val quantity: Int)
+
+@Serializable private data class RelaxedTag(val id: String)
+
+@Serializable private data class RelaxedLine(val stock: RelaxedStock)
+
+@Serializable private data class RelaxedNeedLine(val stock: RelaxedStockNeed)
 
 /** Runs [workflow] through [InMemoryRunner] on the user [message]: its events and final session. */
 private fun runApp(workflow: Workflow, message: String = "go"): Pair<List<Event>, Session> =
@@ -197,6 +210,132 @@ class RelaxedInputsRunnerTest {
     assertEquals(3L, session.state["count"])
     assertEquals(4L, session.state["total"])
     assertEquals(mapOf<String, Any>("total" to "4"), emitted)
+  }
+
+  @Test
+  fun edgeCheck_valueTheConsumerCannotTake_failsAtBuild() {
+    // Arrange
+    val maybe = node<Any?, Int?>("maybe") { _, _ -> 1 }
+    val needsInt = node("needs_int") { _, n: Int -> n }
+    val noted = node<Any?, RelaxedNotedOrder>("noted") { _, _ -> RelaxedNotedOrder("pen", 1, "n") }
+    val plain = node("plain") { _, order: RelaxedOrder -> order.item }
+    val message = node("message") { _, content: Content -> content.text() }
+
+    // Act
+    val nullable = assertFailsWith<GraphValidationException> { runApp(chain(maybe, needsInt)) }
+    val superset = assertFailsWith<GraphValidationException> { runApp(chain(noted, plain)) }
+    val intoContent =
+      assertFailsWith<GraphValidationException> {
+        runApp(chain(node<Any?, RelaxedOrder>("order") { _, _ -> RelaxedOrder("pen", 1) }, message))
+      }
+
+    // Assert
+    assertContains(nullable.message.orEmpty(), "maybe -> needs_int")
+    assertContains(superset.message.orEmpty(), "noted -> plain")
+    assertContains(intoContent.message.orEmpty(), "order -> message")
+  }
+
+  /** A returned Content travels as JSON, so only a Content or `Any?` port takes it. */
+  @Test
+  fun edgeCheck_returnedContent_buildsOnlyIntoContentOrAnyPorts() {
+    // Arrange
+    fun draft() = node<Any?, Content>("draft") { _, _ -> Content.fromText(Role.MODEL, "hi") }
+    val send = node("send") { _, text: String -> text }
+    val forward = node("forward") { _, content: Content -> content.text() }
+    val keep = node<Any?, Any?>("keep") { _, value -> (value as Map<*, *>)["role"] }
+
+    // Act
+    val intoString = assertFailsWith<GraphValidationException> { runApp(chain(draft(), send)) }
+    val intoContent = lastOutput(chain(draft(), forward))
+    val intoAny = lastOutput(chain(draft(), keep))
+
+    // Assert
+    assertContains(intoString.message.orEmpty(), "Schema mismatch on edge draft -> send")
+    assertEquals("hi", intoContent)
+    assertEquals("model", intoAny)
+  }
+
+  /** A returned Content's schema requires no field its JSON form may omit. */
+  @Test
+  fun returnedContent_intoAPortWithTheProducersSchema_buildsAndRuns() {
+    // Arrange
+    val draft = node<Any?, Content>("draft") { _, _ -> Content.fromText(Role.MODEL, "hi") }
+    val keep =
+      node<Any?, Any?>("keep", inputSchema = draft.outputSchema) { _, value ->
+        (value as Map<*, *>)["role"]
+      }
+
+    // Act
+    val output = lastOutput(chain(draft, keep))
+
+    // Assert
+    assertEquals("model", output)
+  }
+
+  /** A Content's JSON form from a producer with no schema fails the next port's input check. */
+  @Test
+  fun contentJson_fromASchemaLessProducer_failsAsAnInputMismatch() {
+    // Arrange
+    val draft = Emitter("draft", mapOf("role" to "model", "parts" to listOf(mapOf("text" to "hi"))))
+    val send = node("send") { _, text: String -> text }
+
+    // Act
+    val error = assertFailsWith<NodeInputValidationException> { runApp(chain(draft, send)) }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "input of node 'send' does not match")
+  }
+
+  @Test
+  fun edgeCheck_intIntoNullableInt_buildsAndRuns() {
+    // Arrange
+    val widened = node("widened") { _, n: Int? -> n }
+
+    // Act
+    val output = lastOutput(chain(node<Any?, Int>("one") { _, _ -> 1 }, widened))
+
+    // Assert
+    assertEquals(1L, output)
+  }
+
+  @Test
+  fun edgeCheck_fieldWithADefault_requiredOnOutputOptionalOnInput() {
+    // Arrange
+    val stock = node<Any?, RelaxedStock>("stock") { _, _ -> RelaxedStock("pen") }
+    val tag = node<Any?, RelaxedTag>("tag") { _, _ -> RelaxedTag("pen") }
+    val need = node("need") { _, n: RelaxedStockNeed -> "${n.id}:${n.quantity}" }
+    val restock = node("restock") { _, s: RelaxedStock -> "${s.id}:${s.quantity}" }
+    val lines =
+      node<Any?, List<RelaxedLine>>("lines") { _, _ -> listOf(RelaxedLine(RelaxedStock("pen"))) }
+    val needLines = node("need_lines") { _, l: List<RelaxedNeedLine> -> l.single().stock.quantity }
+
+    // Act
+    val writtenDefault = lastOutput(chain(stock, need))
+    val nestedDefault = lastOutput(chain(lines, needLines))
+    val filledDefault = lastOutput(chain(tag, restock))
+    val missing = assertFailsWith<GraphValidationException> { runApp(chain(tag, need)) }
+
+    // Assert
+    assertEquals("pen:1", writtenDefault)
+    assertEquals(1L, nestedDefault)
+    assertEquals("pen:1", filledDefault)
+    assertContains(missing.message.orEmpty(), "tag -> need")
+  }
+
+  @Test
+  fun edgeCheck_byteArrayOutput_fitsAStringAndNotAList() {
+    // Arrange
+    val bytes = node<Any?, ByteArray>("bytes") { _, _ -> byteArrayOf(1, 2) }
+    val text = node("text") { _, encoded: String -> encoded }
+    val numbers = node("numbers") { _, n: List<Int> -> n.size }
+
+    // Act
+    val encoded = lastOutput(chain(bytes, text))
+    val error = assertFailsWith<GraphValidationException> { runApp(chain(bytes, numbers)) }
+
+    // Assert
+    assertEquals("AQI=", encoded)
+    assertContains(error.message.orEmpty(), "bytes -> numbers")
   }
 
   @Test
