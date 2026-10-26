@@ -26,13 +26,17 @@ import com.google.adk.kt.apps.App
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.runners.InMemoryRunner
+import com.google.adk.kt.serialization.adkJson
+import com.google.adk.kt.serialization.jsonElementToAny
 import com.google.adk.kt.sessions.Session
 import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.Schema
 import com.google.adk.kt.types.Type
+import kotlin.jvm.JvmInline
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -43,6 +47,13 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.Serializable
+
+@Serializable private data class RelaxedOrder(val item: String, val quantity: Int)
+
+@Serializable @JvmInline private value class RelaxedTicketId(val raw: String)
+
+@Serializable private data class RelaxedQuery(val project: String, val maxResults: Int = 5)
 
 /** Runs [workflow] through [InMemoryRunner] on the user [message]: its events and final session. */
 private fun runApp(workflow: Workflow, message: String = "go"): Pair<List<Event>, Session> =
@@ -60,8 +71,103 @@ private fun lastOutput(workflow: Workflow, message: String = "go"): Any? =
 private fun chain(vararg nodes: Node): Workflow =
   Workflow(name = "wf", edges = (listOf(Start) + nodes).zipWithNext { a, b -> Edge(a, b) })
 
-/** How values are read where they enter a schema, end to end through a runner. */
+/** How values are read where they enter a port or a schema, end to end through a runner. */
 class RelaxedInputsRunnerTest {
+
+  @Test
+  fun userMessage_intoStringOrClassPort_readsAsTextOrJson() {
+    // Arrange
+    val greet = node("greet") { _, name: String -> "Hi $name" }
+    val total = node("total") { _, order: RelaxedOrder -> "${order.item}:${order.quantity}" }
+
+    // Act
+    val greeting = lastOutput(chain(greet), "Ada")
+    val order = lastOutput(chain(total), """{"item": "pen", "quantity": "2"}""")
+
+    // Assert
+    assertEquals("Hi Ada", greeting)
+    assertEquals("pen:2", order)
+  }
+
+  @Test
+  fun userMessage_intoByteArrayPort_readsAsBase64Text() {
+    // Arrange
+    val size = node("size") { _, b: ByteArray -> b.size }
+
+    // Act: base64 text that also reads as a JSON number.
+    val decodedSize = lastOutput(chain(size), "1234")
+
+    // Assert
+    assertEquals(3L, decodedSize)
+  }
+
+  @Test
+  fun typedPort_wholeNumberOrCapitalizedTrue_takesTheIntRejectsTheBoolean() {
+    // Arrange
+    val produceWhole = node<Any?, Any?>("produce") { _, _ -> 42.0 }
+    val double = node("double") { _, n: Int -> n * 2 }
+    val produceWord = node<Any?, Any?>("produce") { _, _ -> "TRUE" }
+    val negate = node("negate") { _, b: Boolean -> !b }
+
+    // Act
+    val doubled = lastOutput(chain(produceWhole, double))
+    val error = assertFailsWith<NodeInputValidationException> { runApp(chain(produceWord, negate)) }
+
+    // Assert
+    assertEquals(84L, doubled)
+    assertContains(error.message.orEmpty(), "input of node 'negate' does not match")
+  }
+
+  @Test
+  fun explicitInputSchema_integersExtraKeysAndEnum_convertsKeepsAndEnforces() {
+    // Arrange
+    val countSchema =
+      Schema(type = Type.OBJECT, properties = mapOf("count" to Schema(type = Type.INTEGER)))
+    val colorSchema = Schema(type = Type.STRING, enum = listOf("red"))
+    fun passThrough(schema: Schema) = node<Any?, Any?>("check", inputSchema = schema) { _, v -> v }
+    fun producing(value: Any) = node<Any?, Any?>("produce") { _, _ -> value }
+
+    // Act
+    val quoted = lastOutput(chain(producing(mapOf("count" to "3")), passThrough(countSchema)))
+    val whole = lastOutput(chain(producing(mapOf("count" to 30.0)), passThrough(countSchema)))
+    val extra =
+      lastOutput(chain(producing(mapOf("count" to 1, "unit" to "kg")), passThrough(countSchema)))
+    val error =
+      assertFailsWith<NodeInputValidationException> {
+        runApp(chain(producing("blue"), passThrough(colorSchema)))
+      }
+
+    // Assert
+    assertEquals(mapOf("count" to 3L), quoted)
+    assertEquals(mapOf("count" to 30L), whole)
+    assertEquals(mapOf("count" to 1L, "unit" to "kg"), extra)
+    assertContains(error.message.orEmpty(), "enum")
+  }
+
+  @Test
+  fun explicitInputSchema_keyOnlyTheTypeDefaults_fails() {
+    // Arrange
+    val requiresMax =
+      Schema(
+        type = Type.OBJECT,
+        properties =
+          mapOf(
+            "project" to Schema(type = Type.STRING),
+            "maxResults" to Schema(type = Type.INTEGER),
+          ),
+        required = listOf("project", "maxResults"),
+      )
+    val search = node("search", inputSchema = requiresMax) { _, q: RelaxedQuery -> q.maxResults }
+
+    // Act
+    val error =
+      assertFailsWith<NodeInputValidationException> {
+        runApp(chain(search), """{"project": "ADK"}""")
+      }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "lacks required 'maxResults'")
+  }
 
   @Test
   fun stateSchema_quotedInteger_storesTheCheckedValue() {
@@ -94,11 +200,94 @@ class RelaxedInputsRunnerTest {
   }
 
   @Test
+  fun contentPort_objectFromAnUncheckedProducer_fails() {
+    // Arrange: a custom node declares no output schema, so the decode guards the port.
+    val order = Emitter("order", mapOf("item" to "pen", "quantity" to 1))
+    val message = node("message") { _, content: Content -> content.text() }
+
+    // Act
+    val error = assertFailsWith<NodeInputValidationException> { runApp(chain(order, message)) }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "input of node 'message' does not match")
+  }
+
+  @Test
+  fun adkTypePort_objectOfAnotherShape_failsAndASavedOneReadsBack() {
+    // Arrange: a custom node declares no output schema, so the decode guards the port.
+    val part = Part(text = "hi")
+    val savedPart = jsonElementToAny(adkJson.encodeToJsonElement(Part.serializer(), part))
+    val readPart = node("read_part") { _, p: Part -> p.text }
+
+    // Act
+    val readBack = lastOutput(chain(Emitter("saved", savedPart), readPart))
+    val error =
+      assertFailsWith<NodeInputValidationException> {
+        runApp(chain(Emitter("order", mapOf("id" to "a1", "total" to 3)), readPart))
+      }
+
+    // Assert
+    assertEquals("hi", readBack)
+    assertContains(error.message.orEmpty(), "input of node 'read_part' does not match")
+  }
+
+  @Test
+  fun closedSchema_undeclaredKey_fails() {
+    // Arrange
+    val closed =
+      Schema(
+        type = Type.OBJECT,
+        properties = mapOf("count" to Schema(type = Type.INTEGER)),
+        additionalProperties = false,
+      )
+    val produce = node<Any?, Any?>("produce") { _, _ -> mapOf("count" to 1, "unit" to "kg") }
+    val check = node<Any?, Any?>("check", inputSchema = closed) { _, v -> v }
+
+    // Act
+    val error = assertFailsWith<NodeInputValidationException> { runApp(chain(produce, check)) }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "has a key the schema does not declare")
+  }
+
+  @Test
+  fun userMessage_literalThatIsNotStrictJson_failsATypedPort() {
+    // Arrange
+    val negate = node("negate") { _, b: Boolean -> !b }
+    val double = node("double") { _, n: Int -> n * 2 }
+
+    // Act
+    val accepted = lastOutput(chain(negate), "true")
+    val failures =
+      listOf(
+          "TRUE" to negate,
+          "NaN" to double,
+          "Infinity" to double,
+          "3_000" to double,
+          "007" to double,
+          "+3" to double,
+          "3d" to double,
+          "0x1p3" to double,
+        )
+        .map { (message, port) ->
+          assertFailsWith<NodeInputValidationException> { runApp(chain(port), message) }
+        }
+
+    // Assert
+    assertEquals(false, accepted)
+    for (error in failures) assertContains(error.message.orEmpty(), "input of node '")
+  }
+
+  @Test
   fun outputSchemas_valueThatFits_outputTheCheckedValue() {
     // Arrange
     val countSchema =
       Schema(type = Type.OBJECT, properties = mapOf("count" to Schema(type = Type.INTEGER)))
     val colorSchema = Schema(type = Type.STRING, enum = listOf("red"))
+    val functionNode =
+      node<Any?, Any?>("produce", outputSchema = countSchema) { _, _ ->
+        mapOf("count" to "3", "unit" to "kg")
+      }
     val customNode = Emitter("emit", mapOf("count" to 4.0))
     // A next node shows the checked output a successor receives.
     fun workflowOutput(value: Any, schema: Schema): Workflow {
@@ -112,6 +301,7 @@ class RelaxedInputsRunnerTest {
     }
 
     // Act
+    val fromFunction = lastOutput(chain(functionNode))
     val fromCustom = lastOutput(chain(CheckedEmitter(customNode, countSchema)))
     val fromWorkflow = lastOutput(workflowOutput(mapOf("count" to "5"), countSchema))
     val inEnum = lastOutput(workflowOutput("red", colorSchema))
@@ -119,6 +309,7 @@ class RelaxedInputsRunnerTest {
       assertFailsWith<IllegalArgumentException> { runApp(workflowOutput("blue", colorSchema)) }
 
     // Assert
+    assertEquals(mapOf("count" to 3L, "unit" to "kg"), fromFunction)
     assertEquals(mapOf("count" to 4L), fromCustom)
     assertEquals(mapOf("count" to 5L), fromWorkflow)
     assertEquals("red", inEnum)
@@ -220,6 +411,22 @@ class RelaxedInputsRunnerTest {
 
     // Assert
     assertEquals(listOf("wf@1/n@1"), events.filter { it.output != null }.map { it.nodeInfo?.path })
+  }
+
+  /** A message reaches every port whose schema takes a string as its text, unparsed. */
+  @Test
+  fun message_intoStringShapedPorts_isItsText() {
+    // Arrange
+    val ticket = node("ticket") { _, id: RelaxedTicketId -> id.raw }
+    val letter = node("letter") { _, c: Char -> c.toString() }
+
+    // Act
+    val ticketId = lastOutput(chain(ticket), message = "1001")
+    val digit = lastOutput(chain(letter), message = "7")
+
+    // Assert
+    assertEquals("1001", ticketId)
+    assertEquals("7", digit)
   }
 }
 
