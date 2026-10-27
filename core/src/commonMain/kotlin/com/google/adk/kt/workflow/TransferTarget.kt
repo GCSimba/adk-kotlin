@@ -31,10 +31,38 @@ import com.google.adk.kt.processors.isTransferTarget
 internal data class TransferTarget(val agent: BaseAgent, val parent: Context?)
 
 /**
+ * Follows the `transfer_to_agent` handoffs that [first], a run of [node] under [parent] (null at
+ * the top of the invocation), requests, and returns the context of the agent that ends the loop:
+ * one that fails, pauses, or finishes without a transfer. [runHop] runs each target under the
+ * context it resolved to, or at the top of the invocation for null.
+ */
+@ExperimentalWorkflowApi
+internal suspend fun followHandoffs(
+  node: Node,
+  first: Context,
+  parent: Context?,
+  runHop: suspend (agent: BaseAgent, parent: Context?) -> Context,
+): Context {
+  var parentContext = parent
+  var current = node
+  var hop = first
+  while (true) {
+    val state = hop.requireNodeState()
+    if (state.failure != null || state.isPaused) return hop
+    val targetName = hop.actions.transferToAgent ?: return hop
+    require(current is BaseAgent) { "Only agents can request an agent transfer." }
+    val target = resolveTransferTarget(targetName, current, hop, parentContext)
+    parentContext = target.parent
+    current = target.agent
+    hop = runHop(target.agent, target.parent)
+  }
+}
+
+/**
  * Resolves the agent [targetName] names for a transfer requested by [current], which ran as
- * [currentContext] under [parentContext], and the context the target runs under. Only a child, the
- * parent, or a sibling of [current] can be reached, and a task or single-turn child or sibling is
- * not, as the `transfer_to_agent` tool does not offer it.
+ * [currentContext] under [parentContext] (null at the top of the invocation), and the context the
+ * target runs under. Only a child, the parent, or a sibling of [current] can be reached, and a task
+ * or single-turn child or sibling is not, as the `transfer_to_agent` tool does not offer it.
  *
  * @throws IllegalArgumentException for a transfer to itself, a transfer the flags forbid, a target
  *   that is a task or single-turn agent, or one that is unknown or unrelated to [current].

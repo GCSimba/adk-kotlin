@@ -22,11 +22,13 @@ import com.google.adk.kt.SchemaUtils
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
+import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.events.applyRewinds
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.tools.AgentTool
 import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.tools.ToolContext
+import com.google.adk.kt.tools.TransferToAgentTool
 import com.google.adk.kt.tools.agentToolDeclaration
 import com.google.adk.kt.tools.inputSchemaOf
 import com.google.adk.kt.types.Content
@@ -287,6 +289,66 @@ internal fun unresolvedTaskDelegations(
   }
   return callsById.filterKeys { it !in answeredIds }.values.toList()
 }
+
+/**
+ * Returns the `transfer_to_agent` call beside the task delegations of [event], which waits until
+ * those tasks answer, as in Python; null when [event] delegates nothing or does not transfer.
+ */
+internal fun deferredTransferIn(event: Event, tools: Map<String, BaseTool>): FunctionCall? =
+  event
+    .functionCalls()
+    .firstOrNull { it.name == TransferToAgentTool.TRANSFER_TO_AGENT_TOOL_NAME }
+    ?.takeIf { taskDelegationsIn(event, tools).isNotEmpty() }
+
+/**
+ * Returns the deferred `transfer_to_agent` call [owner] made beside task delegations that no
+ * response has answered yet, across the live [events]. A [scope] limits the calls as in
+ * [unresolvedTaskDelegations].
+ */
+internal fun unansweredDeferredTransfer(
+  events: List<Event>,
+  owner: String,
+  tools: Map<String, BaseTool>,
+  scope: String? = null,
+): FunctionCall? {
+  val live = applyRewinds(events)
+  val answeredIds = live.flatMap { it.functionResponses() }.mapNotNullTo(mutableSetOf()) { it.id }
+  return live
+    .filter { it.author == owner && (scope == null || it.isolationScope == scope) }
+    .mapNotNull { deferredTransferIn(it, tools) }
+    .lastOrNull { !it.id.isNullOrEmpty() && it.id !in answeredIds }
+}
+
+/** Returns [event] without its `transfer_to_agent` responses and handoff, which wait for tasks. */
+internal fun withoutTransferResponses(event: Event): Event {
+  val content = event.content ?: return event
+  val isTransfer = { part: Part ->
+    part.functionResponse?.name == TransferToAgentTool.TRANSFER_TO_AGENT_TOOL_NAME
+  }
+  if (content.parts.none(isTransfer)) return event
+  return event.copy(
+    content = content.copy(parts = content.parts.filterNot(isTransfer)),
+    actions = event.actions.copy(transferToAgent = null),
+  )
+}
+
+/** Builds the response that answers a deferred transfer [call] and hands off to its target. */
+internal fun transferResponseEvent(author: String, call: FunctionCall): Event =
+  Event(
+    author = author,
+    content =
+      Content(
+        role = Role.USER,
+        parts =
+          listOf(
+            Part(
+              functionResponse =
+                FunctionResponse(id = call.id, name = call.name, response = mapOf("result" to null))
+            )
+          ),
+      ),
+    actions = EventActions(transferToAgent = call.args["agent_name"] as? String),
+  )
 
 /**
  * Builds the user-authored function response that answers a task delegation [call] with the task's

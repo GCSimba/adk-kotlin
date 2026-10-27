@@ -16,6 +16,7 @@
 package com.google.adk.kt.processors
 
 import com.google.adk.kt.agents.InvocationContext
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.summarizer.TokenThresholdEventCompactor
@@ -26,11 +27,12 @@ import com.google.adk.kt.summarizer.TokenThresholdEventCompactor
  *
  * When the invocation's [InvocationContext.eventsCompactionConfig] has token-threshold compaction
  * configured and the most recently observed prompt token count has reached the threshold, this
- * appends a compaction summary event to the session. Because it runs before [ContentsProcessor],
- * the freshly appended summary is reflected in the contents built for the request. The [LlmRequest]
- * itself is returned unchanged.
+ * appends a compaction summary event, in the agent's isolation scope, to the session. Because it
+ * runs before [ContentsProcessor], the freshly appended summary is reflected in the contents built
+ * for the request. The [LlmRequest] itself is returned unchanged.
  */
 internal class CompactionRequestProcessor : LlmRequestProcessor {
+  @OptIn(FrameworkInternalApi::class)
   override suspend fun process(
     context: InvocationContext,
     request: LlmRequest,
@@ -39,7 +41,12 @@ internal class CompactionRequestProcessor : LlmRequestProcessor {
     val config = context.eventsCompactionConfig ?: return request
     if (!config.hasTokenThresholdConfig()) return request
     val sessionService = context.sessionService ?: return request
-    TokenThresholdEventCompactor(config, context.agent.name, context.branch)
+    TokenThresholdEventCompactor(
+        config,
+        context.agent.name,
+        context.branch,
+        context.frameworkData.isolationScope,
+      )
       .compact(context.session, sessionService)
     return request
   }

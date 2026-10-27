@@ -26,6 +26,8 @@ import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.ResumabilityConfig
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.apps.App
+import com.google.adk.kt.callbacks.AfterAgentCallback
+import com.google.adk.kt.callbacks.CallbackChoice
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.models.LlmRequest
@@ -752,6 +754,95 @@ class AgentTransferLoopTest {
   }
 
   @Test
+  fun runAsync_taskWorkerTransferToChatRoot_rerunsTheRootAtTheTopLevel() = runBlocking {
+    // Arrange: a task worker under a chat root hands off to the root.
+    val worker =
+      LlmAgent(
+        name = "worker",
+        model =
+          DummyModel.createSequential(
+            "m",
+            listOf(
+              transferResponse("root"),
+              LlmResponse(content = Content.fromText(Role.MODEL, "again")),
+            ),
+          ),
+        mode = AgentMode.TASK,
+      )
+    val root =
+      LlmAgent(
+        name = "root",
+        model =
+          DummyModel.createSequential(
+            "m",
+            listOf(
+              modelFunctionCallResponse("worker", mapOf("request" to "do it")),
+              LlmResponse(content = Content.fromText(Role.MODEL, "root done")),
+            ),
+          ),
+        subAgents = listOf(worker),
+        mode = AgentMode.CHAT,
+      )
+    val runner = InMemoryRunner(app = App(appName = "app", rootNode = root))
+
+    // Act
+    val events = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+
+    // Assert: as in ADK Python, the root runs again beside its first run, not nested in it.
+    val paths = events.mapNotNull { it.nodeInfo?.path }
+    assertTrue(paths.any { it.startsWith("root@2") }, "$paths")
+    assertTrue(paths.none { it.startsWith("root@1/root@") }, "$paths")
+  }
+
+  @Test
+  fun runAsync_taskTransferBackToItsParentOnAFollowUp_rerunsTheParentUnderANewRunId() =
+    runBlocking {
+      // Arrange: turn 1 hands off from root to helper; turn 2 starts at helper, whose task hands
+      // back.
+      val worker =
+        LlmAgent(
+          name = "worker",
+          model =
+            DummyModel.createSequential(
+              "m",
+              listOf(
+                transferResponse("helper"),
+                LlmResponse(content = Content.fromText(Role.MODEL, "again")),
+              ),
+            ),
+          mode = AgentMode.TASK,
+        )
+      val helper =
+        LlmAgent(
+          name = "helper",
+          model =
+            DummyModel.createSequential(
+              "m",
+              listOf(
+                LlmResponse(content = Content.fromText(Role.MODEL, "hello")),
+                modelFunctionCallResponse("worker", mapOf("request" to "x")),
+                LlmResponse(content = Content.fromText(Role.MODEL, "helper done")),
+              ),
+            ),
+          subAgents = listOf(worker),
+          mode = AgentMode.CHAT,
+        )
+      val root = chatAgent("root", transferModel("helper"), subAgents = listOf(helper))
+      val runner = InMemoryRunner(app = App(appName = "app", rootNode = root))
+      val unused =
+        runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "hi")).toList()
+
+      // Act
+      val events =
+        runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go on")).toList()
+
+      // Assert: the helper's rerun takes the next run ID instead of repeating `root@1/helper@1`.
+      val paths = events.mapNotNull { it.nodeInfo?.path }
+      assertTrue(paths.any { it.startsWith("root@1/helper@1") }, "$paths")
+      assertTrue(paths.any { it.startsWith("root@1/helper@2") }, "$paths")
+    }
+
+  @Test
   fun runNode_transferToTaskSubAgent_failsDispatchingNode() = runBlocking {
     // Arrange: the tool offers only `helper`, so a model that names the task agent is rejected.
     val worker = LlmAgent(name = "worker", model = replyModel("unused"), mode = AgentMode.TASK)
@@ -770,6 +861,38 @@ class AgentTransferLoopTest {
     // Assert
     assertContains(error.message.orEmpty(), "Cannot transfer to 'worker'")
     assertTrue(events.none { it.author == "worker" })
+  }
+
+  @Test
+  fun runAsync_chatNodeInWorkflowTransfer_runsItsAfterAgentCallbacks() = runBlocking {
+    // Arrange: a chat node inside a workflow hands off to its helper.
+    var afterCallbacks = 0
+    val helper = chatAgent("helper", replyModel("from helper"))
+    val router =
+      LlmAgent(
+        "router",
+        transferModel("helper"),
+        subAgents = listOf(helper),
+        mode = AgentMode.CHAT,
+        afterAgentCallbacks =
+          listOf(
+            AfterAgentCallback {
+              afterCallbacks += 1
+              CallbackChoice.Continue(Unit)
+            }
+          ),
+      )
+    val runner =
+      InMemoryRunner(
+        app = App(appName = "app", rootNode = Workflow("wf", listOf(Edge(Start, router))))
+      )
+
+    // Act
+    val events = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+
+    // Assert: the router's turn finishes at the transfer, so its after-agent callbacks run once.
+    assertEquals(1, afterCallbacks)
+    assertEquals(1, events.count { it.author == "helper" && it.contentText() == "from helper" })
   }
 
   @Test

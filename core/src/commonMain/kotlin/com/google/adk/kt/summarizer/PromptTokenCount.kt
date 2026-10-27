@@ -41,14 +41,21 @@ private const val CHARS_PER_TOKEN = 4
  *   [Event.author] are considered; also used by the estimate fallback to build effective prompt
  *   contents.
  * @param branch The current invocation branch, used by the estimate fallback.
+ * @param isolationScope The scope whose prompt is measured; events of other scopes are skipped.
  */
-internal fun latestPromptTokenCount(events: List<Event>, agentName: String, branch: String?): Int? {
+internal fun latestPromptTokenCount(
+  events: List<Event>,
+  agentName: String,
+  branch: String?,
+  isolationScope: String? = null,
+): Int? {
   for (event in events.asReversed()) {
+    if (event.isolationScope != isolationScope) continue
     if (event.isCompactionEvent()) break
     if (agentName.isNotEmpty() && event.author != agentName) continue
     if (event.usageMetadata?.promptTokenCount != null) return event.usageMetadata.promptTokenCount
   }
-  return estimatePromptTokenCount(events, agentName, branch)
+  return estimatePromptTokenCount(events, agentName, branch, isolationScope)
 }
 
 /**
@@ -63,6 +70,7 @@ private fun estimatePromptTokenCount(
   events: List<Event>,
   agentName: String,
   branch: String?,
+  isolationScope: String?,
 ): Int? {
   val contents =
     HistoryRewriterProcessor()
@@ -71,6 +79,7 @@ private fun estimatePromptTokenCount(
         agentName = agentName,
         currentBranch = branch,
         includeContents = IncludeContents.DEFAULT,
+        isolationScope = isolationScope,
       )
   var totalChars = 0
   for (content in contents) {

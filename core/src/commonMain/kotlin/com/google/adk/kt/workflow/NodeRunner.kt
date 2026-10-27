@@ -18,10 +18,13 @@
 
 package com.google.adk.kt.workflow
 
+import com.google.adk.kt.agents.AgentMode
+import com.google.adk.kt.agents.BaseAgent
 import com.google.adk.kt.agents.ChildRunIds
 import com.google.adk.kt.agents.ChildRuns
 import com.google.adk.kt.agents.Context
 import com.google.adk.kt.agents.InvocationContext
+import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
@@ -87,18 +90,23 @@ private constructor(
   private val childRunIds = ChildRunIds()
   private val childRuns = ChildRuns()
 
+  // A non-single-turn agent reads answers from its own history, so it skips the root scans.
+  private val resumesItself: Boolean =
+    node is BaseAgent &&
+      (node !is LlmAgent || node.nodeMode(invocationContext) != AgentMode.SINGLE_TURN)
+
   // A root reads its invocation's events once, for its own answers and replay.
   private val rootHistory: List<Event>? =
-    if (parent == null) ResumeScan.invocationEvents(invocationContext) else null
+    if (parent == null && !resumesItself) ResumeScan.invocationEvents(invocationContext) else null
+
+  // Reconstruct the ancestor agent path when a follow-up turn starts at a sub-agent.
+  private val nodePath: String =
+    Context.buildNodePath(parent?.nodePath ?: ancestorAgentPath(node), node.name, runId)
 
   // Child nodes receive recovered answers from their parent's scan; only root runs scan here.
   private val resolvedResumeInputs: Map<String, Any?> =
     if (rootHistory != null) {
-      ResumeScan.answersFor(
-        rootHistory,
-        BranchPath.segment(node.name, runId),
-        invocationContext.invocationId,
-      )
+      ResumeScan.answersFor(rootHistory, nodePath, invocationContext.invocationId)
     } else {
       resumeInputs
     }
@@ -161,6 +169,7 @@ private constructor(
       attemptCount = attempt,
       resumeInputs = resolvedResumeInputs,
       useAsOutput = useAsOutput,
+      nodePath = nodePath,
       // A retried workflow restarts node numbering, so finished nodes replay under their paths.
       childRunIds = if (node is Workflow) ChildRunIds() else childRunIds,
       childRuns = if (node is Workflow) ChildRuns() else childRuns,
@@ -210,6 +219,7 @@ private constructor(
       } catch (e: NodeInterruptedException) {
         // A dispatched child paused, or raiseOnWait aborted the run. Any interrupt ids are already
         // recorded where the child was dispatched, so this attempt counts as finished.
+        nodeState.childWaiting = true
         flushPending()
       } catch (e: DynamicNodeFailedException) {
         // A dynamically dispatched child failed; carry its failure up without retrying here.
@@ -403,13 +413,30 @@ private constructor(
      * its context.
      */
     suspend fun runAtTopLevel(node: Node, root: Context): Context =
-      NodeRunner(
+      runTopLevelHop(node, root.invocationContext, root.requireNodeState().eventSink, input = null)
+
+    /**
+     * Runs [node] without a parent activation, under its ancestor agents' path, with a run ID from
+     * the invocation's shared top-level counter, and a task scope when it is a task agent.
+     */
+    private suspend fun runTopLevelHop(
+      node: Node,
+      invocationContext: InvocationContext,
+      sink: EventSink,
+      input: Any?,
+    ): Context {
+      validateRootNodeName(node)
+      val parentPath = ancestorAgentPath(node)
+      val id = invocationContext.frameworkData.nextTopLevelRunId(parentPath.orEmpty(), node.name)
+      return NodeRunner(
           node = node,
-          invocationContext = root.invocationContext,
-          eventSink = root.requireNodeState().eventSink,
-          runId = root.invocationContext.frameworkData.topLevelRunIds.next(node.name),
+          invocationContext = invocationContext,
+          eventSink = sink,
+          runId = id,
+          overrideIsolationScope = taskScope(node, parentPath, id),
         )
-        .run(nodeInput = null)
+        .run(nodeInput = input)
+    }
 
     /**
      * Runs [node] as the root of [context]; only the [com.google.adk.kt.runners.Runner] should
@@ -422,8 +449,6 @@ private constructor(
     // coroutine.
     @Suppress("UnsafeCoroutineCrossing")
     fun runRoot(node: Node, context: InvocationContext): Flow<Event> = flow {
-      validateNodeName(node.name)
-      val runId = context.frameworkData.topLevelRunIds.next(node.name)
       val failure = coroutineScope {
         val channel = Channel<QueuedEvent>(Channel.BUFFERED)
         val failureDeferred = async {
@@ -433,11 +458,7 @@ private constructor(
               channel.send(QueuedEvent(event, processed, nodeFailure))
               processed?.await()
             }
-            NodeRunner(node = node, invocationContext = context, eventSink = sink, runId = runId)
-              .run(nodeInput = rootInput(context))
-              .requireNodeState()
-              .failure
-              ?.cause
+            runRootLoop(node, context, sink)
           } finally {
             // Explicit cause: no-arg close() fails to link against kotlinx-coroutines < 1.11.
             val unused = channel.close(cause = null)
@@ -465,6 +486,59 @@ private constructor(
       }
       if (failure != null) throw failure
     }
+
+    /**
+     * Runs [rootNode] and follows any `transfer_to_agent` handoffs across the agent tree until an
+     * agent finishes without transferring, pauses, or fails.
+     */
+    private suspend fun runRootLoop(
+      rootNode: Node,
+      invocationContext: InvocationContext,
+      sink: EventSink,
+    ): Throwable? {
+      val frameworkData = invocationContext.frameworkData
+      (rootNode as? BaseAgent)?.parentAgent?.let { firstParent ->
+        var prefix = ""
+        for (ancestor in generateSequence(firstParent) { it.parentAgent }.toList().asReversed()) {
+          val id = frameworkData.nextTopLevelRunId(prefix, ancestor.name)
+          prefix = Context.buildNodePath(prefix.ifEmpty { null }, ancestor.name, id)
+        }
+      }
+      val input: Any? = if (rootNode is BaseAgent) null else rootInput(invocationContext)
+      val first = runTopLevelHop(rootNode, invocationContext, sink, input)
+      val last =
+        followHandoffs(rootNode, first, parent = null) { agent, parent ->
+          if (parent == null) {
+            runTopLevelHop(agent, invocationContext, sink, input = null)
+          } else {
+            validateNodeName(agent.name)
+            val id = parent.requireNodeState().nextChildRunId(agent.name)
+            NodeRunner(
+                node = agent,
+                parent = parent,
+                runId = id,
+                overrideIsolationScope = taskScope(agent, parent.nodePath, id),
+              )
+              .run(nodeInput = null)
+          }
+        }
+      return last.requireNodeState().failure?.cause
+    }
+
+    /** A task agent works in a scope named by its node path, as in [Context.runNode]. */
+    private fun taskScope(node: Node, parentPath: String?, runId: String): String? =
+      Context.buildNodePath(parentPath, node.name, runId).takeIf {
+        (node as? LlmAgent)?.mode == AgentMode.TASK
+      }
+
+    /** Returns the static `@1` node path of [node]'s ancestor agents, or null when it has none. */
+    private fun ancestorAgentPath(node: Node): String? =
+      (node as? BaseAgent)?.parentAgent?.let { firstParent ->
+        generateSequence(firstParent) { it.parentAgent }
+          .toList()
+          .asReversed()
+          .joinToString("/") { "${it.name}@1" }
+      }
   }
 }
 

@@ -131,8 +131,10 @@ import kotlinx.coroutines.flow.transformWhile
  * @param includeContents History the model sees. [IncludeContents.NONE] sends only the current
  *   turn; null means [IncludeContents.DEFAULT], except that a single-turn workflow node then runs
  *   without history.
- * @property mode How this agent converses as a workflow node or a sub-agent. Null means
- *   [AgentMode.CHAT] for an agent with a parent or sub-agents, as in Python, and
+ * @property mode How this agent converses as a workflow node or a sub-agent. In an agent tree run
+ *   by a runner, it needs the tree's root to be an [LlmAgent] passed as a node, as with
+ *   `App(rootNode = agent)`; otherwise building the runner throws. Null means [AgentMode.CHAT] for
+ *   an agent with a parent or sub-agents or a root that runs as a workflow node, and
  *   [AgentMode.SINGLE_TURN] otherwise. A [AgentMode.TASK] agent gains a `finish_task` tool, and a
  *   task or single-turn sub-agent is offered to its parent as a tool rather than as a transfer
  *   target; it runs as a child node, so building the parent throws [IllegalArgumentException] if
@@ -344,10 +346,10 @@ class LlmAgent(
       else AgentMode.SINGLE_TURN
 
   /**
-   * The mode this agent runs in as a node: any per-run override set for this agent, else
-   * [defaultMode].
+   * The mode this agent runs in as a node: any per-run override set for this agent (a runner sets
+   * an invocation root's own mode, or chat when it has none), else [defaultMode].
    */
-  private fun nodeMode(context: InvocationContext): AgentMode =
+  internal fun nodeMode(context: InvocationContext): AgentMode =
     context.frameworkData.modeOverrideFor(this) ?: defaultMode()
 
   /**
@@ -425,8 +427,9 @@ class LlmAgent(
    * Runs this agent on [agentContext], running its task sub-agents along the way. Each round runs
    * the agent until the model delegates tasks or ends. The delegated tasks then run as child nodes,
    * in each call's own isolation scope, and their answers start the next round. With a
-   * [finishTool], the run ends once a `finish_task` call succeeds; a `transfer_to_agent` ends it
-   * too, so the dispatch loop runs the target as a node.
+   * [finishTool], the run ends once a `finish_task` call succeeds. A `transfer_to_agent` beside
+   * delegations waits for their answers, then ends the run without another model call, and the
+   * dispatch loop runs its target as a node.
    */
   private fun runWithDelegations(
     context: Context,
@@ -435,16 +438,25 @@ class LlmAgent(
   ): Flow<Any?> = flow {
     val toolsByName = tools.associateBy { it.name }
     answerPendingDelegations(context, toolsByName, ownScopeOnly = finishTool != null)
+    val scope = context.isolationScope.takeIf { finishTool != null }
+    unansweredDeferredTransfer(context.session.events, name, toolsByName, scope)?.let {
+      emitDeferredTransfer(context, it)
+      return@flow
+    }
     val finish = finishTool?.let(::FinishState)
     while (true) {
       val round = DelegationRound()
       emitAll(
         runAsync(agentContext).transformWhile { event ->
-          emitRoundEvent(context, agentContext, event, round, finish, toolsByName)
+          emitRoundEvent(context, event, round, finish, toolsByName)
         }
       )
-      if (round.transferred || round.delegations.isEmpty()) return@flow
+      if (round.delegations.isEmpty()) return@flow
       for (call in round.delegations) emitTaskResponse(context, call)
+      round.deferredTransfer?.let {
+        emitDeferredTransfer(context, it)
+        return@flow
+      }
       if (!canStartNextRound(round, agentContext)) return@flow
     }
   }
@@ -457,8 +469,8 @@ class LlmAgent(
     /** Long-running calls of this round that no response has answered yet. */
     val pendingLongRunningCalls = mutableSetOf<String>()
 
-    /** Whether the round ended at a `transfer_to_agent` handoff. */
-    var transferred = false
+    /** The `transfer_to_agent` call beside this round's delegations, run once they answer. */
+    var deferredTransfer: FunctionCall? = null
   }
 
   /** The `finish_task` tool of a task run and the arguments of its latest call. */
@@ -473,7 +485,6 @@ class LlmAgent(
    */
   private suspend fun FlowCollector<Any?>.emitRoundEvent(
     context: Context,
-    agentContext: InvocationContext,
     event: Event,
     round: DelegationRound,
     finish: FinishState?,
@@ -504,8 +515,8 @@ class LlmAgent(
       }
     }
     emit(event)
-    if (event.actions.transferToAgent != null) return endRoundAtHandoff(agentContext, round)
     round.delegations = taskDelegationsIn(event, toolsByName)
+    round.deferredTransfer = deferredTransferIn(event, toolsByName)
     return round.delegations.isEmpty() || hasEagerToolCalls(event, toolsByName)
   }
 
@@ -518,8 +529,21 @@ class LlmAgent(
     branch: String?,
   ): Boolean {
     if (startsModelRound(event, branch)) return false
-    emit(withFinishTaskRejected(event))
+    // The handoff waits for the delegated tasks, as in Python, so its response comes later.
+    val withoutTransfer = withoutTransferResponses(event)
+    if (withoutTransfer.content == null || withoutTransfer.content.parts.isNotEmpty()) {
+      emit(withFinishTaskRejected(withoutTransfer))
+    }
     return !isOwnStep(event, branch) || event.functionResponses().isEmpty()
+  }
+
+  /** Answers a deferred transfer [call], which hands off once this run ends. */
+  private suspend fun FlowCollector<Any?>.emitDeferredTransfer(
+    context: Context,
+    call: FunctionCall,
+  ) {
+    emit(transferResponseEvent(name, call))
+    endRunAtHandoff(context.invocationContext)
   }
 
   /**
@@ -566,19 +590,6 @@ class LlmAgent(
     val args = finish.args
     if (args == null || !FinishTaskTool.isTerminalResponse(event)) return null
     return FinishStep.Done(finish.tool.taskOutput(args))
-  }
-
-  /**
-   * Leaves a `transfer_to_agent` handoff to the dispatch loop, so the target runs once, as a node.
-   * Ends this agent's run when the invocation is resumable, and returns false to end the round.
-   */
-  private suspend fun FlowCollector<Any?>.endRoundAtHandoff(
-    agentContext: InvocationContext,
-    round: DelegationRound,
-  ): Boolean {
-    round.transferred = true
-    endRunAtHandoff(agentContext)
-    return false
   }
 
   /**
@@ -742,15 +753,12 @@ class LlmAgent(
         shouldPause = true
       }
       // Mark this agent done before target validation so resume does not run it again.
-      if (
-        context.isResumable &&
-          !transferred &&
-          event.author == name &&
-          event.actions.transferToAgent != null
-      ) {
+      if (!transferred && event.author == name && event.actions.transferToAgent != null) {
         transferred = true
-        context.setAgentState(name, endOfAgent = true)
-        emitEndOfAgent(context)
+        if (context.isResumable) {
+          context.setAgentState(name, endOfAgent = true)
+          emitEndOfAgent(context)
+        }
       }
     }
     if (shouldPause || transferred) return@flow
@@ -764,6 +772,14 @@ class LlmAgent(
       emitEndOfAgent(context)
     }
   }
+
+  /** Whether this agent runs as a chat or task node, whose loop follows handoffs itself. */
+  internal fun runsInNodeLoop(context: InvocationContext): Boolean =
+    when (context.frameworkData.modeOverrideFor(this)) {
+      AgentMode.CHAT,
+      AgentMode.TASK -> true
+      else -> false
+    }
 
   @OptIn(FrameworkInternalApi::class)
   private fun executeTurns(context: InvocationContext): Flow<Event> = flow {
@@ -796,7 +812,8 @@ class LlmAgent(
     } while (
       !context.isEndOfInvocation &&
         lastEvent?.isFinalResponse == false &&
-        lastEvent?.actions?.endOfAgent != true
+        lastEvent?.actions?.endOfAgent != true &&
+        (!runsInNodeLoop(context) || lastEvent?.actions?.transferToAgent == null)
     )
   }
 

@@ -41,11 +41,20 @@ import com.google.adk.kt.types.Role
  * @param agentName The current agent name, used when estimating the prompt token count.
  * @param branch The current invocation branch, used when estimating the prompt token count.
  */
-class TokenThresholdEventCompactor(
+class TokenThresholdEventCompactor
+internal constructor(
   private val config: EventsCompactionConfig,
   private val agentName: String,
   private val branch: String?,
+  // Only this scope's events are measured and summarized, and the summary carries it.
+  private val isolationScope: String?,
 ) : EventCompactor {
+
+  constructor(
+    config: EventsCompactionConfig,
+    agentName: String,
+    branch: String?,
+  ) : this(config, agentName, branch, isolationScope = null)
 
   private companion object {
     val logger = LoggerFactory.getLogger(TokenThresholdEventCompactor::class)
@@ -62,12 +71,15 @@ class TokenThresholdEventCompactor(
     // compactor consistent with prompt building (HistoryRewriterProcessor also applies rewinds).
     val liveEvents = applyRewinds(session.events)
 
-    val promptTokenCount = latestPromptTokenCount(liveEvents, agentName, branch) ?: return
+    val promptTokenCount =
+      latestPromptTokenCount(liveEvents, agentName, branch, isolationScope) ?: return
     if (promptTokenCount < tokenThreshold) return
 
-    val compactionWindow = selectTailRetentionWindow(liveEvents, eventRetentionSize) ?: return
-    val compactionEvent = trySummarizeEvents(summarizer, compactionWindow, logger) ?: return
-    val appendedEvent = sessionService.appendEvent(session, compactionEvent)
+    val scopeEvents = liveEvents.filter { it.isolationScope == isolationScope }
+    val compactionWindow = selectTailRetentionWindow(scopeEvents, eventRetentionSize) ?: return
+    val summary = trySummarizeEvents(summarizer, compactionWindow, logger) ?: return
+    val appendedEvent =
+      sessionService.appendEvent(session, summary.copy(isolationScope = isolationScope))
     logger.debug {
       "Token-threshold compaction summarized ${compactionWindow.size} events into " +
         "${appendedEvent.id}."
@@ -123,6 +135,7 @@ class TokenThresholdEventCompactor(
           content = previousCompaction.compactedContent,
           branch = latestCompaction.branch,
           timestamp = previousCompaction.startTimestamp,
+          isolationScope = latestCompaction.isolationScope,
         )
       return listOf(previousCompactionEvent) + eventsToCompact
     }

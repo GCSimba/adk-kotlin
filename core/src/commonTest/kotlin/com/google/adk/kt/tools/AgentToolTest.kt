@@ -16,8 +16,11 @@
 
 package com.google.adk.kt.tools
 
+import com.google.adk.kt.agents.AgentMode
 import com.google.adk.kt.agents.CallbackContext
 import com.google.adk.kt.agents.LlmAgent
+import com.google.adk.kt.agents.SequentialAgent
+import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.apps.App
 import com.google.adk.kt.artifacts.InMemoryArtifactService
 import com.google.adk.kt.callbacks.AfterAgentCallback
@@ -51,6 +54,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 
 class AgentToolTest {
@@ -101,6 +105,90 @@ class AgentToolTest {
     val result = tool.run(context, mapOf("request" to "Hello"))
 
     assertEquals("Response from inner agent", result)
+  }
+
+  @Test
+  @OptIn(ExperimentalWorkflowApi::class)
+  fun run_wrappedTreeWithATaskAgent_runsTheTaskAndReturnsTheReply() = runBlocking {
+    // Arrange: the wrapped coordinator delegates to a task agent, which needs the node path.
+    val worker =
+      LlmAgent(
+        name = "worker",
+        model =
+          DummyModel.createSequential(
+            "w",
+            listOf(modelFunctionCallResponse("finish_task", mapOf("result" to "worked"))),
+          ),
+        description = "Does the work.",
+        mode = AgentMode.TASK,
+      )
+    val coordinator =
+      LlmAgent(
+        name = "coordinator",
+        model =
+          DummyModel.createSequential(
+            "c",
+            listOf(
+              modelFunctionCallResponse("worker", mapOf("request" to "do it")),
+              LlmResponse(content = modelMessage("coordinator done")),
+            ),
+          ),
+        subAgents = listOf(worker),
+      )
+    val tool = AgentTool(coordinator)
+    val context = testToolContext(testInvocationContext(agent = coordinator))
+
+    // Act
+    val result = tool.run(context, mapOf("request" to "go"))
+
+    // Assert
+    assertEquals("coordinator done", result)
+  }
+
+  @Test
+  @OptIn(ExperimentalWorkflowApi::class)
+  fun constructor_nonLlmAgentWithAModeBelow_throws() {
+    // Arrange: only an LlmAgent root can run its tree's modes as a node.
+    val worker = LlmAgent(name = "worker", model = DummyModel("w"), mode = AgentMode.TASK)
+    val steps = SequentialAgent(name = "steps", subAgents = listOf(worker))
+
+    // Act
+    val error = assertFailsWith<IllegalArgumentException> { AgentTool(steps) }
+
+    // Assert
+    assertEquals(
+      "AgentTool runs agent modes only under an LlmAgent, but 'steps' is not one.",
+      error.message,
+    )
+  }
+
+  @Test
+  @OptIn(ExperimentalWorkflowApi::class)
+  fun constructor_singleTurnAgent_throws() {
+    // Arrange: a mode puts the tree on the node path, whose runner rejects a single-turn root.
+    val agent = LlmAgent(name = "single", model = DummyModel("s"), mode = AgentMode.SINGLE_TURN)
+
+    // Act
+    val error = assertFailsWith<IllegalArgumentException> { AgentTool(agent) }
+
+    // Assert
+    assertEquals("AgentTool can't run the single-turn agent 'single' as a root.", error.message)
+  }
+
+  @Test
+  @OptIn(ExperimentalWorkflowApi::class)
+  fun constructor_taskAgent_throws() {
+    // Arrange: a task's output is a finish_task response, which AgentTool's text result loses.
+    val agent = LlmAgent(name = "task", model = DummyModel("t"), mode = AgentMode.TASK)
+
+    // Act
+    val error = assertFailsWith<IllegalArgumentException> { AgentTool(agent) }
+
+    // Assert
+    assertEquals(
+      "AgentTool can't run the task agent 'task'; add it to a chat agent's subAgents.",
+      error.message,
+    )
   }
 
   @Test

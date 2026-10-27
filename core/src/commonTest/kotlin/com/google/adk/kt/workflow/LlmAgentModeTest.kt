@@ -171,22 +171,15 @@ private fun coordinator(
   model: Model,
   subAgents: List<BaseAgent>,
   tools: List<BaseTool> = emptyList(),
-) =
-  LlmAgent(
-    name = "root_agent",
-    model = model,
-    subAgents = subAgents,
-    tools = tools,
-    mode = AgentMode.CHAT,
-  )
+) = LlmAgent(name = "root_agent", model = model, subAgents = subAgents, tools = tools)
 
-/** Runs [root] as the start node of a workflow, where its chat mode keeps the conversation. */
+/** Runs [root] passed as a node, so it may use agent modes. */
 private fun runnerFor(root: BaseAgent, resumable: Boolean = false) =
   InMemoryRunner(
     app =
       App(
         "app",
-        rootNode = Workflow("wf", listOf(Edge(Start, root))),
+        rootNode = root,
         resumabilityConfig = if (resumable) ResumabilityConfig(isResumable = true) else null,
       )
   )
@@ -326,6 +319,19 @@ class LlmAgentModeTest {
   }
 
   @Test
+  fun singleTurnRoot_isRejectedWhenTheRunnerIsBuilt() {
+    // Arrange
+    val root =
+      LlmAgent("root_agent", ModeScriptedModel(text("unused")), mode = AgentMode.SINGLE_TURN)
+
+    // Act
+    val error = assertFailsWith<IllegalArgumentException> { runnerFor(root) }
+
+    // Assert
+    assertContains(error.message.orEmpty(), "must have mode='chat' or 'task'")
+  }
+
+  @Test
   fun taskMode_taskWithTaskSubAgent_runsNestedDelegation() = runBlocking {
     // Arrange: the root delegates to a task agent, which delegates to its own task sub-agent.
     val grandchild =
@@ -403,6 +409,29 @@ class LlmAgentModeTest {
         .flatMap { it.parts }
         .mapNotNull { it.functionResponse?.takeIf { response -> response.name == "finish_task" } }
     assertEquals(listOf(FinishTaskTool.REJECTED_RESPONSE), earlyFinish.map { it.response })
+  }
+
+  @Test
+  fun runAsync_coordinatorOfTaskAgent_followUpGoesToChatSiblingItTransferredTo() = runBlocking {
+    // Arrange: a coordinator of a task agent hands off to a chat sibling.
+    val rootModel =
+      ModeScriptedModel(call("transfer_to_agent", mapOf("agent_name" to "helper")), text("root"))
+    val helper = LlmAgent("helper", ModeScriptedModel(text("helper here"), text("helper again")))
+    val runner =
+      runnerFor(
+        coordinator(
+          rootModel,
+          listOf(taskAgent("worker", ModeScriptedModel(text("unused"))), helper),
+        )
+      )
+    val unused = runner.send("hi")
+
+    // Act
+    val followUp = runner.send("more").contentful()
+
+    // Assert: as in Python, the follow-up goes to the sibling, not back to the coordinator.
+    assertEquals(listOf("helper again"), followUp.map { it.contentText() })
+    assertEquals(1, rootModel.requests.size)
   }
 
   @Test
@@ -516,6 +545,447 @@ class LlmAgentModeTest {
     // Assert
     assertEquals(listOf("a"), scoped.map { it.id })
     assertEquals(listOf("a", "b"), unscoped.map { it.id })
+  }
+
+  @Test
+  fun taskMode_root_runsInScopeNamedByNodePath() = runBlocking {
+    // Arrange
+    val model =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val runner = runnerFor(taskAgent("root_task", model))
+
+    // Act
+    val first = runner.send("go")
+    val second = runner.send("the second one")
+
+    // Assert: the task, and the reply that continues it, share the task's scope, and the reply
+    // finishes the task.
+    assertTrue(first.filter { it.author == "root_task" }.all { it.isolationScope == "root_task@1" })
+    assertTrue(second.any { it.output == mapOf("result" to "done") })
+    val session = checkNotNull(runner.sessionService.getSession(SessionKey("app", "u", "s")))
+    val reply = session.events.single { it.content?.text() == "the second one" }
+    assertEquals("root_task@1", reply.isolationScope)
+    assertEquals("go", model.requests.first().contents.first().text())
+  }
+
+  @Test
+  fun chatMode_turnMixingToolTaskAndTransfer_runsTaskThenTransfers() = runBlocking {
+    // Arrange
+    val lookup = DummyTool("lookup", onRun = { _, _ -> mapOf("ok" to true) })
+    val workerModel = ModeScriptedModel(call("finish_task", mapOf("result" to "done")))
+    val helper = LlmAgent("helper", ModeScriptedModel(text("helper here")))
+    val root =
+      coordinator(
+        ModeScriptedModel(
+          calls(
+            "lookup" to emptyMap(),
+            "worker" to mapOf("request" to "do"),
+            "transfer_to_agent" to mapOf("agent_name" to "helper"),
+          ),
+          text("after task"),
+        ),
+        listOf(taskAgent("worker", workerModel), helper),
+        tools = listOf(lookup),
+      )
+
+    // Act
+    val events = runnerFor(root).send("go")
+
+    // Assert: as in Python, the delegation runs before the node follows the transfer.
+    assertEquals(1, workerModel.requests.size)
+    assertTrue("worker" in events.responseNames())
+    assertEquals("helper", events.contentful().last().author)
+  }
+
+  @Test
+  fun chatMode_resumableTurnMixingTaskAndTransfer_runsEachAgentOnce() = runBlocking {
+    // Arrange: a resumable chat root delegates a task and hands off in the same turn.
+    val workerModel = ModeScriptedModel(call("finish_task", mapOf("result" to "done")))
+    val helperModel = ModeScriptedModel(text("helper here"), text("helper again"))
+    val root =
+      coordinator(
+        ModeScriptedModel(
+          calls(
+            "worker" to mapOf("request" to "do"),
+            "transfer_to_agent" to mapOf("agent_name" to "helper"),
+          ),
+          text("after task"),
+        ),
+        listOf(taskAgent("worker", workerModel), LlmAgent("helper", helperModel)),
+      )
+
+    // Act
+    val events = runnerFor(root, resumable = true).send("go")
+
+    // Assert: the task runs once and the helper answers once, as a node, not also inline.
+    assertEquals(1, workerModel.requests.size)
+    assertEquals(1, helperModel.requests.size, "${events.map { it.author }}")
+  }
+
+  @Test
+  fun chatMode_turnWhoseTaskAsksTheUserAndTransfers_endsTheTurnAtTheQuestion() = runBlocking {
+    // Arrange: one turn delegates to a task that asks a question, and also transfers.
+    val workerModel = ModeScriptedModel(text("Which city?"))
+    val helperModel = ModeScriptedModel(text("helper here"))
+    val root =
+      coordinator(
+        ModeScriptedModel(
+          calls(
+            "worker" to mapOf("request" to "book a trip"),
+            "transfer_to_agent" to mapOf("agent_name" to "helper"),
+          )
+        ),
+        listOf(taskAgent("worker", workerModel), LlmAgent("helper", helperModel)),
+      )
+
+    // Act
+    val events = runnerFor(root).send("go")
+
+    // Assert: as in Python, the turn ends at the question and the helper does not run yet.
+    assertEquals("Which city?", events.contentful().last().contentText())
+    assertTrue(helperModel.requests.isEmpty())
+  }
+
+  @Test
+  fun chatMode_replyToTaskThatAskedBesideATransfer_finishesTheTaskThenTransfers() = runBlocking {
+    // Arrange: one turn delegates to a task that asks a question, and also transfers.
+    val workerModel =
+      ModeScriptedModel(text("Which city?"), call("finish_task", mapOf("result" to "Paris")))
+    val helperModel = ModeScriptedModel(text("helper here"))
+    val rootModel =
+      ModeScriptedModel(
+        calls(
+          "worker" to mapOf("request" to "book a trip"),
+          "transfer_to_agent" to mapOf("agent_name" to "helper"),
+        ),
+        text("root again"),
+      )
+    val runner =
+      runnerFor(
+        coordinator(
+          rootModel,
+          listOf(taskAgent("worker", workerModel), LlmAgent("helper", helperModel)),
+        )
+      )
+    val unused = runner.send("go")
+
+    // Act
+    val reply = runner.send("Paris")
+
+    // Assert: as in Python, the task finishes first, and then the transfer runs without another
+    // model call by the root.
+    assertEquals(
+      listOf("worker", "transfer_to_agent"),
+      reply.responseNames().filter { it != FinishTaskTool.NAME },
+    )
+    assertEquals(
+      listOf("helper here"),
+      reply.filter { it.author == "helper" }.map { it.contentText() },
+    )
+    assertEquals(1, rootModel.requests.size)
+  }
+
+  @Test
+  fun taskMode_taskWhoseInnerTaskAsksBesideATransfer_waitsThenTransfers() = runBlocking {
+    // Arrange: a delegated task delegates to an inner task that asks, and also transfers.
+    val innerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "b")))
+    val helperModel = ModeScriptedModel(text("helper here"))
+    val outerModel =
+      ModeScriptedModel(
+        calls(
+          "inner_task" to mapOf("request" to "pick"),
+          "transfer_to_agent" to mapOf("agent_name" to "helper"),
+        )
+      )
+    val outer =
+      LlmAgent(
+        name = "outer_task",
+        description = "Does outer.",
+        model = outerModel,
+        mode = AgentMode.TASK,
+        subAgents = listOf(taskAgent("inner_task", innerModel), LlmAgent("helper", helperModel)),
+      )
+    val rootModel =
+      ModeScriptedModel(call("outer_task", mapOf("request" to "go")), text("root done"))
+    val runner = runnerFor(coordinator(rootModel, listOf(outer)))
+
+    // Act
+    val first = runner.send("start")
+    val rootRequestsAfterQuestion = rootModel.requests.size
+    val reply = runner.send("b")
+
+    // Assert: as in Python, the first turn ends at the question; the reply finishes the inner task,
+    // then the outer task transfers, and only then does the root go on.
+    assertEquals("which one?", first.contentful().last().contentText())
+    assertEquals(1, rootRequestsAfterQuestion)
+    assertContains(innerModel.requests[1].contents.map { it.text() }, "b")
+    assertEquals(
+      listOf("inner_task", "transfer_to_agent", "outer_task"),
+      reply.responseNames().filter { it != FinishTaskTool.NAME },
+    )
+    assertEquals(1, helperModel.requests.size)
+    assertEquals(1, outerModel.requests.size)
+    assertEquals("root done", reply.contentful().last().contentText())
+  }
+
+  @Test
+  fun taskMode_taskHandingOffToAHelperWhoseTaskAsks_endsTheTurnAtTheQuestion() = runBlocking {
+    // Arrange: a delegated task hands off to a helper, whose own task asks the user.
+    val innerModel = ModeScriptedModel(text("which one?"))
+    val helper =
+      LlmAgent(
+        name = "helper",
+        model = ModeScriptedModel(call("inner_task", mapOf("request" to "pick")), text("ok")),
+        subAgents = listOf(taskAgent("inner_task", innerModel)),
+      )
+    val outer =
+      LlmAgent(
+        name = "outer_task",
+        description = "Does outer.",
+        model = ModeScriptedModel(call("transfer_to_agent", mapOf("agent_name" to "helper"))),
+        mode = AgentMode.TASK,
+        subAgents = listOf(helper),
+      )
+    val rootModel =
+      ModeScriptedModel(call("outer_task", mapOf("request" to "go")), text("root done"))
+
+    // Act
+    val events = runnerFor(coordinator(rootModel, listOf(outer))).send("start")
+
+    // Assert: the waiting inner task holds the root back, so the turn ends at its question.
+    assertEquals("which one?", events.contentful().last().contentText())
+    assertEquals(1, rootModel.requests.size)
+  }
+
+  @Test
+  fun singleTurnTool_handoffBackToADottedRoot_runsTheRootAgain() = runBlocking {
+    // Arrange: a root whose name has a dot calls a single-turn tool that hands back to it.
+    val finder =
+      LlmAgent(
+        "finder",
+        ModeScriptedModel(call("transfer_to_agent", mapOf("agent_name" to "support.bot"))),
+        description = "Finds things.",
+        mode = AgentMode.SINGLE_TURN,
+      )
+    val root =
+      LlmAgent(
+        "support.bot",
+        ModeScriptedModel(call("finder", mapOf("request" to "look")), text("root again")),
+        subAgents = listOf(finder),
+        mode = AgentMode.CHAT,
+      )
+
+    // Act
+    val events = runnerFor(root).send("go")
+
+    // Assert: the handoff runs the root at the top level instead of failing the tool.
+    val paths = events.filter { it.author == "support.bot" }.mapNotNull { it.nodeInfo?.path }
+    assertEquals(listOf("support.bot@1", "support.bot@2"), paths.distinct(), "$paths")
+    assertTrue(events.none { it.errorCode != null }, "${events.mapNotNull { it.errorMessage }}")
+  }
+
+  @Test
+  fun singleTurnTool_handoffBackToTheAgentAFollowUpStartedAt_getsANewRunId() = runBlocking {
+    // Arrange: turn 1 hands off to `helper`; turn 2 starts at `helper`, whose tool hands back.
+    val finder =
+      LlmAgent(
+        "finder",
+        ModeScriptedModel(call("transfer_to_agent", mapOf("agent_name" to "helper"))),
+        description = "Finds things.",
+        mode = AgentMode.SINGLE_TURN,
+      )
+    val helper =
+      LlmAgent(
+        "helper",
+        ModeScriptedModel(
+          text("helper here"),
+          call("finder", mapOf("request" to "look")),
+          text("helper again"),
+          text("helper done"),
+        ),
+        subAgents = listOf(finder),
+      )
+    val root =
+      coordinator(
+        ModeScriptedModel(call("transfer_to_agent", mapOf("agent_name" to "helper"))),
+        listOf(helper),
+      )
+    val runner = runnerFor(root)
+    val unused = runner.send("hi")
+
+    // Act
+    val events = runner.send("find it")
+
+    // Assert: the handoff back runs `helper` under a new run ID, not its first one again.
+    val paths = events.filter { it.author == "helper" }.mapNotNull { it.nodeInfo?.path }.distinct()
+    assertEquals(2, paths.size, "$paths")
+  }
+
+  @Test
+  fun runAsync_replyToTaskUnderChatSubAgent_resumesThroughItsDelegator() = runBlocking {
+    // Arrange: the root hands off to a chat sub-agent, whose task agent asks a question.
+    val workerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val chatSubModel =
+      ModeScriptedModel(call("task_worker", mapOf("request" to "do it")), text("sub done"))
+    val chatSub =
+      LlmAgent("chat_sub", chatSubModel, subAgents = listOf(taskAgent("task_worker", workerModel)))
+    val root =
+      coordinator(
+        ModeScriptedModel(call("transfer_to_agent", mapOf("agent_name" to "chat_sub"))),
+        listOf(chatSub),
+      )
+    val runner = runnerFor(root)
+    val unused = runner.send("go")
+
+    // Act
+    val second = runner.send("the second one")
+
+    // Assert: as in Python, the chat sub-agent resumes its delegation and goes on with the result.
+    assertTrue("task_worker" in second.responseNames())
+    assertEquals("sub done", second.contentful().last().contentText())
+  }
+
+  @Test
+  fun runAsync_answerToTaskAgentsLongRunningCall_resumesThroughItsDelegator() = runBlocking {
+    // Arrange: the root delegates to a task agent, which pauses on a long-running approval.
+    val approve = DummyTool("approve", isLongRunning = true, onRun = { _, _ -> Unit })
+    val worker =
+      LlmAgent(
+        name = "worker",
+        model =
+          ModeScriptedModel(
+            call("approve", emptyMap()),
+            call("finish_task", mapOf("result" to "approved")),
+          ),
+        description = "Does worker.",
+        tools = listOf(approve),
+        mode = AgentMode.TASK,
+      )
+    val root =
+      coordinator(
+        ModeScriptedModel(call("worker", mapOf("request" to "get approval")), text("all done")),
+        listOf(worker),
+      )
+    val runner = runnerFor(root)
+    val approvalId =
+      runner.send("go").flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+
+    // Act
+    val second = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+
+    // Assert: as in Python, the answer resumes the task through the agent that delegated it.
+    assertTrue("worker" in second.responseNames())
+    assertEquals("all done", second.contentful().last().contentText())
+  }
+
+  @Test
+  fun taskMode_rootWhoseTaskAsksTheUser_resumesThroughTheRootOnTheReply() = runBlocking {
+    // Arrange: a task root delegates to a task agent, which asks the user a question.
+    val worker =
+      taskAgent(
+        "worker",
+        ModeScriptedModel(
+          text("Which city?"),
+          call("finish_task", mapOf("result" to "Paris booked")),
+        ),
+      )
+    val rootModel =
+      ModeScriptedModel(
+        call("worker", mapOf("request" to "book a trip")),
+        call("finish_task", mapOf("result" to "trip done")),
+      )
+    val root =
+      LlmAgent(
+        name = "root_task",
+        model = rootModel,
+        mode = AgentMode.TASK,
+        subAgents = listOf(worker),
+      )
+    val runner = runnerFor(root)
+    val unused = runner.send("plan my trip")
+
+    // Act
+    val reply = runner.send("Paris")
+
+    // Assert: the reply reaches the task through the root, which then finishes its own task.
+    assertTrue("worker" in reply.responseNames())
+    val rootFinish =
+      reply
+        .flatMap { it.functionCalls() }
+        .single { it.name == "finish_task" && it.args["result"] == "trip done" }
+    assertEquals(mapOf("result" to "trip done"), rootFinish.args)
+    assertEquals(2, rootModel.requests.size)
+  }
+
+  @Test
+  fun taskMode_resumableRootReplyByInvocationId_finishesTheTask() = runBlocking {
+    // Arrange: a resumable task root asks the user a question, which ends its turn.
+    val rootModel =
+      ModeScriptedModel(text("Which city?"), call("finish_task", mapOf("result" to "Paris")))
+    val root = LlmAgent(name = "root_task", model = rootModel, mode = AgentMode.TASK)
+    val runner = runnerFor(root, resumable = true)
+    val question = runner.send("plan my trip")
+    val invocationId = question.first { it.author == "root_task" }.invocationId
+
+    // Act: the reply resumes that invocation by its ID.
+    val reply =
+      runner
+        .runAsync(
+          "u",
+          "s",
+          invocationId = invocationId,
+          newMessage = Content.fromText(Role.USER, "Paris"),
+        )
+        .toList()
+
+    // Assert: as in Python, the resumed task root runs and finishes its task.
+    assertEquals(2, rootModel.requests.size)
+    assertTrue(reply.flatMap { it.functionCalls() }.any { it.name == "finish_task" })
+  }
+
+  @Test
+  fun taskMode_rootTransfer_runsTargetOnce() = runBlocking {
+    // Arrange: a task root hands off to its chat sub-agent.
+    val helperModel = ModeScriptedModel(text("helper here"))
+    val root =
+      LlmAgent(
+        name = "root_task",
+        model = ModeScriptedModel(call("transfer_to_agent", mapOf("agent_name" to "helper"))),
+        mode = AgentMode.TASK,
+        subAgents = listOf(LlmAgent("helper", helperModel)),
+      )
+
+    // Act
+    val events = runnerFor(root).send("go")
+
+    // Assert: as in Python, the task stops at its transfer and only the node loop runs the target.
+    assertEquals(1, helperModel.requests.size)
+    assertEquals(1, events.count { it.author == "helper" && it.contentText() == "helper here" })
+  }
+
+  @Test
+  fun taskMode_followUpAfterRootTransfer_reachesTheTargetWithItsHistory() = runBlocking {
+    // Arrange: a task root hands off to its chat sub-agent on the first turn.
+    val helperModel = ModeScriptedModel(text("helper here"))
+    val root =
+      LlmAgent(
+        name = "root_task",
+        model = ModeScriptedModel(call("transfer_to_agent", mapOf("agent_name" to "helper"))),
+        mode = AgentMode.TASK,
+        subAgents = listOf(LlmAgent("helper", helperModel)),
+      )
+    val runner = runnerFor(root)
+    val unused = runner.send("first question")
+
+    // Act
+    val unusedFollowUp = runner.send("second question")
+
+    // Assert: as in Python, the helper answers in the scope it ran in and sees the follow-up.
+    val texts = helperModel.requests.last().contents.map { it.text() }
+    assertContains(texts, "second question")
+    assertContains(texts, "helper here")
   }
 
   @Test
@@ -1096,49 +1566,25 @@ class LlmAgentModeTest {
   }
 
   @Test
-  fun singleTurnTool_outsideAWorkflowNode_answersWithError() = runBlocking {
-    // Arrange: a sequential root runs the coordinator in the classic flow, outside any node.
-    val helperModel = ModeScriptedModel(text("unused"))
-    val helper =
-      LlmAgent("helper", helperModel, description = "A helper.", mode = AgentMode.SINGLE_TURN)
+  fun modeSubAgentsUnderAgentRoot_areRejectedWhenTheRunnerIsBuilt() {
+    // Arrange: a sequential root passed as an agent would run the coordinator in the classic flow.
+    val helper = LlmAgent("helper", ModeScriptedModel(text("unused")), mode = AgentMode.SINGLE_TURN)
+    val coordinatorModel = ModeScriptedModel(text("unused"))
     val coordinator =
       LlmAgent(
         name = "root_agent",
-        model = ModeScriptedModel(call("helper", mapOf("request" to "hi")), text("all done")),
-        subAgents = listOf(helper),
+        model = coordinatorModel,
+        subAgents = listOf(helper, taskAgent("worker", ModeScriptedModel(text("unused")))),
       )
-    val root = SequentialAgent(name = "steps", subAgents = listOf(coordinator))
+    val app =
+      App("app", rootAgent = SequentialAgent(name = "steps", subAgents = listOf(coordinator)))
 
     // Act
-    val events = InMemoryRunner(app = App("app", rootAgent = root)).send("go")
+    val error = assertFailsWith<IllegalArgumentException> { InMemoryRunner(app = app) }
 
-    // Assert: the call is answered with an error, the turn goes on, and the helper never runs.
-    val response = events.flatMap { it.functionResponses() }.single { it.name == "helper" }
-    assertContains(response.response["result"].toString(), "Error running sub-agent")
-    assertEquals("all done", events.contentful().last().contentText())
-    assertTrue(helperModel.requests.isEmpty())
-  }
-
-  @Test
-  fun taskTool_outsideAWorkflowNode_answersWithError() = runBlocking {
-    // Arrange: a sequential root runs the coordinator in the classic flow, outside any node.
-    val workerModel = ModeScriptedModel(text("unused"))
-    val coordinator =
-      LlmAgent(
-        name = "root_agent",
-        model = ModeScriptedModel(call("worker", mapOf("request" to "do it")), text("all done")),
-        subAgents = listOf(taskAgent("worker", workerModel)),
-      )
-    val root = SequentialAgent(name = "steps", subAgents = listOf(coordinator))
-
-    // Act
-    val events = InMemoryRunner(app = App("app", rootAgent = root)).send("go")
-
-    // Assert: the call is answered with an error instead of staying open, and the task never runs.
-    val response = events.flatMap { it.functionResponses() }.single { it.name == "worker" }
-    assertContains(response.response["result"].toString(), "Error running sub-agent")
-    assertEquals("all done", events.contentful().last().contentText())
-    assertTrue(workerModel.requests.isEmpty())
+    // Assert
+    assertContains(error.message.orEmpty(), "Agents [helper, worker] set a mode")
+    assertTrue(coordinatorModel.requests.isEmpty())
   }
 
   @Test
@@ -1166,6 +1612,55 @@ class LlmAgentModeTest {
     assertTrue(third.isNotEmpty())
     assertTrue(third.all { it.invocationId != paused.invocationId })
   }
+
+  @Test
+  fun runAsync_coordinatorRootPlainReplyToPausedTask_continuesInvocation() = runBlocking {
+    // Arrange: an LlmAgent root delegates to a task agent, which asks a question.
+    val workerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val root =
+      coordinator(
+        ModeScriptedModel(call("worker", mapOf("request" to "do it")), text("all done")),
+        listOf(taskAgent("worker", workerModel)),
+      )
+    val runner = runnerFor(root)
+    val paused = runner.send("go").single { it.contentText() == "which one?" }
+
+    // Act
+    val second = runner.send("the second one")
+
+    // Assert: the reply joins the paused task's invocation.
+    assertTrue(second.isNotEmpty())
+    assertTrue(second.all { it.invocationId == paused.invocationId })
+  }
+
+  @Test
+  fun runAsync_coordinatorRootAnswerToOtherCallWhileTaskPaused_doesNotBorrowTaskInvocation() =
+    runBlocking {
+      // Arrange: an approval is left open, then a later delegation pauses on a question.
+      val approve = DummyTool("approve", isLongRunning = true, onRun = { _, _ -> Unit })
+      val root =
+        coordinator(
+          ModeScriptedModel(
+            call("approve", emptyMap()),
+            call("worker", mapOf("request" to "do it")),
+            text("approved"),
+          ),
+          listOf(taskAgent("worker", ModeScriptedModel(text("which one?")))),
+          tools = listOf(approve),
+        )
+      val runner = runnerFor(root)
+      val approvalId =
+        runner.send("approve it").flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+      val paused = runner.send("now the task").single { it.contentText() == "which one?" }
+
+      // Act
+      val third = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+
+      // Assert: the answer to the approval does not join the paused task's invocation.
+      assertTrue(third.isNotEmpty())
+      assertTrue(third.all { it.invocationId != paused.invocationId })
+    }
 
   @Test
   fun runAsync_functionResponseWhileTaskPaused_doesNotBorrowTaskInvocation() = runBlocking {

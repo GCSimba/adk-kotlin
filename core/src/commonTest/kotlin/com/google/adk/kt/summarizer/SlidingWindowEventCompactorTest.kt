@@ -478,6 +478,31 @@ class SlidingWindowEventCompactorTest {
   }
 
   @Test
+  fun compact_scopedTaskEvents_excludedFromSummary() = runBlocking {
+    val summarizer = RecordingSummarizer(returning = compactionEvent(startTs = 100L, endTs = 210L))
+    val sessionService = RecordingSessionService()
+    val compactor =
+      SlidingWindowEventCompactor(
+        EventsCompactionConfig(compactionInterval = 2, overlapSize = 1, summarizer = summarizer)
+      )
+    val session = testSession()
+    val firstUser = userEvent("plan a trip", invocationId = "inv_1", timestamp = 100L)
+    val firstModel = modelEvent("booking it", invocationId = "inv_1", timestamp = 110L)
+    // A task agent's private turns carry its isolation scope; they must never reach the summary.
+    val taskQuestion =
+      modelEvent("Which city?", invocationId = "inv_1", timestamp = 120L)
+        .copy(isolationScope = "task-1")
+    val taskAnswer =
+      userEvent("Paris", invocationId = "inv_2", timestamp = 200L).copy(isolationScope = "task-1")
+    val secondModel = modelEvent("booked Paris", invocationId = "inv_2", timestamp = 210L)
+    session.events.addAll(listOf(firstUser, firstModel, taskQuestion, taskAnswer, secondModel))
+
+    compactor.compact(session, sessionService)
+
+    assertEquals(listOf(firstUser, firstModel, secondModel), summarizer.calls.single())
+  }
+
+  @Test
   fun compact_rewoundInvocationDoesNotCountTowardThreshold() = runTest {
     val summarizer = RecordingSummarizer()
     val sessionService = RecordingSessionService()

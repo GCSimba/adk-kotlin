@@ -961,8 +961,15 @@ data class ContextFrameworkData(
    */
   internal val cancelledNodePaths: MutableMap<String, Unit> = concurrentMutableMapOf()
 
-  /** Run IDs of the nodes that run at the top of the invocation, beside its root node. */
-  internal val topLevelRunIds = ChildRunIds()
+  /**
+   * Run IDs of the nodes that run without a parent activation, by the path of their ancestor agents
+   * (empty for the root), so every top-level handoff of the invocation draws from one counter.
+   */
+  private val topLevelRunIds: MutableMap<String, ChildRunIds> = concurrentMutableMapOf()
+
+  /** The next run ID for a top-level run of [name] under its ancestor agents' [parentPath]. */
+  internal fun nextTopLevelRunId(parentPath: String, name: String): String =
+    topLevelRunIds.getOrPut(parentPath) { ChildRunIds() }.next(name)
 }
 
 /**

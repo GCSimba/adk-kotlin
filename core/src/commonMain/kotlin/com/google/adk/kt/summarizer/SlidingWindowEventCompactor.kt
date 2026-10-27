@@ -55,7 +55,8 @@ class SlidingWindowEventCompactor(private val config: EventsCompactionConfig) : 
     // Drop rewound invocations first so the summary covers only live events. This keeps the
     // compactor consistent with prompt building (HistoryRewriterProcessor also applies rewinds);
     // otherwise rewound content would leak back into future prompts via the compaction summary.
-    val liveEvents = applyRewinds(session.events)
+    // As in Python, a task's scoped events stay out, so its private turns never reach the summary.
+    val liveEvents = applyRewinds(session.events).filter { it.isolationScope == null }
     val compactionWindow = selectCompactionWindow(liveEvents) ?: return
     val compactionEvent = trySummarizeEvents(summarizer, compactionWindow, logger) ?: return
     val appendedEvent = sessionService.appendEvent(session, compactionEvent)

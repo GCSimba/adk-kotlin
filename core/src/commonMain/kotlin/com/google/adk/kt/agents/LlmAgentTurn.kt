@@ -2075,21 +2075,24 @@ internal class LlmAgentTurn(
     // SequentialAgent/LoopAgent (or any workflow agent that doesn't itself emit a transfer back)
     // would leave the parent unable to resume.
 
-    // If a tool requested a transfer to another agent, execute that agent's loop.
-    functionResponseEvent?.actions?.transferToAgent?.let { agentName ->
-      // Live runs hand over to the target in `runLiveSession`, so they skip this path.
-      if (context.liveRequestQueue != null) return@let
-      require(agentName != agent.name) { "Agent '${agent.name}' cannot transfer to itself." }
-      // Declared targets only, so the model cannot reach any other agent in the tree.
-      val targetAgent =
-        requireNotNull(findTransferTargets(agent).firstOrNull { it.name == agentName }) {
-          if (agent.rootAgent.findAgent(agentName) == null) {
-            "Agent '${agent.name}' requested a transfer to an agent that is not in the agent tree."
-          } else {
-            "Agent '${agent.name}' is not allowed to transfer to the requested agent."
+    // A tool's transfer runs the target here, unless a node loop follows it.
+    if (!agent.runsInNodeLoop(context)) {
+      functionResponseEvent?.actions?.transferToAgent?.let { agentName ->
+        // Live runs hand over to the target in `runLiveSession`, so they skip this path.
+        if (context.liveRequestQueue != null) return@let
+        require(agentName != agent.name) { "Agent '${agent.name}' cannot transfer to itself." }
+        // Declared targets only, so the model cannot reach any other agent in the tree.
+        val targetAgent =
+          requireNotNull(findTransferTargets(agent).firstOrNull { it.name == agentName }) {
+            if (agent.rootAgent.findAgent(agentName) == null) {
+              "Agent '${agent.name}' requested a transfer to an agent that is not in the agent " +
+                "tree."
+            } else {
+              "Agent '${agent.name}' is not allowed to transfer to the requested agent."
+            }
           }
-        }
-      emitAll(targetAgent.runAsync(context))
+        emitAll(targetAgent.runAsync(context))
+      }
     }
   }
 

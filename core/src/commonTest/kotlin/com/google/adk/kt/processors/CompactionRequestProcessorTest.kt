@@ -15,7 +15,9 @@
  */
 package com.google.adk.kt.processors
 
+import com.google.adk.kt.agents.ContextFrameworkData
 import com.google.adk.kt.agents.InvocationContext
+import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.sessions.GetSessionConfig
@@ -35,6 +37,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 
 class CompactionRequestProcessorTest {
@@ -110,6 +113,38 @@ class CompactionRequestProcessorTest {
     assertEquals(1, sessionService.appended.size)
     assertTrue(sessionService.appended.single().actions.compaction != null)
     assertTrue(session.events.any { it.actions.compaction != null })
+  }
+
+  @OptIn(FrameworkInternalApi::class)
+  @Test
+  fun process_taskAgent_compactsItsOwnScope() = runBlocking {
+    val sessionService = RecordingSessionService()
+    val summarizer = RecordingSummarizer(returning = compactionEvent(startTs = 100L, endTs = 100L))
+    val session = testSession()
+    session.events.add(
+      userEvent("s1", invocationId = "inv_1", timestamp = 100L).copy(isolationScope = "task")
+    )
+    session.events.add(
+      modelEventWithPromptTokens(500, invocationId = "inv_1", timestamp = 200L)
+        .copy(isolationScope = "task")
+    )
+    val context =
+      InvocationContext(
+        session = session,
+        agent = DummyAgent(name = "agent"),
+        sessionService = sessionService,
+        eventsCompactionConfig =
+          EventsCompactionConfig(
+            tokenThreshold = 100,
+            eventRetentionSize = 1,
+            summarizer = summarizer,
+          ),
+        frameworkData = ContextFrameworkData(isolationScope = "task"),
+      )
+
+    val unused = CompactionRequestProcessor().process(context, LlmRequest()) {}
+
+    assertEquals("task", sessionService.appended.single().isolationScope)
   }
 
   @Test

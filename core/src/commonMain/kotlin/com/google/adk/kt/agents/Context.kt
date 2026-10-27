@@ -45,8 +45,8 @@ import com.google.adk.kt.workflow.ResumeScan
 import com.google.adk.kt.workflow.Route
 import com.google.adk.kt.workflow.ValueCodec
 import com.google.adk.kt.workflow.Workflow
+import com.google.adk.kt.workflow.followHandoffs
 import com.google.adk.kt.workflow.requireJsonForm
-import com.google.adk.kt.workflow.resolveTransferTarget
 import com.google.adk.kt.workflow.schemaForm
 import com.google.adk.kt.workflow.validateInput
 import com.google.adk.kt.workflow.validateNodeName
@@ -698,13 +698,13 @@ open class Context(
       ns.addInterruptIds(childState.interruptIds)
       throw NodeInterruptedException()
     }
-    // raiseOnWait: a workflow or wait-for-output child left without an output aborts this run.
-    if (
-      raiseOnWait &&
+    // raiseOnWait: a child left without its output, or a handoff target paused on a task, waits.
+    val leftWaiting =
+      childState.node === node &&
         !childState.hasProducedOutput &&
         childContext.actions.transferToAgent == null &&
         (childState.node is Workflow || childState.node.waitForOutput)
-    ) {
+    if (raiseOnWait && (leftWaiting || childState.isPaused)) {
       throw NodeInterruptedException()
     }
     // A delegate's output not recorded for this attempt, such as a replay, is emitted here.
@@ -849,39 +849,25 @@ open class Context(
     useSubBranch: Boolean,
     overrideBranch: String?,
     overrideIsolationScope: String?,
-  ): Context {
-    var parentContext: Context? = this
-    var current = node
-    var childContext = first
-    while (true) {
-      val childState = childContext.requireNodeState()
-      if (childState.failure != null || childState.interruptIds.isNotEmpty()) return childContext
-      val targetName = childContext.actions.transferToAgent ?: return childContext
-      require(current is BaseAgent) { "Only agents can request an agent transfer." }
-      val target = resolveTransferTarget(targetName, current, childContext, parentContext)
-      val parent = target.parent
-      parentContext = parent
-      current = target.agent
-      validateNodeName(current.name)
+  ): Context =
+    followHandoffs(node, first, parent = this) { agent, parent ->
       if (parent == null) {
-        childContext =
-          NodeRunner.runAtTopLevel(current, generateSequence(this) { it.parent }.last())
-        continue
-      }
-      val id = parent.requireNodeState().nextChildRunId(current.name)
-      childContext =
+        // The top-level run checks the name as the root loop does, so a dotted root may run.
+        NodeRunner.runAtTopLevel(agent, generateSequence(this) { it.parent }.last())
+      } else {
+        validateNodeName(agent.name)
         parent.runDispatchedChild(
-          node = current,
+          node = agent,
           input = null,
-          id = id,
+          id = parent.requireNodeState().nextChildRunId(agent.name),
           // Only a run under this node can stand in for this node's output.
           useAsOutput = useAsOutput && parent === this,
           useSubBranch = useSubBranch,
           overrideBranch = overrideBranch,
           overrideIsolationScope = overrideIsolationScope,
         )
+      }
     }
-  }
 
   /**
    * Runs the dispatched child [node] under this activation, or replays it when history shows it
@@ -1030,6 +1016,16 @@ internal class NodeExecutionState(
   var selectedRoutes: List<Route>? = null
   var routesEmitted: Boolean = false
   var failure: NodeExecutionFailure? = null
+
+  /**
+   * Whether a child this activation dispatched paused without an interrupt id, such as a task that
+   * asked the user a question, so a transfer from the same turn waits for the next turn.
+   */
+  var childWaiting: Boolean = false
+
+  /** Whether this activation stopped for input: its own interrupt ids or a waiting child. */
+  val isPaused: Boolean
+    get() = interruptIds.isNotEmpty() || childWaiting
 
   /** Whether this activation replays a recorded outcome from history instead of running. */
   var isReplay: Boolean = false

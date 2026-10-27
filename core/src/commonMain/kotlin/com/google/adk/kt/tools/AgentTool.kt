@@ -17,9 +17,11 @@
 package com.google.adk.kt.tools
 
 import com.google.adk.kt.SchemaUtils
+import com.google.adk.kt.agents.AgentMode
 import com.google.adk.kt.agents.BaseAgent
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.apps.App
 import com.google.adk.kt.artifacts.ForwardingArtifactService
 import com.google.adk.kt.runners.InMemoryRunner
@@ -41,7 +43,9 @@ import kotlinx.coroutines.flow.lastOrNull
  *
  * This tool allows an agent to be called as a tool within a larger application. The agent's input
  * schema is used to define the tool's input parameters, and the agent's output is returned as the
- * tool's result.
+ * tool's result. An [LlmAgent] whose tree sets an agent mode runs as a workflow node; any other
+ * agent keeps the classic flow, so its tree may not set a mode. The agent itself can't be a
+ * single-turn or task agent.
  *
  * @property agent The agent to wrap.
  * @property skipSummarization Whether to skip summarization of the agent output in the parent
@@ -60,6 +64,20 @@ open class AgentTool(
   val includePlugins: Boolean = true,
   val propagateGroundingMetadata: Boolean = false,
 ) : BaseTool(name = agent.name, description = agent.description) {
+
+  init {
+    require(agent is LlmAgent || !setsMode(agent)) {
+      "AgentTool runs agent modes only under an LlmAgent, but '${agent.name}' is not one."
+    }
+    // A tree with modes runs on the node path, whose runner rejects a single-turn root.
+    require(!isSingleTurn(agent)) {
+      "AgentTool can't run the single-turn agent '${agent.name}' as a root."
+    }
+    // A task ends in a finish_task response with no text, so its output would be lost.
+    require(!isTask(agent)) {
+      "AgentTool can't run the task agent '${agent.name}'; add it to a chat agent's subAgents."
+    }
+  }
 
   private val inputSchema: Schema? by lazy { inputSchemaOf(agent) }
 
@@ -88,9 +106,16 @@ open class AgentTool(
     // agent's runner fires the same plugin callbacks as the parent.
     val childPlugins =
       if (includePlugins) context.invocationContext.pluginManager.plugins else emptyList()
+    // A tree with modes runs as a node, as Python's AgentTool runs a root LlmAgent.
+    val app =
+      if (agent is LlmAgent && setsMode(agent)) {
+        App(appName = childAppName, rootNode = agent, plugins = childPlugins)
+      } else {
+        App(appName = childAppName, rootAgent = agent, plugins = childPlugins)
+      }
     val runner =
       InMemoryRunner(
-        app = App(appName = childAppName, rootAgent = agent, plugins = childPlugins),
+        app = app,
         sessionService = childSessionService,
         // Share artifacts bidirectionally with the parent invocation: the wrapped agent reads
         // and writes through the parent's [ArtifactService], and each save is recorded into the
@@ -152,6 +177,20 @@ open class AgentTool(
 
     return ""
   }
+
+  /** Whether [agent] is a single-turn [LlmAgent]. */
+  @OptIn(ExperimentalWorkflowApi::class)
+  private fun isSingleTurn(agent: BaseAgent): Boolean =
+    (agent as? LlmAgent)?.mode == AgentMode.SINGLE_TURN
+
+  /** Whether [agent] is a task-mode [LlmAgent]. */
+  @OptIn(ExperimentalWorkflowApi::class)
+  private fun isTask(agent: BaseAgent): Boolean = (agent as? LlmAgent)?.mode == AgentMode.TASK
+
+  /** Whether [agent] or any agent below it sets an agent mode. */
+  @OptIn(ExperimentalWorkflowApi::class)
+  private fun setsMode(agent: BaseAgent): Boolean =
+    (agent as? LlmAgent)?.mode != null || agent.subAgents.any(::setsMode)
 
   /**
    * Fluent builder for [AgentTool], provided primarily for Java callers. Any property left unset

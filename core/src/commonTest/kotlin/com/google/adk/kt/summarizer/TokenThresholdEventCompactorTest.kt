@@ -212,6 +212,50 @@ class TokenThresholdEventCompactorTest {
   }
 
   @Test
+  fun compact_scopedCompactor_summarizesOnlyItsScopeAndStampsTheSummary() = runBlocking {
+    val summarizer = RecordingSummarizer(returning = compactionEvent(startTs = 110L, endTs = 120L))
+    val sessionService = RecordingSessionService()
+    val compactor =
+      tokenThresholdCompactor(tokenThreshold = 100, eventRetentionSize = 1, summarizer, "task")
+    val session = testSession()
+    val unscoped = userEvent("u1", invocationId = "inv_1", timestamp = 100L)
+    val s1 = userEvent("s1", invocationId = "inv_1", timestamp = 110L).copy(isolationScope = "task")
+    val s2 =
+      modelEvent("s2", invocationId = "inv_1", timestamp = 120L).copy(isolationScope = "task")
+    val s3 =
+      modelEventWithPromptTokens(150, invocationId = "inv_1", timestamp = 130L)
+        .copy(isolationScope = "task")
+    session.events.addAll(listOf(unscoped, s1, s2, s3))
+
+    compactor.compact(session, sessionService)
+
+    // retention=1 keeps s3 raw; the unscoped event is never part of the task's summary.
+    assertEquals(listOf(s1, s2), summarizer.calls.single())
+    assertEquals("task", sessionService.appended.single().isolationScope)
+  }
+
+  @Test
+  fun compact_unscopedCompactor_ignoresAScopedPromptCount() = runBlocking {
+    val summarizer = RecordingSummarizer(returning = compactionEvent(startTs = 100L, endTs = 110L))
+    val sessionService = RecordingSessionService()
+    val compactor =
+      tokenThresholdCompactor(tokenThreshold = 100, eventRetentionSize = 1, summarizer)
+    val session = testSession()
+    val e1 = userEvent("u1", invocationId = "inv_1", timestamp = 100L)
+    val e2 = modelEventWithPromptTokens(20, invocationId = "inv_1", timestamp = 110L)
+    // A task's large prompt in its own scope says nothing about the unscoped prompt.
+    val scoped =
+      modelEventWithPromptTokens(150, invocationId = "inv_1", timestamp = 120L)
+        .copy(isolationScope = "task")
+    session.events.addAll(listOf(e1, e2, scoped))
+
+    compactor.compact(session, sessionService)
+
+    assertTrue(summarizer.calls.isEmpty())
+    assertTrue(sessionService.appended.isEmpty())
+  }
+
+  @Test
   fun compact_candidatesBelowRetention_doesNothing() = runTest {
     val summarizer = RecordingSummarizer()
     val sessionService = RecordingSessionService()
@@ -460,6 +504,7 @@ class TokenThresholdEventCompactorTest {
     tokenThreshold: Int,
     eventRetentionSize: Int,
     summarizer: EventSummarizer,
+    isolationScope: String? = null,
   ): TokenThresholdEventCompactor =
     TokenThresholdEventCompactor(
       EventsCompactionConfig(
@@ -469,6 +514,7 @@ class TokenThresholdEventCompactorTest {
       ),
       agentName = "agent",
       branch = null,
+      isolationScope = isolationScope,
     )
 
   /** An [EventSummarizer] that fails the way a summarizer's model call can fail. */
