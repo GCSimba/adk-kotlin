@@ -974,10 +974,17 @@ internal class HistoryRewriterProcessor {
         responses.isNotEmpty() && responses.any { it.id in functionCallIds }
       }
 
-    // Result: [0..functionCallEventIndex] + [mergedEvent]
-    val result = events.subList(0, functionCallEventIndex + 1).toMutableList()
-    result.add(mergeFunctionResponseEvents(functionResponseEvents))
-    return result
+    // An answer to an earlier call that came in meanwhile stays for the async step to pair.
+    val earlierCallIds = events.subList(0, functionCallEventIndex).functionCallIds()
+    val earlierCallResponses =
+      events.subList(functionCallEventIndex + 1, events.size - 1).filter { event ->
+        val responses = event.functionResponses()
+        responses.isNotEmpty() && responses.all { it.id in earlierCallIds }
+      }
+
+    return events.subList(0, functionCallEventIndex + 1) +
+      earlierCallResponses +
+      mergeFunctionResponseEvents(functionResponseEvents)
   }
 
   /**

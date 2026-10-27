@@ -909,8 +909,13 @@ abstract class AbstractRunner : Runner {
           invocationId = currentContext.invocationId,
           author = Role.USER,
           content = currentContext.userContent,
-          // A reply while a task is paused belongs to that task's conversation.
-          isolationScope = pausedTaskEvent(context.session.events)?.isolationScope,
+          // A reply while a task is paused belongs to that task; an answer to a call, to the call.
+          isolationScope =
+            if (currentContext.userContent?.hasIdentifiedFunctionResponses() == true) {
+              null
+            } else {
+              pausedTaskEvent(context.session.events)?.isolationScope
+            },
         )
         .apply { applyStateDelta(this, stateDelta) }
         .let { applyRunConfigCustomMetadata(it, context.runConfig) }

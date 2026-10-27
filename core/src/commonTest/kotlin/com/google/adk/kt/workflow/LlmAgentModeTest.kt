@@ -1635,31 +1635,53 @@ class LlmAgentModeTest {
   }
 
   @Test
-  fun runAsync_coordinatorRootAnswerToOtherCallWhileTaskPaused_doesNotBorrowTaskInvocation() =
+  fun runAsync_coordinatorRootAnswerToOtherCallWhileTaskPaused_reachesTheCoordinator() =
     runBlocking {
       // Arrange: an approval is left open, then a later delegation pauses on a question.
       val approve = DummyTool("approve", isLongRunning = true, onRun = { _, _ -> Unit })
+      val coordinatorModel =
+        ModeScriptedModel(
+          call("approve", emptyMap()),
+          call("worker", mapOf("request" to "do it")),
+          text("all done"),
+        )
+      val workerModel =
+        ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
       val root =
         coordinator(
-          ModeScriptedModel(
-            call("approve", emptyMap()),
-            call("worker", mapOf("request" to "do it")),
-            text("approved"),
-          ),
-          listOf(taskAgent("worker", ModeScriptedModel(text("which one?")))),
+          coordinatorModel,
+          listOf(taskAgent("worker", workerModel)),
           tools = listOf(approve),
         )
       val runner = runnerFor(root)
-      val approvalId =
-        runner.send("approve it").flatMap { it.functionCalls() }.single { it.name == "approve" }.id
-      val paused = runner.send("now the task").single { it.contentText() == "which one?" }
+      val approvalCall =
+        runner.send("approve it").single { e -> e.functionCalls().any { it.name == "approve" } }
+      val approvalId = approvalCall.functionCalls().single().id
+      val unused = runner.send("now the task")
+      val coordinatorRequestsBeforeAnswer = coordinatorModel.requests.size
 
       // Act
-      val third = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+      val unusedAnswer = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+      val coordinatorRequestsAfterAnswer = coordinatorModel.requests.size
+      val workerRequestsAfterAnswer = workerModel.requests.size
+      val reply = runner.send("the second one")
 
-      // Assert: the answer to the approval does not join the paused task's invocation.
-      assertTrue(third.isNotEmpty())
-      assertTrue(third.all { it.invocationId != paused.invocationId })
+      // Assert: the answer keeps the unscoped call's scope and waits for the paused task without a
+      // model call; the reply then finishes the task, and the coordinator sees both answers.
+      val session = checkNotNull(runner.sessionService.getSession(SessionKey("app", "u", "s")))
+      val answer = session.events.single { e -> e.functionResponses().any { it.id == approvalId } }
+      assertNull(answer.isolationScope)
+      assertEquals(approvalCall.invocationId, answer.invocationId)
+      assertEquals(coordinatorRequestsBeforeAnswer, coordinatorRequestsAfterAnswer)
+      assertEquals(1, workerRequestsAfterAnswer)
+      assertTrue(reply.any { it.contentText() == "all done" })
+      val coordinatorResponses =
+        coordinatorModel.requests
+          .last()
+          .contents
+          .flatMap { it.parts }
+          .mapNotNull { it.functionResponse?.name }
+      assertEquals(listOf("approve", "worker"), coordinatorResponses)
     }
 
   @Test

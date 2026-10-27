@@ -351,6 +351,22 @@ internal fun transferResponseEvent(author: String, call: FunctionCall): Event =
   )
 
 /**
+ * Whether the task a delegation [call] started is still open in an invocation other than
+ * [invocationId]: its scope, named by the call id, has events in [liveEvents], the session events
+ * left after rewinds, and the latest is from elsewhere.
+ */
+internal fun taskWaitsInAnotherInvocation(
+  liveEvents: List<Event>,
+  call: FunctionCall,
+  invocationId: String,
+): Boolean {
+  val callId = call.id ?: return false
+  val latest = liveEvents.lastOrNull { it.isolationScope == callId } ?: return false
+  // A finished task replays its output even if its answer was never recorded.
+  return latest.invocationId != invocationId && !FinishTaskTool.isTerminalResponse(latest)
+}
+
+/**
  * Builds the user-authored function response that answers a task delegation [call] with the task's
  * [output]: a map output is the response itself, anything else is wrapped under `output`.
  */

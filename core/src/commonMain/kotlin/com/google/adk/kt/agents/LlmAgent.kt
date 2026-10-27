@@ -32,6 +32,7 @@ import com.google.adk.kt.callbacks.BeforeToolCallback
 import com.google.adk.kt.callbacks.OnModelErrorCallback
 import com.google.adk.kt.callbacks.OnToolErrorCallback
 import com.google.adk.kt.events.Event
+import com.google.adk.kt.events.applyRewinds
 import com.google.adk.kt.logging.LoggerFactory
 import com.google.adk.kt.models.Model
 import com.google.adk.kt.processors.AgentTransferProcessor
@@ -56,6 +57,7 @@ import com.google.adk.kt.types.GenerateContentConfig
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.Schema
 import com.google.adk.kt.workflow.NodeInfo
+import com.google.adk.kt.workflow.NodeInterruptedException
 import com.google.adk.kt.workflow.WorkflowConfigurationException
 import com.google.adk.kt.workflow.isValidNodeName
 import kotlin.jvm.JvmStatic
@@ -601,16 +603,25 @@ class LlmAgent(
     emitEndOfAgent(context)
   }
 
-  /** Answers the delegations an earlier turn left unanswered; a task resumes only its own. */
+  /**
+   * Answers the delegations an earlier turn left unanswered; a task resumes only its own. Pauses
+   * this run while one of those tasks waits in another invocation.
+   */
   private suspend fun FlowCollector<Any?>.answerPendingDelegations(
     context: Context,
     toolsByName: Map<String, BaseTool>,
     ownScopeOnly: Boolean,
   ) {
     val scope = if (ownScopeOnly) context.isolationScope else null
-    for (call in unresolvedTaskDelegations(context.session.events, name, toolsByName, scope)) {
-      emitTaskResponse(context, call)
-    }
+    val events = context.session.events
+    val liveEvents = applyRewinds(events)
+    val invocationId = context.invocationContext.invocationId
+    val (waiting, runnable) =
+      unresolvedTaskDelegations(events, name, toolsByName, scope).partition {
+        taskWaitsInAnotherInvocation(liveEvents, it, invocationId)
+      }
+    for (call in runnable) emitTaskResponse(context, call)
+    if (waiting.isNotEmpty()) throw NodeInterruptedException()
   }
 
   /**

@@ -1006,6 +1006,26 @@ class HistoryRewriterProcessorTest {
     assertEquals(listOf("Look it up.", "lookup", "lookup"), partNames(contents))
   }
 
+  @Test
+  fun rewrite_answerToAnEarlierCallBeforeTheLatestAnswer_staysWithItsCall() {
+    val events =
+      listOf(
+        userEvent("Approve it."),
+        Event(author = "agent", content = modelFunctionCall("approve", id = "c1")),
+        userEvent("Now the task."),
+        Event(author = "agent", content = modelFunctionCall("worker", id = "c2")),
+        Event(author = "user", content = userFunctionResponse("approve", "c1")),
+        Event(author = "user", content = userFunctionResponse("worker", "c2")),
+      )
+
+    val contents = rewrite(events)
+
+    assertEquals(
+      listOf("Approve it.", "approve", "approve", "Now the task.", "worker", "worker"),
+      partNames(contents),
+    )
+  }
+
   private fun rewrite(
     events: List<Event>,
     agentName: String = "agent",
