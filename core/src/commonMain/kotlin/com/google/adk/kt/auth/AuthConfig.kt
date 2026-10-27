@@ -22,7 +22,9 @@ import kotlin.jvm.JvmStatic
 
 /**
  * What a tool needs to authenticate to a service: the scheme the service expects, and the tool's
- * credentials.
+ * credentials. Creating a config or reading its properties requires
+ * `@OptIn(ExperimentalAuthApi::class)`; holding one, as
+ * [EventActions][com.google.adk.kt.events.EventActions] does, does not.
  *
  * @property authScheme How the service expects the tool to authenticate.
  * @property rawAuthCredential The credential the tool is configured with: one it uses as is, such
@@ -35,11 +37,14 @@ import kotlin.jvm.JvmStatic
  *   [rawAuthCredential], computed once, so `copy` keeps it. `toString` redacts it.
  * @throws IllegalArgumentException if [credentialKey] is empty.
  */
+@OptIn(ExperimentalAuthApi::class)
+data class AuthConfig
 @ExperimentalAuthApi
-data class AuthConfig(
-  val authScheme: AuthScheme,
-  val rawAuthCredential: AuthCredential? = null,
-  val exchangedAuthCredential: AuthCredential? = null,
+constructor(
+  @ExperimentalAuthApi val authScheme: AuthScheme,
+  @ExperimentalAuthApi val rawAuthCredential: AuthCredential? = null,
+  @ExperimentalAuthApi val exchangedAuthCredential: AuthCredential? = null,
+  @ExperimentalAuthApi
   val credentialKey: String = deriveCredentialKey(authScheme, rawAuthCredential),
 ) {
   init {
@@ -56,6 +61,7 @@ data class AuthConfig(
    * Prefer it over `copy` from Java: `copy` takes every property positionally, so its signature
    * changes whenever a property is added.
    */
+  @ExperimentalAuthApi
   @AdkJavaInteropApi
   fun toBuilder(): Builder =
     Builder()
@@ -68,6 +74,7 @@ data class AuthConfig(
    * Fluent builder for [AuthConfig], provided primarily for Java callers. Any property left unset
    * falls back to the same default as the constructor.
    */
+  @ExperimentalAuthApi
   @AdkJavaInteropApi
   @Suppress("ScopeReceiverThis") // Java-style builder for Java interop.
   class Builder {
@@ -103,6 +110,6 @@ data class AuthConfig(
   }
 
   companion object {
-    @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
+    @ExperimentalAuthApi @AdkJavaInteropApi @JvmStatic fun builder(): Builder = Builder()
   }
 }

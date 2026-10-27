@@ -18,6 +18,11 @@ package com.google.adk.kt.events
 
 import com.google.adk.kt.agents.TypedData
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import com.google.adk.kt.annotations.ExperimentalAuthApi
+import com.google.adk.kt.annotations.FrameworkInternalApi
+import com.google.adk.kt.auth.AuthConfig
+import com.google.adk.kt.auth.AuthScheme
+import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.sessions.State
 import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.types.Content
@@ -25,11 +30,15 @@ import com.google.adk.kt.types.Part
 import com.google.adk.kt.workflow.Route
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.Json
 
+@OptIn(ExperimentalAuthApi::class)
 class EventActionsTest {
 
   @Test
@@ -126,6 +135,18 @@ class EventActionsTest {
   }
 
   @Test
+  fun mergeWith_requestedAuthConfigs_mergesBothWithOthersWinning() {
+    val other = AUTH_CONFIG.copy(credentialKey = "other")
+    val ea1 =
+      EventActions(requestedAuthConfigs = mutableMapOf("a" to AUTH_CONFIG, "b" to AUTH_CONFIG))
+    val ea2 = EventActions(requestedAuthConfigs = mutableMapOf("b" to other))
+
+    val merged = ea1.mergeWith(ea2)
+
+    assertEquals(mapOf("a" to AUTH_CONFIG, "b" to other), merged.requestedAuthConfigs)
+  }
+
+  @Test
   fun mergeWith_usesThisIfOtherIsNullForNullable() {
     val ea1 = EventActions(transferToAgent = "agent1", rewindBeforeInvocationId = "id1")
     val ea2 = EventActions()
@@ -185,6 +206,7 @@ class EventActionsTest {
         artifactDelta = mutableMapOf("f" to 1),
         requestedToolConfirmations = mutableMapOf("c" to ToolConfirmation(confirmed = true)),
         escalate = true,
+        requestedAuthConfigs = mutableMapOf("a" to AUTH_CONFIG),
       )
 
     val snapshot = original.snapshot()
@@ -194,6 +216,7 @@ class EventActionsTest {
     assertEquals(1, snapshot.artifactDelta["f"])
     assertEquals(ToolConfirmation(confirmed = true), snapshot.requestedToolConfirmations["c"])
     assertTrue(snapshot.escalate)
+    assertEquals(AUTH_CONFIG, snapshot.requestedAuthConfigs["a"])
 
     // ... but later in-place writes to the original's maps do not leak into it.
     original.stateDelta["k2"] = "v2"
@@ -202,6 +225,8 @@ class EventActionsTest {
     assertNull(snapshot.stateDelta["k2"])
     assertNull(snapshot.artifactDelta["f2"])
     assertNull(snapshot.requestedToolConfirmations["c2"])
+    original.requestedAuthConfigs["a2"] = AUTH_CONFIG
+    assertNull(snapshot.requestedAuthConfigs["a2"])
   }
 
   @OptIn(AdkJavaInteropApi::class)
@@ -225,6 +250,7 @@ class EventActionsTest {
             endTimestamp = 2,
             compactedContent = Content(parts = listOf(Part(text = "summary"))),
           ),
+        requestedAuthConfigs = mutableMapOf("a" to AUTH_CONFIG),
       )
 
     assertEquals(actions.copy(), actions.toBuilder().build())
@@ -240,9 +266,49 @@ class EventActionsTest {
     rebuilt.stateDelta["k2"] = "v2"
     rebuilt.artifactDelta["f"] = 1
     rebuilt.requestedToolConfirmations["c"] = ToolConfirmation(confirmed = true)
+    rebuilt.requestedAuthConfigs["a"] = AUTH_CONFIG
 
     assertEquals(mapOf<String, Any>("k" to "v"), original.stateDelta)
     assertTrue(original.artifactDelta.isEmpty())
     assertTrue(original.requestedToolConfirmations.isEmpty())
+    assertTrue(original.requestedAuthConfigs.isEmpty())
+  }
+
+  @OptIn(FrameworkInternalApi::class)
+  @Test
+  fun serializer_requestedAuthConfigs_writesThemAndReadsPythonsName() {
+    val config = """{"authScheme": {"type": "http", "scheme": "bearer"}, "credentialKey": "k"}"""
+    val actions = EventActions(requestedAuthConfigs = mutableMapOf("a" to AUTH_CONFIG))
+
+    assertEquals(
+      Json.parseToJsonElement("""{"requestedAuthConfigs": {"a": $config}}"""),
+      adkJson.encodeToJsonElement(EventActions.serializer(), actions),
+    )
+    assertEquals(
+      actions,
+      adkJson.decodeFromString(
+        EventActions.serializer(),
+        """{"requested_auth_configs": {"a": $config}}""",
+      ),
+    )
+  }
+
+  @OptIn(FrameworkInternalApi::class)
+  @Test
+  fun serializer_malformedAuthConfig_throws() {
+    // As in ADK Python, a malformed config fails the whole event.
+    val error =
+      assertFailsWith<SerializationException> {
+        adkJson.decodeFromString(
+          EventActions.serializer(),
+          """{"requestedAuthConfigs": {"a": {"credentialKey": "k"}}}""",
+        )
+      }
+
+    assertEquals("Malformed auth config.", error.message)
+  }
+
+  private companion object {
+    val AUTH_CONFIG = AuthConfig(AuthScheme.Http.bearer(), credentialKey = "k")
   }
 }

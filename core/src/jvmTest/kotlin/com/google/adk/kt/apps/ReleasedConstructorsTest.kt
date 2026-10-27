@@ -24,9 +24,11 @@ import com.google.adk.kt.agents.InvocationCostManager
 import com.google.adk.kt.agents.ResumabilityConfig
 import com.google.adk.kt.agents.RunConfig
 import com.google.adk.kt.agents.StreamingMode
+import com.google.adk.kt.agents.TypedData
 import com.google.adk.kt.artifacts.ArtifactService
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
+import com.google.adk.kt.events.EventCompaction
 import com.google.adk.kt.memory.MemoryService
 import com.google.adk.kt.models.CacheMetadata
 import com.google.adk.kt.models.Gemini
@@ -662,6 +664,47 @@ class ReleasedConstructorsTest {
 
     // Assert
     assertEquals(Event(id = event.id, timestamp = event.timestamp), event)
+  }
+
+  @Test
+  fun eventActions_constructorWithoutRequestedAuthConfigs_stillLinks() {
+    // Arrange: Java compiled before requestedAuthConfigs was appended calls these eleven params.
+    val parameters =
+      arrayOf(
+        Boolean::class.java,
+        Map::class.java,
+        Map::class.java,
+        String::class.java,
+        Boolean::class.java,
+        Boolean::class.java,
+        Map::class.java,
+        String::class.java,
+        List::class.java,
+        TypedData::class.java,
+        EventCompaction::class.java,
+      )
+
+    // Act
+    val actions =
+      EventActions::class
+        .java
+        .getConstructor(*parameters)
+        .newInstance(
+          true,
+          mutableMapOf<String, Any>(),
+          mutableMapOf<String, Int>(),
+          "other",
+          false,
+          false,
+          mutableMapOf<String, Any>(),
+          null,
+          null,
+          null,
+          null,
+        )
+
+    // Assert
+    assertEquals(EventActions(skipSummarization = true, transferToAgent = "other"), actions)
   }
 
   @Test

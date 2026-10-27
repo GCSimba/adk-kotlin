@@ -18,7 +18,10 @@
 
 package com.google.adk.kt.agents
 
+import com.google.adk.kt.annotations.ExperimentalAuthApi
 import com.google.adk.kt.annotations.ExperimentalLiveApi
+import com.google.adk.kt.auth.AuthConfig
+import com.google.adk.kt.auth.AuthScheme
 import com.google.adk.kt.callbacks.AfterAgentCallback
 import com.google.adk.kt.callbacks.BeforeAgentCallback
 import com.google.adk.kt.callbacks.CallbackChoice
@@ -40,7 +43,8 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 
 /**
- * Tests for [BaseAgent] name validation, its resumability state helpers and its live entry point.
+ * Tests for [BaseAgent] name validation, its resumability state helpers, the events its agent
+ * callbacks produce, and its live entry point.
  */
 class BaseAgentTest {
 
@@ -171,6 +175,26 @@ class BaseAgentTest {
     val events = agent.runLive(testInvocationContext(agent = agent)).toList()
 
     assertEquals(listOf<Content?>(LiveTestAgent.SPOKEN, after), events.map { it.content })
+  }
+
+  @OptIn(ExperimentalAuthApi::class)
+  @Test
+  fun runAsync_afterAgentCallbackRequestsCredential_emitsAnEventWithTheRequest() = runBlocking {
+    val config = AuthConfig(AuthScheme.Http.bearer(), credentialKey = "key")
+    val agent =
+      LiveTestAgent(
+        afterAgentCallbacks =
+          listOf(
+            AfterAgentCallback { context ->
+              context.eventActions.requestedAuthConfigs["call_1"] = config
+              CallbackChoice.Continue(Unit)
+            }
+          )
+      )
+
+    val events = agent.runAsync(testInvocationContext(agent = agent)).toList()
+
+    assertEquals(mapOf("call_1" to config), events.single().actions.requestedAuthConfigs)
   }
 
   @Test

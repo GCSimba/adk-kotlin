@@ -15,6 +15,7 @@
  */
 package com.google.adk.kt.summarizer
 
+import com.google.adk.kt.annotations.ExperimentalAuthApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.logging.Logger
 import kotlin.coroutines.cancellation.CancellationException
@@ -47,14 +48,15 @@ internal suspend fun trySummarizeEvents(
 
 /**
  * Returns the longest prefix of the given window that can be summarized without splitting a
- * function-call/response pair or leaving a tool-confirmation (HITL) request unresolved.
+ * function-call/response pair or leaving a tool-confirmation (HITL) or sign-in request unresolved.
  *
  * Performs a single left-to-right pass tracking "open" obligations keyed by call ID: a function
- * call or a tool-confirmation request opens one, and a function response with the same ID closes
- * it. The prefix is safe to summarize exactly at the points where no obligation is open, so the
- * longest prefix ending at such a balanced point is returned (empty if the window never reaches a
- * balanced point).
+ * call, a tool-confirmation request or a sign-in request opens one, and a function response with
+ * the same ID in a later event closes it. The prefix is safe to summarize exactly at the points
+ * where no obligation is open, so the longest prefix ending at such a balanced point is returned
+ * (empty if the window never reaches a balanced point).
  */
+@OptIn(ExperimentalAuthApi::class)
 internal fun longestSelfContainedPrefix(events: List<Event>): List<Event> {
   val openIds = mutableSetOf<String>()
   var safeLength = 0
@@ -66,6 +68,7 @@ internal fun longestSelfContainedPrefix(events: List<Event>): List<Event> {
       call.id?.let(openIds::add)
     }
     openIds.addAll(event.actions.requestedToolConfirmations.keys)
+    openIds.addAll(event.actions.requestedAuthConfigs.keys)
     if (openIds.isEmpty()) safeLength = index + 1
   }
   return events.subList(0, safeLength)

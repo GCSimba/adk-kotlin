@@ -31,13 +31,15 @@ import com.google.adk.kt.sessions.SessionService
  * ## Safety net
  *
  * Before summarizing, the selected window is shrunk to its longest self-contained prefix so a
- * compaction never splits an open interaction. Both a function call and a human-in-the-loop
- * tool-confirmation request open an obligation keyed by the call ID, and a function response with
- * the same ID closes it. The window is cut back to the last point where no obligation is still
- * open, which guarantees:
+ * compaction never splits an open interaction. A function call, a human-in-the-loop
+ * tool-confirmation request and a sign-in request each open an obligation keyed by the call ID, and
+ * a function response with the same ID closes it. The window is cut back to the last point where no
+ * obligation is still open, which guarantees:
  * - no function call is summarized without its response,
  * - no tool-confirmation request (`event.actions.requestedToolConfirmations`) without its resolving
- *   response.
+ *   response,
+ * - no sign-in request (`event.actions.requestedAuthConfigs`) without a function response for the
+ *   same call ID.
  *
  * A summarizer failure skips the compaction instead of failing the caller, since the uncompacted
  * history is still usable.
@@ -73,7 +75,7 @@ class SlidingWindowEventCompactor(private val config: EventsCompactionConfig) : 
    * it crosses the most recent compaction boundary with at least `compactionInterval` new
    * invocations, it collects up to `overlapSize` additional preceding invocations and stops. The
    * resulting chronological window is then shrunk via [longestSelfContainedPrefix], so a compaction
-   * never splits an open function-call / tool-confirmation interaction.
+   * never splits an open function-call, tool-confirmation or sign-in interaction.
    *
    * Returns `null` when there is nothing to summarize: either fewer than `compactionInterval` new
    * invocations exist, or the selected window has no self-contained prefix.

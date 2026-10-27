@@ -17,7 +17,10 @@
 package com.google.adk.kt.sessions.dto
 
 import com.google.adk.kt.agents.TypedData
+import com.google.adk.kt.annotations.ExperimentalAuthApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
+import com.google.adk.kt.auth.AuthConfig
+import com.google.adk.kt.auth.AuthScheme
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.events.EventCompaction
@@ -444,7 +447,7 @@ class SessionMappersTest {
     assertThat(keys).containsExactly("text", "finished")
   }
 
-  @OptIn(FrameworkInternalApi::class)
+  @OptIn(FrameworkInternalApi::class, ExperimentalAuthApi::class)
   @Test
   fun event_roundTripThroughRawEvent_restoresWholeEvent() {
     val original =
@@ -513,6 +516,10 @@ class SessionMappersTest {
                   startTimestamp = 1_700_000_000_100L,
                   endTimestamp = 1_700_000_000_200L,
                   compactedContent = modelMessage("summary"),
+                ),
+              requestedAuthConfigs =
+                mutableMapOf(
+                  "call-2" to AuthConfig(AuthScheme.Http.bearer(), credentialKey = "key")
                 ),
             )
             .apply {

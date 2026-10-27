@@ -26,6 +26,7 @@ import com.google.adk.kt.testing.compactionEvent
 import com.google.adk.kt.testing.eventWithFunctionCall
 import com.google.adk.kt.testing.eventWithFunctionResponse
 import com.google.adk.kt.testing.eventWithHitlRequest
+import com.google.adk.kt.testing.eventWithSignInRequest
 import com.google.adk.kt.testing.modelEvent
 import com.google.adk.kt.testing.rewindEvent
 import com.google.adk.kt.testing.testSession
@@ -377,6 +378,61 @@ class SlidingWindowEventCompactorTest {
     // The pending HITL request opens an obligation that never closes, so the safe prefix ends just
     // before it.
     assertEquals(listOf(firstUser, firstModel, secondUser), summarizer.calls.single())
+  }
+
+  @Test
+  fun compact_pendingSignInRequestInWindow_truncatesBeforeIt() = runBlocking {
+    val summarizer = RecordingSummarizer(returning = compactionEvent(startTs = 100L, endTs = 110L))
+    val sessionService = RecordingSessionService()
+    val compactor =
+      SlidingWindowEventCompactor(
+        EventsCompactionConfig(compactionInterval = 2, overlapSize = 1, summarizer = summarizer)
+      )
+    val session = testSession()
+    val firstUser = userEvent("hi", invocationId = "inv_1", timestamp = 100L)
+    val firstModel = modelEvent("hello", invocationId = "inv_1", timestamp = 110L)
+    val secondUser = userEvent("do it", invocationId = "inv_2", timestamp = 200L)
+    val signInEvent =
+      eventWithSignInRequest(invocationId = "inv_2", timestamp = 210L, callId = "s_1")
+    session.events.addAll(listOf(firstUser, firstModel, secondUser, signInEvent))
+
+    compactor.compact(session, sessionService)
+
+    // The request stays open until a function response for the same call ID, so the safe prefix
+    // ends just before it.
+    assertEquals(listOf(firstUser, firstModel, secondUser), summarizer.calls.single())
+  }
+
+  @Test
+  fun compact_resolvedSignInRequest_keepsItInWindow() = runBlocking {
+    val summarizer = RecordingSummarizer(returning = compactionEvent(startTs = 100L, endTs = 220L))
+    val sessionService = RecordingSessionService()
+    val compactor =
+      SlidingWindowEventCompactor(
+        EventsCompactionConfig(compactionInterval = 2, overlapSize = 1, summarizer = summarizer)
+      )
+    val session = testSession()
+    val firstUser = userEvent("hi", invocationId = "inv_1", timestamp = 100L)
+    val firstModel = modelEvent("hello", invocationId = "inv_1", timestamp = 110L)
+    val secondUser = userEvent("do it", invocationId = "inv_2", timestamp = 200L)
+    val signInEvent =
+      eventWithSignInRequest(invocationId = "inv_2", timestamp = 210L, callId = "s_1")
+    // The tool's response after the user signs in closes the request.
+    val responseEvent =
+      eventWithFunctionResponse(
+        invocationId = "inv_2",
+        timestamp = 220L,
+        name = "tool",
+        callId = "s_1",
+      )
+    session.events.addAll(listOf(firstUser, firstModel, secondUser, signInEvent, responseEvent))
+
+    compactor.compact(session, sessionService)
+
+    assertEquals(
+      listOf(firstUser, firstModel, secondUser, signInEvent, responseEvent),
+      summarizer.calls.single(),
+    )
   }
 
   @Test

@@ -19,6 +19,7 @@ package com.google.adk.kt.plugins
 import com.google.adk.kt.agents.CallbackContext
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import com.google.adk.kt.annotations.ExperimentalAuthApi
 import com.google.adk.kt.callbacks.CallbackChoice
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
@@ -420,6 +421,7 @@ class DebugLoggingPlugin(
     )
   }
 
+  @OptIn(ExperimentalAuthApi::class)
   private fun serializeActions(actions: EventActions): Map<String, Any?>? {
     val actionsData =
       dataOf(
@@ -427,6 +429,8 @@ class DebugLoggingPlugin(
         "artifact_delta" to actions.artifactDelta.ifEmpty { null }?.let { it.toMap() },
         "transfer_to_agent" to actions.transferToAgent,
         "escalate" to (if (actions.escalate) true else null),
+        // Only the count, since a config can hold a client secret.
+        "requested_auth_configs" to actions.requestedAuthConfigs.ifEmpty { null }?.size,
         "requested_tool_confirmations" to actions.requestedToolConfirmations.ifEmpty { null }?.size,
       )
     return actionsData.ifEmpty { null }

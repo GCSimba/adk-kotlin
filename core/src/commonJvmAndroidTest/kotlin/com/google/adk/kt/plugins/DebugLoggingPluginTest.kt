@@ -17,7 +17,14 @@
 package com.google.adk.kt.plugins
 
 import com.google.adk.kt.agents.toCallbackContext
+import com.google.adk.kt.annotations.ExperimentalAuthApi
+import com.google.adk.kt.auth.AuthConfig
+import com.google.adk.kt.auth.AuthCredential
+import com.google.adk.kt.auth.AuthScheme
+import com.google.adk.kt.auth.Secret
 import com.google.adk.kt.callbacks.CallbackChoice
+import com.google.adk.kt.events.Event
+import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.models.LlmRequest
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.testing.DummyAgent
@@ -142,6 +149,32 @@ class DebugLoggingPluginTest {
     assertContains(text, "Zurich")
     assertContains(text, "entry_type: tool_response")
     assertContains(text, "temperature")
+  }
+
+  @OptIn(ExperimentalAuthApi::class)
+  @Test
+  fun capturesSignInRequestCountWithoutTheConfig() = runBlocking {
+    val file = tempFile()
+    val plugin = newPlugin(file)
+    val config =
+      AuthConfig(
+        AuthScheme.Http.bearer(),
+        rawAuthCredential = AuthCredential.ApiKey(Secret("sentinel-api-key")),
+        credentialKey = "key",
+      )
+    val event =
+      Event(
+        author = "test_agent",
+        actions = EventActions(requestedAuthConfigs = mutableMapOf("call_1" to config)),
+      )
+
+    plugin.startInvocation()
+    assertEquals(event, plugin.onEvent(invocationContext, event))
+    plugin.afterRun(invocationContext)
+
+    val text = file.readText()
+    assertContains(text, "requested_auth_configs: 1")
+    assertFalse(text.contains("sentinel-api-key"))
   }
 
   @Test

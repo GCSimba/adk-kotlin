@@ -18,10 +18,14 @@ package com.google.adk.kt.events
 
 import com.google.adk.kt.agents.TypedData
 import com.google.adk.kt.annotations.AdkJavaInteropApi
+import com.google.adk.kt.annotations.ExperimentalAuthApi
+import com.google.adk.kt.auth.AuthConfig
+import com.google.adk.kt.auth.AuthConfigSerializer
 import com.google.adk.kt.collections.concurrentMutableMapOf
 import com.google.adk.kt.sessions.State
 import com.google.adk.kt.workflow.Route
 import com.google.adk.kt.workflow.RouteListSerializer
+import kotlin.jvm.JvmOverloads
 import kotlin.jvm.JvmStatic
 import kotlinx.serialization.Contextual
 import kotlinx.serialization.Serializable
@@ -57,9 +61,14 @@ import kotlinx.serialization.json.JsonNames
  * @property agentState The state of the agent for resumability.
  * @property compaction If set, this event carries a context-compaction summary that replaces the
  *   compacted range of events when the next LLM prompt is built. See [EventCompaction].
+ * @property requestedAuthConfigs The credentials this event's tools ask the app for, keyed by
+ *   function call ID. Experimental: reading it requires `@OptIn(ExperimentalAuthApi::class)`.
  */
+@OptIn(ExperimentalAuthApi::class)
 @Serializable
-data class EventActions(
+data class EventActions
+@JvmOverloads
+constructor(
   @JsonNames("skip_summarization") var skipSummarization: Boolean = false,
   @JsonNames("state_delta")
   val stateDelta: MutableMap<String, @Contextual Any> = concurrentMutableMapOf(),
@@ -74,6 +83,11 @@ data class EventActions(
   @Serializable(with = RouteListSerializer::class) var route: List<Route>? = null,
   @JsonNames("agent_state") var agentState: TypedData? = null,
   var compaction: EventCompaction? = null,
+  @property:ExperimentalAuthApi
+  @JsonNames("requested_auth_configs")
+  val requestedAuthConfigs:
+    MutableMap<String, @Serializable(with = AuthConfigSerializer::class) AuthConfig> =
+    concurrentMutableMapOf(),
 ) {
   /**
    * Removes a key from the state delta.
@@ -125,14 +139,19 @@ data class EventActions(
       route = other.route ?: this.route,
       agentState = other.agentState ?: this.agentState,
       compaction = other.compaction ?: this.compaction,
+      requestedAuthConfigs =
+        concurrentMutableMapOf<String, AuthConfig>().apply {
+          putAll(this@EventActions.requestedAuthConfigs)
+          putAll(other.requestedAuthConfigs)
+        },
     )
 
   /**
-   * Returns a deep copy of this object with the mutable [stateDelta], [artifactDelta] and
-   * [requestedToolConfirmations] maps duplicated, so a later in-place write to this object is not
-   * seen through the copy. Used to snapshot the actions onto each emitted event. Only these maps
-   * are duplicated; the remaining fields are immutable or only reassigned (never mutated in place),
-   * so sharing the copied reference is safe.
+   * Returns a deep copy of this object with the mutable [stateDelta], [artifactDelta],
+   * [requestedToolConfirmations] and [requestedAuthConfigs] maps duplicated, so a later in-place
+   * write to this object is not seen through the copy. Used to snapshot the actions onto each
+   * emitted event. Only these maps are duplicated; the remaining fields are immutable or only
+   * reassigned (never mutated in place), so sharing the copied reference is safe.
    */
   internal fun snapshot(): EventActions =
     copy(
@@ -142,6 +161,8 @@ data class EventActions(
         concurrentMutableMapOf<String, ToolConfirmation>().apply {
           putAll(requestedToolConfirmations)
         },
+      requestedAuthConfigs =
+        concurrentMutableMapOf<String, AuthConfig>().apply { putAll(requestedAuthConfigs) },
     )
 
   /**
@@ -164,6 +185,7 @@ data class EventActions(
       .route(snapshot.route)
       .agentState(snapshot.agentState)
       .compaction(snapshot.compaction)
+      .requestedAuthConfigs(snapshot.requestedAuthConfigs)
   }
 
   /**
@@ -184,6 +206,7 @@ data class EventActions(
     private var route: List<Route>? = null
     private var agentState: TypedData? = null
     private var compaction: EventCompaction? = null
+    private var requestedAuthConfigs: MutableMap<String, AuthConfig> = concurrentMutableMapOf()
 
     fun skipSummarization(skipSummarization: Boolean): Builder = apply {
       this.skipSummarization = skipSummarization
@@ -219,6 +242,12 @@ data class EventActions(
 
     fun compaction(compaction: EventCompaction?): Builder = apply { this.compaction = compaction }
 
+    @ExperimentalAuthApi
+    fun requestedAuthConfigs(requestedAuthConfigs: MutableMap<String, AuthConfig>): Builder =
+      apply {
+        this.requestedAuthConfigs = requestedAuthConfigs
+      }
+
     fun build(): EventActions =
       EventActions(
         skipSummarization = skipSummarization,
@@ -232,6 +261,7 @@ data class EventActions(
         route = route,
         agentState = agentState,
         compaction = compaction,
+        requestedAuthConfigs = requestedAuthConfigs,
       )
   }
 

@@ -18,6 +18,7 @@
 
 package com.google.adk.kt.agents
 
+import com.google.adk.kt.annotations.ExperimentalAuthApi
 import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
@@ -232,6 +233,7 @@ abstract class BaseAgent(
     return null
   }
 
+  @OptIn(ExperimentalAuthApi::class)
   private fun CallbackContext.hasActions(): Boolean =
     eventActions.stateDelta.isNotEmpty() ||
       eventActions.artifactDelta.isNotEmpty() ||
@@ -239,6 +241,7 @@ abstract class BaseAgent(
       eventActions.escalate ||
       eventActions.endOfAgent ||
       eventActions.requestedToolConfirmations.isNotEmpty() ||
+      eventActions.requestedAuthConfigs.isNotEmpty() ||
       eventActions.rewindBeforeInvocationId != null
 
   /**
