@@ -31,7 +31,8 @@ import kotlin.jvm.JvmStatic
  *   is. The app sets it, such as with an API key the user enters; for OAuth2 and OpenID Connect,
  *   ADK first sets the authorization URL and state, and the app then adds the sign-in result.
  * @property credentialKey The key under which ADK stores and looks up [exchangedAuthCredential];
- *   configs with the same key share it.
+ *   configs with the same key share it. Defaults to a key derived from [authScheme] and
+ *   [rawAuthCredential], computed once, so `copy` keeps it. `toString` redacts it.
  * @throws IllegalArgumentException if [credentialKey] is empty.
  */
 @ExperimentalAuthApi
@@ -39,11 +40,16 @@ data class AuthConfig(
   val authScheme: AuthScheme,
   val rawAuthCredential: AuthCredential? = null,
   val exchangedAuthCredential: AuthCredential? = null,
-  val credentialKey: String,
+  val credentialKey: String = deriveCredentialKey(authScheme, rawAuthCredential),
 ) {
   init {
     require(credentialKey.isNotEmpty()) { "AuthConfig requires a non-empty credentialKey." }
   }
+
+  // A derived key is a digest of the raw credential, so it can reveal a weak secret.
+  override fun toString(): String =
+    "AuthConfig(authScheme=$authScheme, rawAuthCredential=$rawAuthCredential, " +
+      "exchangedAuthCredential=$exchangedAuthCredential, credentialKey=${credentialKey.redacted()})"
 
   /**
    * Returns a [Builder] initialized with this instance's properties, primarily for Java callers.
@@ -80,17 +86,20 @@ data class AuthConfig(
       this.exchangedAuthCredential = exchangedAuthCredential
     }
 
-    fun credentialKey(credentialKey: String): Builder = apply { this.credentialKey = credentialKey }
+    fun credentialKey(credentialKey: String?): Builder = apply {
+      this.credentialKey = credentialKey
+    }
 
-    fun build(): AuthConfig =
-      AuthConfig(
-        authScheme =
-          checkNotNull(authScheme) { "AuthConfig.Builder requires authScheme to be set." },
+    fun build(): AuthConfig {
+      val authScheme =
+        checkNotNull(authScheme) { "AuthConfig.Builder requires authScheme to be set." }
+      return AuthConfig(
+        authScheme = authScheme,
         rawAuthCredential = rawAuthCredential,
         exchangedAuthCredential = exchangedAuthCredential,
-        credentialKey =
-          checkNotNull(credentialKey) { "AuthConfig.Builder requires credentialKey to be set." },
+        credentialKey = credentialKey ?: deriveCredentialKey(authScheme, rawAuthCredential),
       )
+    }
   }
 
   companion object {

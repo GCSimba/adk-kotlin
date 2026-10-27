@@ -36,6 +36,29 @@ class AuthConfigSerializerTest {
   }
 
   @Test
+  fun decode_emptyCredentialKey_throws() {
+    val error =
+      assertFailsWith<SerializationException> {
+        decode("""{"authScheme": {"type": "http", "scheme": "bearer"}, "credentialKey": ""}""")
+      }
+
+    assertEquals("Malformed auth config.", error.message)
+    assertNull(error.cause)
+  }
+
+  @Test
+  fun decode_explicitCredentialKey_keepsIt() {
+    val config =
+      decode(
+        """{"authScheme": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"},
+          "rawAuthCredential": {"authType": "apiKey", "apiKey": "sk-123"},
+          "credentialKey": "my-key"}"""
+      )
+
+    assertEquals("my-key", config.credentialKey)
+  }
+
+  @Test
   fun decode_invalidSchemeOrCredential_throws() {
     val inputs =
       listOf(
@@ -80,18 +103,21 @@ class AuthConfigSerializerTest {
   }
 
   @Test
-  fun decode_withoutCredentialKey_throws() {
+  fun decode_withoutCredentialKey_derivesKey() {
+    val scheme = """{"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}"""
+    val raw = """{"authType": "apiKey", "apiKey": "sk-123"}"""
     val inputs =
       listOf(
-        """{"authScheme": {"type": "http", "scheme": "bearer"}}""",
-        """{"authScheme": {"type": "http", "scheme": "bearer"}, "credentialKey": null}""",
-        """{"authScheme": {"type": "http", "scheme": "bearer"}, "credentialKey": ""}""",
+        """{"authScheme": $scheme, "rawAuthCredential": $raw}""",
+        """{"authScheme": $scheme, "rawAuthCredential": $raw, "credentialKey": null}""",
       )
 
     inputs.forEachIndexed { i, input ->
-      val error = assertFailsWith<SerializationException>("input #$i") { decode(input) }
-
-      assertEquals("An auth config has no credential key.", error.message, "input #$i")
+      assertEquals(
+        "adk_http_3e922d755264ee81_apiKey_56c19575f72717f8",
+        decode(input).credentialKey,
+        "input #$i",
+      )
     }
   }
 

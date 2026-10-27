@@ -33,10 +33,7 @@ class AuthConfigTest {
 
   @Test
   fun builder_requiredFieldsOnly_matchesConstructorDefaults() {
-    assertEquals(
-      AuthConfig(authScheme = SCHEME, credentialKey = CREDENTIAL_KEY),
-      AuthConfig.builder().authScheme(SCHEME).credentialKey(CREDENTIAL_KEY).build(),
-    )
+    assertEquals(AuthConfig(authScheme = SCHEME), AuthConfig.builder().authScheme(SCHEME).build())
   }
 
   @Test
@@ -47,8 +44,11 @@ class AuthConfigTest {
   }
 
   @Test
-  fun builder_withoutCredentialKey_throws() {
-    assertFailsWith<IllegalStateException> { AuthConfig.builder().authScheme(SCHEME).build() }
+  fun builder_withoutCredentialKey_derivesKey() {
+    assertEquals(
+      deriveCredentialKey(SCHEME, AUTH_CONFIG.rawAuthCredential),
+      AUTH_CONFIG.toBuilder().credentialKey(null).build().credentialKey,
+    )
   }
 
   @Test
@@ -64,9 +64,35 @@ class AuthConfigTest {
   }
 
   @Test
+  fun constructor_withoutCredentialKey_derivesKey() {
+    val raw = AUTH_CONFIG.rawAuthCredential
+
+    assertEquals(
+      deriveCredentialKey(SCHEME, raw),
+      AuthConfig(authScheme = SCHEME, rawAuthCredential = raw).credentialKey,
+    )
+  }
+
+  @Test
+  fun copy_otherRawCredential_keepsKey() {
+    val config = AuthConfig(authScheme = SCHEME)
+
+    assertEquals(
+      config.credentialKey,
+      config.copy(rawAuthCredential = AUTH_CONFIG.rawAuthCredential).credentialKey,
+    )
+  }
+
+  @Test
   fun toString_authConfig_omitsSecrets() {
     val printed = AUTH_CONFIG.toString()
 
+    assertEquals(
+      "AuthConfig(authScheme=$SCHEME, rawAuthCredential=${AUTH_CONFIG.rawAuthCredential}, " +
+        "exchangedAuthCredential=${AUTH_CONFIG.exchangedAuthCredential}, " +
+        "credentialKey=<redacted>)",
+      printed,
+    )
     assertFalse(printed.contains(CLIENT_SECRET))
     assertFalse(printed.contains(ACCESS_TOKEN))
   }

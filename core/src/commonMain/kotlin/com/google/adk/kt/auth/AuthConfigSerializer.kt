@@ -30,7 +30,8 @@ import kotlinx.serialization.json.JsonNames
 /**
  * Reads and writes an [AuthConfig] as a JSON object, with its scheme and credentials in the formats
  * of [AuthSchemeSerializer] and [AuthCredentialSerializer]. Input also takes each multi-word
- * field's snake_case name, as the server's request bodies do.
+ * field's snake_case name, as the server's request bodies do. A config without a credential key
+ * gets a derived one, as from the [AuthConfig] constructor.
  */
 internal object AuthConfigSerializer : KSerializer<AuthConfig> {
   override val descriptor: SerialDescriptor = Wire.serializer().descriptor
@@ -39,8 +40,9 @@ internal object AuthConfigSerializer : KSerializer<AuthConfig> {
     encoder.encodeSerializableValue(Wire.serializer(), Wire(value))
   }
 
-  override fun deserialize(decoder: Decoder): AuthConfig =
-    decodeWithoutInput { decoder.decodeSerializableValue(Wire.serializer()) }.toConfig()
+  override fun deserialize(decoder: Decoder): AuthConfig = decodeWithoutInput {
+    decoder.decodeSerializableValue(Wire.serializer()).toConfig()
+  }
 
   /**
    * Rethrows a decode failure without its cause, whose message can quote secrets in the input. It
@@ -77,11 +79,13 @@ internal object AuthConfigSerializer : KSerializer<AuthConfig> {
       config.credentialKey,
     )
 
-    fun toConfig(): AuthConfig {
-      val key =
-        credentialKey?.takeIf { it.isNotEmpty() }
-          ?: throw SerializationException("An auth config has no credential key.")
-      return AuthConfig(authScheme, rawAuthCredential, exchangedAuthCredential, key)
-    }
+    // AuthConfig rejects an empty key, which then reads as malformed.
+    fun toConfig(): AuthConfig =
+      AuthConfig(
+        authScheme,
+        rawAuthCredential,
+        exchangedAuthCredential,
+        credentialKey ?: deriveCredentialKey(authScheme, rawAuthCredential),
+      )
   }
 }
