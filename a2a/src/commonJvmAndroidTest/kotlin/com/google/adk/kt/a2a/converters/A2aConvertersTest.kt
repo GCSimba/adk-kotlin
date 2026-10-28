@@ -454,6 +454,25 @@ class A2aConvertersTest {
   }
 
   @Test
+  fun taskToEvent_withPendingState_marksPartsAsThoughts() {
+    val artifact =
+      Artifact.builder().artifactId("artifact-1").parts(listOf(TextPart("Draft"))).build()
+    val statusMessage =
+      Message.builder().role(Message.Role.ROLE_AGENT).parts(listOf(TextPart("Working"))).build()
+    val task =
+      Task.builder()
+        .id("task-1")
+        .contextId("context-1")
+        .status(TaskStatus(TaskState.TASK_STATE_WORKING, statusMessage, null))
+        .artifacts(listOf(artifact))
+        .build()
+
+    val result = task.toAdkEvent(invocationContext)
+
+    assertThat(result.content?.parts?.map { it.thought }).containsExactly(true, true)
+  }
+
+  @Test
   fun taskToEvent_withFailedState_setsErrorCode() {
     val statusMessage =
       Message.builder().role(Message.Role.ROLE_AGENT).parts(listOf(TextPart("Task failed"))).build()

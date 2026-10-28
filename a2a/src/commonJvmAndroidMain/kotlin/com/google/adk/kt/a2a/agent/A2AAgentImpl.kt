@@ -16,10 +16,12 @@
 
 package com.google.adk.kt.a2a.agent
 
+import com.google.adk.kt.a2a.converters.ADK_METADATA_CONTEXT_ID
 import com.google.adk.kt.a2a.converters.isCompleted
 import com.google.adk.kt.a2a.converters.isFinalState
 import com.google.adk.kt.a2a.converters.isInterruptedState
 import com.google.adk.kt.a2a.converters.isLastChunk
+import com.google.adk.kt.a2a.converters.remoteAgentEvent
 import com.google.adk.kt.a2a.converters.shouldBuffer
 import com.google.adk.kt.a2a.converters.shouldResetBuffer
 import com.google.adk.kt.a2a.converters.toA2aMessage
@@ -50,6 +52,7 @@ import org.a2aproject.sdk.jsonrpc.common.json.JsonUtil
 import org.a2aproject.sdk.spec.AgentCard
 import org.a2aproject.sdk.spec.CancelTaskParams
 import org.a2aproject.sdk.spec.Message
+import org.a2aproject.sdk.spec.Task
 import org.a2aproject.sdk.spec.TaskState
 
 /**
@@ -112,12 +115,14 @@ internal class A2AAgentImpl(
     val processorJob = launch {
       val a2aAggregator = A2AStreamingResponseAggregator(context.invocationId, name)
       val debugRequest = serializeMessageToJson(message)
+      var lastTask: Task? = null
 
       for (responseEvent in eventChannel) {
         val result = processClientEvent(responseEvent, context, debugRequest, a2aAggregator)
 
         result.taskId?.let { activeTaskId.set(it) }
         result.isTerminal?.let { isTaskTerminal.set(it) }
+        responseEvent.taskOrNull?.let { lastTask = it }
 
         for (event in result.eventsToEmit) {
           send(event)
@@ -126,6 +131,16 @@ internal class A2AAgentImpl(
         if (result.shouldClose) {
           break
         }
+      }
+      // Report an unfinished task as ADK Python does; its context id lets the next turn continue.
+      if (lastTask != null && !isTerminal(lastTask.status.state())) {
+        send(
+          remoteAgentEvent(context)
+            .copy(
+              errorMessage = "A2A response ended before the remote task reached a terminal state",
+              customMetadata = mapOf(ADK_METADATA_CONTEXT_ID to lastTask.contextId),
+            )
+        )
       }
       close()
     }
@@ -148,6 +163,8 @@ internal class A2AAgentImpl(
     // (it fires immediately once the channel is closed), so cleanup happens in one place.
     try {
       a2aClient.sendMessage(message, listOf(handler), errorHandler, null)
+      // A blocking send hands its one response to the handler before it returns.
+      if (!streaming) eventChannel.close()
     } catch (e: Exception) {
       close(e)
     }
@@ -170,21 +187,7 @@ internal class A2AAgentImpl(
     debugRequest: Result<String>,
     a2aAggregator: A2AStreamingResponseAggregator,
   ): EventProcessResult {
-    var taskId: String? = null
-    var isTerminal: Boolean? = null
-
-    when (responseEvent) {
-      is TaskEvent -> {
-        taskId = responseEvent.task.id
-        isTerminal = isTerminal(responseEvent.task.status.state())
-      }
-      is TaskUpdateEvent -> {
-        taskId = responseEvent.task.id
-        isTerminal = isTerminal(responseEvent.task.status.state())
-      }
-      else -> {}
-    }
-
+    val task = responseEvent.taskOrNull
     val events = mutableListOf<Event>()
     val adkEvent = responseEvent.toAdkEvent(context)
     if (adkEvent != null) {
@@ -201,8 +204,8 @@ internal class A2AAgentImpl(
 
     return EventProcessResult(
       eventsToEmit = events,
-      taskId = taskId,
-      isTerminal = isTerminal,
+      taskId = task?.id,
+      isTerminal = if (task != null) isTerminal(task.status.state()) else null,
       shouldClose = responseEvent.isCompleted(),
     )
   }
@@ -246,5 +249,14 @@ internal class A2AAgentImpl(
       is TaskUpdateEvent -> JsonUtil.toJson(event.task)
     }
 
-  private fun isTerminal(state: TaskState): Boolean = state.isFinalState() || state.isInterruptedState()
+  private fun isTerminal(state: TaskState): Boolean =
+    state.isFinalState() || state.isInterruptedState()
+
+  private val ClientEvent.taskOrNull: Task?
+    get() =
+      when (this) {
+        is MessageEvent -> null
+        is TaskEvent -> task
+        is TaskUpdateEvent -> task
+      }
 }

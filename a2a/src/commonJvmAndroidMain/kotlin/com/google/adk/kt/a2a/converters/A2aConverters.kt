@@ -222,6 +222,8 @@ internal fun Task.toAdkEvent(invocationContext: InvocationContext): Event {
   if (adkParts.isEmpty() && !isFinal) {
     return emptyEvent(invocationContext)
   }
+  // A task still in progress reports progress, not its answer, so ADK Python marks it as thoughts.
+  if (status.state() in PENDING_STATES) adkParts.replaceAll { it.copy(thought = true) }
 
   val event =
     remoteAgentEvent(invocationContext)

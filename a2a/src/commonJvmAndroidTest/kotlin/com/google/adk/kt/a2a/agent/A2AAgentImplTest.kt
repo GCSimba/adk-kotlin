@@ -16,6 +16,7 @@
 
 package com.google.adk.kt.a2a.agent
 
+import com.google.adk.kt.a2a.converters.contextId
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.agents.RunConfig
 import com.google.adk.kt.agents.StreamingMode
@@ -33,6 +34,7 @@ import com.google.adk.kt.testing.userMessage
 import com.google.common.truth.Truth.assertThat
 import java.util.function.BiConsumer
 import java.util.function.Consumer
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -40,8 +42,10 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import org.a2aproject.sdk.client.Client
 import org.a2aproject.sdk.client.ClientEvent
+import org.a2aproject.sdk.client.MessageEvent
 import org.a2aproject.sdk.client.TaskEvent
 import org.a2aproject.sdk.client.TaskUpdateEvent
 import org.a2aproject.sdk.spec.AgentCapabilities
@@ -114,7 +118,13 @@ class A2AAgentImplTest {
           ),
       )
 
-    invocationContext = InvocationContext(agent = mockAgent, session = session, runConfig = null)
+    // Streams by default: most tests deliver events after sendMessage returns, as a stream does.
+    invocationContext =
+      InvocationContext(
+        agent = mockAgent,
+        session = session,
+        runConfig = RunConfig(streamingMode = StreamingMode.SSE),
+      )
   }
 
   @Test
@@ -244,8 +254,9 @@ class A2AAgentImplTest {
       consumer.accept(createTaskEvent(TaskState.TASK_STATE_COMPLETED, "Done"), agentCard)
     }
 
-    val events = agent.runAsync(invocationContext).toList()
+    val events = agent.runAsync(blockingContext()).toList()
 
+    assertThat(capturedStreaming).isFalse()
     // Should contain the event from the stream, but no final aggregated event
     assertThat(events).hasSize(1)
     assertThat(events[0].content?.parts?.firstOrNull()?.text).isEqualTo("Done")
@@ -722,6 +733,56 @@ class A2AAgentImplTest {
   }
 
   @Test
+  fun runAsync_blockingSendAnsweredWithMessage_completesFlow() =
+    runBlocking<Unit> {
+      val agent = createTestAgent()
+      mockStreamResponse(this) { consumer ->
+        consumer.accept(MessageEvent(agentMessage("Hi")), agentCard)
+      }
+
+      val events = withTimeout(5.seconds) { agent.runAsync(blockingContext()).toList() }
+
+      assertThat(capturedStreaming).isFalse()
+      assertThat(events.map { it.content?.parts?.single()?.text }).containsExactly("Hi")
+    }
+
+  // Uses runBlocking (real time) because task cancellation runs on Dispatchers.IO.
+  @Test
+  fun runAsync_blockingSendAnsweredWithWorkingTask_endsWithErrorAndCancelsTask() =
+    runBlocking<Unit> {
+      val agent = createTestAgent()
+      mockStreamResponse(this) { consumer ->
+        consumer.accept(createTaskEvent(TaskState.TASK_STATE_WORKING, "working..."), agentCard)
+      }
+
+      val events = withTimeout(5.seconds) { agent.runAsync(blockingContext()).toList() }
+
+      assertThat(events).hasSize(2)
+      assertThat(events[0].content?.parts?.single()?.thought).isTrue()
+      assertThat(events[1].errorMessage).isNotNull()
+      // The next turn reads the remote context id from this agent's last event.
+      assertThat(events[1].contextId).isEqualTo("context-1")
+      verify(mockClient, timeout(5000)).cancelTask(any())
+    }
+
+  @Test
+  fun runAsync_streamEndsWithWorkingTask_endsWithError() =
+    runBlocking<Unit> {
+      val agent = createTestAgent()
+      mockStreamResponse(this, endsStream = true) { consumer ->
+        consumer.accept(
+          createStatusUpdateEvent(TaskState.TASK_STATE_WORKING, "working..."),
+          agentCard,
+        )
+      }
+
+      val events = withTimeout(5.seconds) { agent.runAsync(invocationContext).toList() }
+
+      assertThat(events.last().errorMessage).isNotNull()
+      assertThat(events.last().contextId).isEqualTo("context-1")
+    }
+
+  @Test
   fun runAsync_authRequired_completesFlow() = runTest {
     val agent = createTestAgent()
     mockStreamResponse(this) { consumer ->
@@ -776,16 +837,26 @@ class A2AAgentImplTest {
       )
   }
 
+  private fun blockingContext(): InvocationContext =
+    invocationContext.copy(runConfig = RunConfig(streamingMode = StreamingMode.NONE))
+
+  // Like the SDK: delivers before sendMessage returns when blocking, and later when streaming.
   private fun mockStreamResponse(
     scope: CoroutineScope,
+    endsStream: Boolean = false,
     responseProducer: (BiConsumer<ClientEvent, AgentCard>) -> Unit,
   ) {
     doAnswer { invocation ->
         val consumers = invocation.getArgument<List<BiConsumer<ClientEvent, AgentCard>>>(1)
         val consumer = consumers[0]
-        scope.launch {
-          delay(10)
+        if (capturedStreaming == false) {
           responseProducer(consumer)
+        } else {
+          scope.launch {
+            delay(10)
+            responseProducer(consumer)
+            if (endsStream) invocation.getArgument<Consumer<Throwable?>>(2).accept(null)
+          }
         }
         null
       }
@@ -798,18 +869,15 @@ class A2AAgentImplTest {
       )
   }
 
+  private fun agentMessage(text: String): Message =
+    Message.builder().role(Message.Role.ROLE_AGENT).parts(listOf(TextPart(text))).build()
+
   private fun createTaskEvent(state: TaskState, text: String): TaskEvent {
     val task =
       Task.builder()
         .id("task-1")
         .contextId("context-1")
-        .status(
-          TaskStatus(
-            state,
-            Message.builder().role(Message.Role.ROLE_AGENT).parts(listOf(TextPart(text))).build(),
-            null,
-          )
-        )
+        .status(TaskStatus(state, agentMessage(text), null))
         .build()
     return TaskEvent(task)
   }
@@ -820,13 +888,7 @@ class A2AAgentImplTest {
       TaskStatusUpdateEvent.builder()
         .taskId("task-1")
         .contextId("context-1")
-        .status(
-          TaskStatus(
-            state,
-            Message.builder().role(Message.Role.ROLE_AGENT).parts(listOf(TextPart(text))).build(),
-            null,
-          )
-        )
+        .status(TaskStatus(state, agentMessage(text), null))
         .build()
     return TaskUpdateEvent(task, update)
   }
