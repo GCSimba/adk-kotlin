@@ -26,27 +26,43 @@ import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.ContentInput
+import com.google.adk.kt.models.LlmResponse
+import com.google.adk.kt.models.Model
 import com.google.adk.kt.testing.DummyLiveModel
 import com.google.adk.kt.testing.DummyLiveStep
 import com.google.adk.kt.testing.DummyLiveStep.AwaitSent
 import com.google.adk.kt.testing.DummyLiveStep.Fail
+import com.google.adk.kt.testing.DummyModel
+import com.google.adk.kt.testing.DummyTool
 import com.google.adk.kt.testing.audioFrame
+import com.google.adk.kt.testing.modelFunctionCallResponse
+import com.google.adk.kt.testing.modelMessage
+import com.google.adk.kt.testing.modelParallelFunctionCallsResponse
 import com.google.adk.kt.testing.outputTranscriptionStep
 import com.google.adk.kt.testing.turnCompleteStep
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.testing.wholeText
+import com.google.adk.kt.tools.BaseTool
+import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.Modality
 import com.google.common.truth.Truth.assertThat
 import com.google.errorprone.annotations.CanIgnoreReturnValue
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit.MILLISECONDS
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.asContextElement
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
@@ -112,8 +128,9 @@ class PublisherRunnerTest {
     }
   }
 
-  private fun runnerFor(model: DummyLiveModel): PublisherRunner {
-    val runner = PublisherRunner.inMemory(LlmAgent(name = "live_agent", model = model))
+  private fun runnerFor(model: Model, tools: List<BaseTool> = emptyList()): PublisherRunner {
+    val runner =
+      PublisherRunner.inMemory(LlmAgent(name = "live_agent", model = model, tools = tools))
     runners += runner
     return runner
   }
@@ -159,6 +176,130 @@ class PublisherRunnerTest {
   /** [event] without the fields that differ between two runs of the same script. */
   private fun withoutRunIds(event: Event): Event =
     event.copy(id = "", invocationId = null, timestamp = 0)
+
+  /**
+   * A runner whose model calls the `record` tool once and then answers; [onCall] runs inside both
+   * model calls and the tool call.
+   */
+  private fun toolCallingRunner(onCall: () -> Unit): PublisherRunner {
+    val responses =
+      listOf(modelFunctionCallResponse("record"), LlmResponse(content = modelMessage("done")))
+    val model =
+      DummyModel(
+        "model",
+        responses.map { response ->
+          flow {
+            onCall()
+            emit(response)
+          }
+        },
+      )
+    val tool =
+      DummyTool(name = "record", declares = true) { _, _ ->
+        onCall()
+        mapOf("status" to "ok")
+      }
+    return runnerFor(model, listOf(tool))
+  }
+
+  private fun singleThreadDispatcher(name: String): ExecutorCoroutineDispatcher =
+    Executors.newSingleThreadExecutor { Thread(it, name) }.asCoroutineDispatcher()
+
+  /**
+   * Counts down [latch] and blocks, as a synchronous Java tool does, until the other parallel call
+   * counts it down too. Not suspend, because suspend code should not call a method that throws
+   * `InterruptedException`, such as `CountDownLatch.await`.
+   */
+  private fun waitForTheOtherCall(latch: CountDownLatch): Boolean {
+    latch.countDown()
+    return latch.await(GUARD_TIMEOUT.inWholeMilliseconds, MILLISECONDS)
+  }
+
+  /** This thread's name without the ` @coroutine#N` suffix that coroutine debug mode adds. */
+  private fun Thread.baseName(): String = name.substringBefore(" @coroutine#")
+
+  @Test
+  fun runAsync_coroutineContextGiven_runsTheModelAndToolsWithIt(): Unit = runBlocking {
+    val seen = CopyOnWriteArrayList<String?>()
+    val runner = toolCallingRunner { seen += requestId.get() }
+    val subscriber = RecordingSubscriber()
+
+    runner
+      .runAsync(
+        "u",
+        "s",
+        newMessage = userMessage("hi"),
+        coroutineContext = requestId.asContextElement("request-1"),
+      )
+      .subscribe(subscriber)
+
+    assertThat(withTimeout(GUARD_TIMEOUT) { subscriber.terminated.await() }).isNull()
+    assertThat(seen).containsExactly("request-1", "request-1", "request-1")
+  }
+
+  @Test
+  fun runAsync_dispatcherGiven_runsTheModelToolsAndOnNextOnIt(): Unit = runBlocking {
+    val threads = CopyOnWriteArrayList<String>()
+    val runner = toolCallingRunner { threads += Thread.currentThread().baseName() }
+    val subscriber = RecordingSubscriber()
+
+    singleThreadDispatcher("adk-run").use { dispatcher ->
+      runner
+        .runAsync("u", "s", newMessage = userMessage("hi"), coroutineContext = dispatcher)
+        .subscribe(subscriber)
+      assertThat(withTimeout(GUARD_TIMEOUT) { subscriber.terminated.await() }).isNull()
+    }
+
+    assertThat(threads).containsExactly("adk-run", "adk-run", "adk-run")
+    assertThat(subscriber.threads.map { it.baseName() }.toSet()).containsExactly("adk-run")
+  }
+
+  @Test
+  fun runAsync_noCoroutineContext_runsParallelBlockingToolCallsConcurrently(): Unit = runBlocking {
+    val bothArrived = CountDownLatch(2)
+    val metTheOtherCall = CopyOnWriteArrayList<Boolean>()
+    val tool =
+      DummyTool(name = "wait_for_other", declares = true) { _, _ ->
+        metTheOtherCall += waitForTheOtherCall(bothArrived)
+        mapOf("status" to "ok")
+      }
+    val model =
+      DummyModel.createSequential(
+        "model",
+        listOf(
+          modelParallelFunctionCallsResponse(
+            FunctionCall(name = "wait_for_other", args = emptyMap(), id = "call-1"),
+            FunctionCall(name = "wait_for_other", args = emptyMap(), id = "call-2"),
+          ),
+          LlmResponse(content = modelMessage("done")),
+        ),
+      )
+    val runner = runnerFor(model, listOf(tool))
+    val subscriber = RecordingSubscriber()
+
+    runner.runAsync("u", "s", newMessage = userMessage("hi")).subscribe(subscriber)
+
+    assertThat(withTimeout(GUARD_TIMEOUT * 2) { subscriber.terminated.await() }).isNull()
+    assertThat(metTheOtherCall).containsExactly(true, true)
+  }
+
+  @Test
+  fun runAsync_fromJava_keepsTheSixArgumentOverload() {
+    val method =
+      PublisherRunner::class
+        .java
+        .getMethod(
+          "runAsync",
+          String::class.java,
+          String::class.java,
+          String::class.java,
+          Content::class.java,
+          Map::class.java,
+          RunConfig::class.java,
+        )
+
+    assertThat(method.returnType).isEqualTo(Publisher::class.java)
+  }
 
   @Test
   fun runLive_notSubscribed_opensNoConnection(): Unit = runBlocking {
@@ -287,6 +428,21 @@ class PublisherRunnerTest {
   }
 
   @Test
+  fun runLive_dispatcherGiven_deliversEventsOnIt(): Unit = runBlocking {
+    val runner = runnerFor(DummyLiveModel(answersAfterTheUser()))
+    val queue = LiveRequestQueue()
+    val subscriber = RecordingSubscriber(queue = queue)
+
+    singleThreadDispatcher("adk-live").use { dispatcher ->
+      runner.runLive("u", "s", queue, coroutineContext = dispatcher).subscribe(subscriber)
+      queue.sendContent(userMessage("hi"))
+      assertThat(withTimeout(GUARD_TIMEOUT) { subscriber.terminated.await() }).isNull()
+    }
+
+    assertThat(subscriber.threads.map { it.baseName() }.toSet()).containsExactly("adk-live")
+  }
+
+  @Test
   fun runLive_subscribersBlockInOnNext_leaveDispatchersDefaultFree(): Unit = runBlocking {
     val runner = runnerFor(DummyLiveModel(answersAfterTheUser()))
 
@@ -343,5 +499,8 @@ class PublisherRunnerTest {
   companion object {
     /** Bounds a wait whose failure mode is a hang. */
     private val GUARD_TIMEOUT = 10.seconds
+
+    /** Stands in for MDC: thread-local state a caller carries into a run through its context. */
+    private val requestId = ThreadLocal<String?>()
   }
 }

@@ -170,7 +170,10 @@ with `CompletableFuture` and Reactive Streams `Publisher`:
     (`Flowable.fromPublisher(...)`), Reactor (`Flux.from(...)`), or Spring
     WebFlux; `runLive` (experimental) does the same for a live conversation,
     which ends when its `LiveRequestQueue` is closed or the model ends the
-    session.
+    session. Both run on `Dispatchers.IO` plus what you pass as
+    `coroutineContext`. For example, `MDCContext()` from
+    kotlinx-coroutines-slf4j carries the caller's MDC into model and tool
+    calls, and a dispatcher replaces IO.
 -   **`CompletableFutureSessionService`, `CompletableFutureArtifactService`, and
     `CompletableFutureMemoryService`** wrap a session, artifact, or memory
     service so that each call returns a `CompletableFuture`, which Reactor

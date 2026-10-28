@@ -29,6 +29,8 @@ import com.google.adk.kt.runners.Runner
 import com.google.adk.kt.types.Content
 import com.google.errorprone.annotations.CheckReturnValue
 import java.util.concurrent.CompletableFuture
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -58,9 +60,15 @@ class PublisherRunner private constructor(private val delegate: Runner) : AutoCl
     get() = delegate.appName
 
   /**
-   * Runs the agent, streaming its events. Set [invocationId] to resume an interrupted invocation.
+   * Runs the agent, streaming its events; set [invocationId] to resume an interrupted invocation.
+   * The run, including tool calls and the subscriber's `onNext`, executes on [Dispatchers.IO] with
+   * [coroutineContext] added: pass `MDCContext()` from kotlinx-coroutines-slf4j to carry the
+   * caller's MDC, or a dispatcher to use instead of IO. A `Job` in [coroutineContext] has no
+   * effect, so cancel the run through its subscription.
    */
   @JvmOverloads
+  // Not Unconfined (blocking tools take turns) or Default (blocking holds a CPU thread).
+  @Suppress("GlobalCoroutineDispatchers")
   fun runAsync(
     userId: String,
     sessionId: String,
@@ -68,6 +76,7 @@ class PublisherRunner private constructor(private val delegate: Runner) : AutoCl
     newMessage: Content? = null,
     stateDelta: Map<String, Any>? = null,
     runConfig: RunConfig? = null,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
   ): Publisher<Event> =
     delegate
       .runAsync(
@@ -78,14 +87,15 @@ class PublisherRunner private constructor(private val delegate: Runner) : AutoCl
         stateDelta = stateDelta,
         runConfig = runConfig,
       )
-      .asPublisher()
+      .asPublisher(Dispatchers.IO + coroutineContext)
 
   /**
    * Experimental: runs the agent over a live connection, streaming the whole conversation's events
    * (see [Runner.runLive]). Each subscription starts its own run, which ends when
    * [liveRequestQueue] is closed or the model ends the session; cancelling the subscription closes
-   * the connection and leaves the queue open. Events arrive on [Dispatchers.IO], never on the
-   * thread that sends to the queue; hand slow work in `onNext` to your own executor.
+   * the connection and leaves the queue open. Events arrive on [Dispatchers.IO], or on a dispatcher
+   * passed in [coroutineContext] as in [runAsync], not on the thread that sends to the queue; hand
+   * slow work in `onNext` to your own executor.
    */
   @CheckReturnValue
   @JvmOverloads
@@ -97,6 +107,7 @@ class PublisherRunner private constructor(private val delegate: Runner) : AutoCl
     sessionId: String,
     liveRequestQueue: LiveRequestQueue,
     runConfig: RunConfig? = null,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
   ): Publisher<Event> =
     delegate
       .runLive(
@@ -105,7 +116,7 @@ class PublisherRunner private constructor(private val delegate: Runner) : AutoCl
         liveRequestQueue = liveRequestQueue,
         runConfig = runConfig,
       )
-      .asPublisher(Dispatchers.IO)
+      .asPublisher(Dispatchers.IO + coroutineContext)
 
   /**
    * Rewinds the session to before [rewindBeforeInvocationId]; see [Runner.rewindAsync]. The
