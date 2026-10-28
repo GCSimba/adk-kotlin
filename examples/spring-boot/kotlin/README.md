@@ -4,8 +4,9 @@ An order-support service written in Kotlin with Spring Boot and WebFlux. It
 runs an ADK workflow, which combines Gemini agents, function nodes that run
 business rules in code, and tools backed by a Spring bean, and serves it two
 ways: a request that gets the finished reply, and a request that streams the
-reply as server-sent events (SSE). It uses the Kotlin API directly:
-KSP-generated tools, `node { }` function nodes, and coroutines end to end, as
+reply as server-sent events (SSE). Where [the Java version](../java) goes
+through Java interop, this one uses the Kotlin API directly: KSP-generated
+tools, `node { }` function nodes, and coroutines end to end, as
 [How it works](#how-it-works) describes.
 
 ```
@@ -137,8 +138,9 @@ data:{"type":"reply","text":"Your order #1042 was last scanned in Brooklyn, NY a
 -   **Spring beans as tools.** At build time, the KSP processor
     (`google-adk-kotlin-processor`) generates a tool class for each
     `OrderService` function annotated with `@Tool`, such as `TrackShipmentTool`,
-    which calls the bean it is given. The function's KDoc becomes the tool's
-    description, and each `@Param` describes an argument.
+    which calls the bean it is given; the Java version reads the annotations at
+    runtime with `ReflectiveTools` instead. The function's KDoc becomes the
+    tool's description, and each `@Param` describes an argument.
 -   **Node outputs, not session state.** Each `LlmAgent` node sets `mode` to
     `AgentMode.SINGLE_TURN`, the default for an agent with no parent or
     sub-agents: its input is its last user message, and its final answer is its
@@ -158,17 +160,18 @@ data:{"type":"reply","text":"Your order #1042 was last scanned in Brooklyn, NY a
     partial events to the caller but never stores them, so no agent sees them
     in its history.
 -   **Function nodes as lambdas.** `node` builds a `FunctionNode` from a
-    suspending lambda.
--   **Non-blocking runs.** The service calls `Runner.runAsync` directly. It
-    returns a cold `Flow<Event>`, which the service collects inside the
-    `suspend` handler or the `Flow` that WebFlux streams, so no thread blocks
-    while the agents work. When a client disconnects, WebFlux cancels the
-    coroutine, which cancels the run and its model calls.
+    suspending lambda, whereas the Java version calls `FunctionNodes.of`.
+-   **Non-blocking runs.** The service calls `Runner.runAsync` directly, without
+    the Java version's `PublisherRunner` and Reactor. It returns a cold
+    `Flow<Event>`, which the service collects inside the `suspend` handler or
+    the `Flow` that WebFlux streams, so no thread blocks while the agents work.
+    When a client disconnects, WebFlux cancels the coroutine, which cancels the
+    run and its model calls.
 -   **One session per request.** The service calls the `suspend`
-    `SessionService` directly: it creates a session, runs the workflow in it,
-    and deletes it in a `finally` block when the run completes, fails, or is
-    canceled. The deletion runs in `NonCancellable`, so it completes even when
-    a canceled request triggers it.
+    `SessionService` directly, without `CompletableFutureSessionService`: it
+    creates a session, runs the workflow in it, and deletes it in a `finally`
+    block when the run completes, fails, or is canceled. The deletion runs in
+    `NonCancellable`, so it completes even when a canceled request triggers it.
 -   **Model errors.** A model call that does not finish normally, such as a
     blocked reply, arrives as an event with an error code rather than as an
     exception. An exception from the model API, such as a quota error, also

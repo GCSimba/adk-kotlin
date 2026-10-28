@@ -328,9 +328,10 @@ the `examples` directory of this repository.
     surface.
 
 *   [`examples/spring-boot/`](examples/spring-boot) — an order-support service
-    with Spring Boot WebFlux, in [Kotlin](examples/spring-boot/kotlin): a
-    workflow of Gemini agents, function nodes, and tools backed by a Spring
-    bean, answering requests with JSON or a stream of server-sent events.
+    with Spring Boot WebFlux, in [Java](examples/spring-boot/java) and in
+    [Kotlin](examples/spring-boot/kotlin): a workflow of Gemini agents, function
+    nodes, and tools backed by a Spring bean, answering requests with JSON or a
+    stream of server-sent events.
 
 *   [`examples/android/`](examples/android) — a Compose app showing the Android
     side, including the on-device (LiteRT-LM, ML Kit) and cloud (Firebase AI)

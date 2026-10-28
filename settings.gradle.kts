@@ -90,6 +90,11 @@ include(":google-adk-kotlin-examples-java")
 
 project(":google-adk-kotlin-examples-java").projectDir = file("examples/java")
 
+include(":google-adk-kotlin-examples-spring-boot-java")
+
+project(":google-adk-kotlin-examples-spring-boot-java").projectDir =
+  file("examples/spring-boot/java")
+
 include(":google-adk-kotlin-examples-spring-boot-kotlin")
 
 project(":google-adk-kotlin-examples-spring-boot-kotlin").projectDir =
