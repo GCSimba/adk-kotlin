@@ -24,6 +24,7 @@ plugins {
   id("com.android.kotlin.multiplatform.library") version "9.3.1" apply false
   id("com.google.cloud.artifactregistry.gradle-plugin") version "2.2.4" apply false
   kotlin("plugin.serialization") version "2.3.21" apply false
+  kotlin("plugin.spring") version "2.3.21" apply false
   alias(libs.plugins.gradle.test.retry) apply false
   alias(libs.plugins.google.services) apply false
   // Compose compiler plugin, pinned to AGP's built-in Kotlin version (see examples/android).

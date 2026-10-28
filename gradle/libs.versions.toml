@@ -50,6 +50,7 @@ robolectric = "4.16.1"
 slf4j = "2.0.17"
 snakeyaml = "2.2"
 spring-ai = "2.0.1"
+spring-boot = "4.1.1"
 # go/keep-sorted end
 
 [libraries]
@@ -95,8 +96,12 @@ google-mlkit-genai-prompt = { module = "com.google.mlkit:genai-prompt", version.
 google-truth = { module = "com.google.truth:truth", version.ref = "google-truth" }
 jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
 jackson-datatype-jsr310 = { module = "com.fasterxml.jackson.datatype:jackson-datatype-jsr310", version.ref = "jackson" }
+# Jackson 3 (tools.jackson); the Spring Boot BOM sets its version.
+jackson-module-kotlin = { module = "tools.jackson.module:jackson-module-kotlin" }
 jspecify = { module = "org.jspecify:jspecify", version.ref = "jspecify" }
 junit = { module = "junit:junit", version.ref = "junit" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect" }
 kotlin-test-junit = { module = "org.jetbrains.kotlin:kotlin-test-junit", version.ref = "kotlin" }
 kotlinx-atomicfu = { module = "org.jetbrains.kotlinx:atomicfu", version.ref = "kotlinx-atomicfu" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx-coroutines" }
@@ -131,6 +136,8 @@ slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
 snakeyaml = { module = "org.yaml:snakeyaml", version.ref = "snakeyaml" }
 spring-ai-google-genai = { module = "org.springframework.ai:spring-ai-google-genai", version.ref = "spring-ai" }
 spring-ai-model = { module = "org.springframework.ai:spring-ai-model", version.ref = "spring-ai" }
+spring-boot-starter-webflux = { module = "org.springframework.boot:spring-boot-starter-webflux" }
+spring-boot-starter-webflux-test = { module = "org.springframework.boot:spring-boot-starter-webflux-test" }
 # go/keep-sorted end
 
 [plugins]
@@ -140,4 +147,5 @@ dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
 google-services = { id = "com.google.gms.google-services", version.ref = "google-services" }
 gradle-test-retry = { id = "org.gradle.test-retry", version.ref = "gradle-test-retry"}
 ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+spring-boot = { id = "org.springframework.boot", version.ref = "spring-boot" }
 # go/keep-sorted end
