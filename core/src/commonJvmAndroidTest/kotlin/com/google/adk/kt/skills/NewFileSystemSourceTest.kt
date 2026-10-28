@@ -23,6 +23,7 @@ import java.nio.file.Path
 import kotlin.io.path.writeText
 import kotlinx.coroutines.test.runTest
 import org.junit.After
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -80,6 +81,21 @@ class NewFileSystemSourceTest {
   @CanIgnoreReturnValue
   private fun Path.writeFile(name: String, content: String): Path =
     resolve(name).also { it.writeText(content) }
+
+  private fun createSymlinkOrSkip(link: Path, target: Path) {
+    val supported =
+      try {
+        Files.createSymbolicLink(link, target)
+        true
+      } catch (e: UnsupportedOperationException) {
+        false
+      } catch (e: java.io.IOException) {
+        false
+      } catch (e: SecurityException) {
+        false
+      }
+    assumeTrue("Symbolic links are not supported on this platform", supported)
+  }
 
   @Test
   fun listFrontmatters_emptyDirectory_returnsEmptyList() = runTest {
@@ -256,6 +272,62 @@ class NewFileSystemSourceTest {
   }
 
   @Test
+  fun loadInstructions_pathTraversalSkillName_returnsFailure() = runTest {
+    val skillsDir = tempDir.resolve("skills")
+    Files.createDirectory(skillsDir)
+    val localSource = NewFileSystemSource(skillsDir.toString())
+    createSkill(parent = tempDir, dirName = "escaped-skill", instructions = "secret")
+
+    val result = localSource.loadInstructions("../escaped-skill")
+
+    assertThat(result.isFailure).isTrue()
+    val exception = result.exceptionOrNull()
+    assertThat(exception).isInstanceOf(SkillSourceException::class.java)
+    assertThat(exception!!.message).contains("Invalid skill name")
+  }
+
+  @Test
+  fun loadFrontmatter_absoluteSkillName_returnsFailure() = runTest {
+    val skillDir = createSkill(dirName = "skill1")
+
+    val result = source.loadFrontmatter(skillDir.toAbsolutePath().toString())
+
+    assertThat(result.isFailure).isTrue()
+    val exception = result.exceptionOrNull()
+    assertThat(exception).isInstanceOf(SkillSourceException::class.java)
+    assertThat(exception!!.message).contains("Invalid skill name")
+  }
+
+  @Test
+  fun loadFrontmatter_windowsDriveSkillNames_returnsFailure() = runTest {
+    for (skillName in listOf("C:", "D:other")) {
+      val result = source.loadFrontmatter(skillName)
+
+      assertThat(result.isFailure).isTrue()
+      val exception = result.exceptionOrNull()
+      assertThat(exception).isInstanceOf(SkillSourceException::class.java)
+      assertThat(exception!!.message).contains("Invalid skill name")
+    }
+  }
+
+  @Test
+  fun loadInstructions_symlinkedSkillDirectory_returnsInstructions() = runTest {
+    val skillsDir = tempDir.resolve("skills")
+    Files.createDirectory(skillsDir)
+    val outsideDir = tempDir.resolve("outside")
+    Files.createDirectory(outsideDir)
+    createSkill(parent = outsideDir, dirName = "shared", instructions = "secret")
+    val link = skillsDir.resolve("shared")
+    createSymlinkOrSkip(link, outsideDir.resolve("shared"))
+
+    val localSource = NewFileSystemSource(skillsDir.toString())
+    val result = localSource.loadInstructions("shared")
+
+    assertThat(result.isSuccess).isTrue()
+    assertThat(result.getOrThrow()).isEqualTo("secret")
+  }
+
+  @Test
   fun loadResource_validResource_returnsBytes() = runTest {
     val skillDir = createSkill(dirName = "skill1")
     skillDir.mkSubdir("assets").writeFile("resource.txt", "hello world")
@@ -395,6 +467,93 @@ class NewFileSystemSourceTest {
     val exception = result.exceptionOrNull()
     assertThat(exception).isInstanceOf(SkillSourceException::class.java)
     assertThat(exception!!.message).contains("Resource not found")
+  }
+
+  @Test
+  fun loadResource_pathTraversal_returnsFailure() = runTest {
+    createSkill(dirName = "skill1")
+
+    val result = source.loadResource("skill1", "../secret.txt")
+
+    assertThat(result.isFailure).isTrue()
+    val exception = result.exceptionOrNull()
+    assertThat(exception).isInstanceOf(SkillSourceException::class.java)
+    assertThat(exception!!.message).contains("Invalid resource path")
+  }
+
+  @Test
+  fun loadResource_pathTraversalSkillName_returnsFailure() = runTest {
+    val skillsDir = tempDir.resolve("skills")
+    Files.createDirectory(skillsDir)
+    val localSource = NewFileSystemSource(skillsDir.toString())
+    createSkill(parent = tempDir, dirName = "escaped-skill")
+
+    val result = localSource.loadResource("../escaped-skill", "assets/resource.txt")
+
+    assertThat(result.isFailure).isTrue()
+    val exception = result.exceptionOrNull()
+    assertThat(exception).isInstanceOf(SkillSourceException::class.java)
+    assertThat(exception!!.message).contains("Invalid skill name")
+  }
+
+  @Test
+  fun loadResource_symlinkedSkillDirectory_returnsBytes() = runTest {
+    val skillsDir = tempDir.resolve("skills")
+    Files.createDirectory(skillsDir)
+    val outsideDir = tempDir.resolve("outside")
+    Files.createDirectory(outsideDir)
+    val skillDir = createSkill(parent = outsideDir, dirName = "shared")
+    skillDir.mkSubdir("assets").writeFile("resource.txt", "hello")
+    createSymlinkOrSkip(skillsDir.resolve("shared"), skillDir)
+
+    val localSource = NewFileSystemSource(skillsDir.toString())
+    val result = localSource.loadResource("shared", "assets/resource.txt")
+
+    assertThat(result.isSuccess).isTrue()
+    assertThat(result.getOrThrow().decodeToString()).isEqualTo("hello")
+  }
+
+  @Test
+  fun listResources_pathTraversal_returnsFailure() = runTest {
+    createSkill(dirName = "skill1")
+
+    val result = source.listResources("skill1", "../secret")
+
+    assertThat(result.isFailure).isTrue()
+    val exception = result.exceptionOrNull()
+    assertThat(exception).isInstanceOf(SkillSourceException::class.java)
+    assertThat(exception!!.message).contains("Invalid resource path")
+  }
+
+  @Test
+  fun listResources_pathTraversalSkillName_returnsFailure() = runTest {
+    val skillsDir = tempDir.resolve("skills")
+    Files.createDirectory(skillsDir)
+    val localSource = NewFileSystemSource(skillsDir.toString())
+    createSkill(parent = tempDir, dirName = "escaped-skill")
+
+    val result = localSource.listResources("../escaped-skill", ".")
+
+    assertThat(result.isFailure).isTrue()
+    val exception = result.exceptionOrNull()
+    assertThat(exception).isInstanceOf(SkillSourceException::class.java)
+    assertThat(exception!!.message).contains("Invalid skill name")
+  }
+
+  @Test
+  fun listFrontmatters_symlinkedSkill_returnsFrontmatter() = runTest {
+    val skillsDir = tempDir.resolve("skills")
+    Files.createDirectory(skillsDir)
+    val outsideDir = tempDir.resolve("outside")
+    Files.createDirectory(outsideDir)
+    createSkill(parent = outsideDir, dirName = "shared", description = "Shared")
+    createSymlinkOrSkip(skillsDir.resolve("shared"), outsideDir.resolve("shared"))
+
+    val localSource = NewFileSystemSource(skillsDir.toString())
+    val result = localSource.listFrontmatters()
+
+    assertThat(result.isSuccess).isTrue()
+    assertThat(result.getOrThrow().map { it.name }).containsExactly("shared")
   }
 
   private companion object {
