@@ -42,6 +42,17 @@ class RetryConfigTest {
   }
 
   @Test
+  fun aWorkflowConfigurationExceptionIsNeverRetried() {
+    val error = WorkflowConfigurationException("misconfigured")
+
+    assertFalse(RetryConfig().shouldRetry(error, attemptCount = 1))
+    assertFalse(
+      RetryConfig(exceptions = listOf("WorkflowConfigurationException"))
+        .shouldRetry(error, attemptCount = 1)
+    )
+  }
+
+  @Test
   fun delayForGrowsByBackoffFactorUntilTheCeiling() {
     // Arrange
     val config =

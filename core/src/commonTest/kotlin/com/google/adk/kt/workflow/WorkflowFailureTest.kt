@@ -27,6 +27,7 @@ import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -435,6 +436,24 @@ class WorkflowFailureTest {
     // Assert: the root workflow re-ran its whole graph, so the child ran once per attempt.
     assertContains(error.message!!, "boom")
     assertEquals(3, childRuns)
+  }
+
+  @Test
+  fun aWorkflowWithTwoTerminalOutputsFailsWithoutARetry() {
+    // Arrange: both terminal nodes produce output.
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, Emitter("first", "1")), Edge(Start, Emitter("second", "2"))),
+        config = NodeConfig(retryConfig = instantRetry(3)),
+      )
+
+    // Act
+    val run = runWorkflowAsAppCatching(workflow)
+
+    // Assert
+    assertIs<WorkflowConfigurationException>(run.failure)
+    assertEquals(1, run.session.events.count { it.errorCode == "WorkflowConfigurationException" })
   }
 
   @Test

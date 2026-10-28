@@ -38,7 +38,8 @@ import kotlin.time.Duration.Companion.milliseconds
  * @property exceptions Reported type names to retry on, matched exactly with no subclass match. The
  *   reported name is the failure's own simple name, or for a [NodeExecutionException] the wrapped
  *   failure's type name -- so list e.g. "RuntimeError", not "NodeExecutionException". Null retries
- *   any failure; an empty list retries none.
+ *   any failure and an empty list none; a [WorkflowConfigurationException] is never retried, even
+ *   when listed.
  */
 @ExperimentalWorkflowApi
 data class RetryConfig(
@@ -65,7 +66,7 @@ data class RetryConfig(
    * has budget left and raised a type this config retries.
    */
   internal fun shouldRetry(error: Throwable, attemptCount: Int): Boolean {
-    if (attemptCount >= maxAttempts) return false
+    if (attemptCount >= maxAttempts || error is WorkflowConfigurationException) return false
     val retryable = exceptions ?: return true
     return errorTypeName(error) in retryable
   }
