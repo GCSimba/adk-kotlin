@@ -36,7 +36,9 @@ import io.ktor.server.routing.route
 import io.ktor.utils.io.writeStringUtf8
 import java.lang.invoke.MethodHandles
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.toList
 import org.slf4j.LoggerFactory
@@ -62,6 +64,7 @@ internal fun Route.runRoutes(
 
       val sessionId = request.sessionId ?: UUID.randomUUID().toString()
 
+      @Suppress("GlobalCoroutineDispatchers") // A blocking tool must not hold the call thread.
       val events =
         runner
           .runAsync(
@@ -72,6 +75,7 @@ internal fun Route.runRoutes(
             request.stateDelta,
             runConfig,
           )
+          .flowOn(Dispatchers.IO)
           .toList()
 
       call.respond(events)
@@ -91,6 +95,7 @@ internal fun Route.runRoutes(
 
     // LF frames like ADK Python (Ktor's SSE writes CRLF), via non-blocking respondBytesWriter.
     call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
+      // No flowOn here, unlike /run: Ktor runs response writers on Dispatchers.IO.
       runner
         .runAsync(
           request.userId,
