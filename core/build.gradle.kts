@@ -62,6 +62,9 @@ kotlin {
           implementation(libs.kotlinx.coroutines.core)
           implementation(libs.kotlinx.serialization)
           api(libs.google.genai.kotlin)
+          // compileOnly: google-genai-kotlin already brings ktor-http at runtime; a runtime
+          // dependency here would raise Android apps to this Ktor and its newer kotlin-stdlib.
+          compileOnly(libs.ktor.http)
         }
       }
     val commonTest =
