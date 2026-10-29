@@ -24,9 +24,13 @@ import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.testing.userEvent
 import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
+import com.google.adk.kt.types.CodeExecutionResult
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.ExecutableCode
 import com.google.adk.kt.types.FileData
 import com.google.adk.kt.types.FunctionResponse
+import com.google.adk.kt.types.Language
+import com.google.adk.kt.types.Outcome
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.ToolCall
@@ -223,6 +227,67 @@ class HistoryRewriterProcessorTest {
       contents[1].parts.map { it.text },
     )
     assertTrue(contents[1].parts.none { it.toolCall != null })
+  }
+
+  // Unlike a server-side tool call, code and its output are context a later agent can read, so they
+  // are relayed on their own part types, as ADK Python does.
+  @Test
+  fun rewrite_codeExecutionFromOtherAgent_isRelayed() {
+    val code = Part(executableCode = ExecutableCode(code = "print(1)", language = Language.PYTHON))
+    val result =
+      Part(codeExecutionResult = CodeExecutionResult(outcome = Outcome.OUTCOME_OK, output = "1"))
+    val events =
+      listOf(
+        userEvent("Run it."),
+        Event(author = "other_agent", content = modelMessage(code, result)),
+      )
+
+    val contents =
+      HistoryRewriterProcessor().rewrite(events, agentName = "agent", currentBranch = null)
+
+    assertEquals(2, contents.size)
+    assertEquals(listOf(Part(text = "For context:"), code, result), contents[1].parts)
+  }
+
+  // A summarizer often runs without history, so another agent's code-only event must start its
+  // turn rather than be skipped for the user's request before it.
+  @Test
+  fun rewrite_includeContentsNone_startsTheTurnOnOtherAgentCode() {
+    val code = Part(executableCode = ExecutableCode(code = "print(1)", language = Language.PYTHON))
+    val result =
+      Part(codeExecutionResult = CodeExecutionResult(outcome = Outcome.OUTCOME_OK, output = "1"))
+    val events =
+      listOf(
+        userEvent("Run it."),
+        Event(author = "other_agent", content = modelMessage(code, result)),
+      )
+
+    val contents =
+      HistoryRewriterProcessor()
+        .rewrite(
+          events,
+          agentName = "agent",
+          currentBranch = null,
+          includeContents = IncludeContents.NONE,
+        )
+
+    assertEquals(1, contents.size)
+    assertEquals(listOf(Part(text = "For context:"), code, result), contents[0].parts)
+  }
+
+  // The model needs its own code and its result back on the next request, so each counts as
+  // content even when it is the only part of its event.
+  @Test
+  fun rewrite_ownCodeExecution_isKept() {
+    val code = Part(executableCode = ExecutableCode(code = "print(1)", language = Language.PYTHON))
+    val result =
+      Part(codeExecutionResult = CodeExecutionResult(outcome = Outcome.OUTCOME_OK, output = "1"))
+    val events = listOf(userEvent("Run it."), modelPartEvent(code), modelPartEvent(result))
+
+    val contents =
+      HistoryRewriterProcessor().rewrite(events, agentName = "agent", currentBranch = null)
+
+    assertEquals(listOf(code, result), contents.drop(1).flatMap { it.parts })
   }
 
   // A signature carrier is visible but has nothing to narrate, so it must not start the current

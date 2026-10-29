@@ -24,11 +24,15 @@ import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.testing.testSession
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.types.Blob
+import com.google.adk.kt.types.CodeExecutionResult
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.ExecutableCode
 import com.google.adk.kt.types.FileData
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.GroundingMetadata
+import com.google.adk.kt.types.Language
+import com.google.adk.kt.types.Outcome
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.UsageMetadata
@@ -152,6 +156,16 @@ class A2aConvertersTest {
   }
 
   @Test
+  fun toA2A_withPartialFunctionCallPart_marksDataPartPartial() {
+    val part = Part(functionCall = FunctionCall(name = "func", id = "1", args = mapOf()))
+
+    val result = part.toA2A(isPartial = true) as DataPart
+
+    assertThat(result.metadata)
+      .isEqualTo(mapOf(MetadataKeys.TYPE to TYPE_FUNCTION_CALL, MetadataKeys.PARTIAL to true))
+  }
+
+  @Test
   fun toAdk_withDataPartFunctionResponse_returnsAdkFunctionResponsePart() {
     val data = mapOf("name" to "func", "id" to "1", "response" to mapOf<String, Any>())
     val metadata = mapOf(MetadataKeys.TYPE to TYPE_FUNCTION_RESPONSE)
@@ -174,6 +188,83 @@ class A2aConvertersTest {
     assertThat(data["name"]).isEqualTo("func")
     assertThat(data["id"]).isEqualTo("1")
     assertThat(dataPart.metadata?.get(MetadataKeys.TYPE)).isEqualTo(TYPE_FUNCTION_RESPONSE)
+  }
+
+  @Test
+  fun toAdk_withDataPartExecutableCode_returnsAdkExecutableCodePart() {
+    val data = mapOf("code" to "print('hi')", "language" to "PYTHON")
+    val dataPart = DataPart(data, mapOf(MetadataKeys.TYPE to TYPE_EXECUTABLE_CODE))
+
+    val result = dataPart.toAdk()
+
+    assertThat(result.executableCode)
+      .isEqualTo(ExecutableCode(code = "print('hi')", language = Language.PYTHON))
+  }
+
+  @Test
+  fun toA2A_withExecutableCodePart_returnsDataPart() {
+    val part =
+      Part(executableCode = ExecutableCode(code = "print('hi')", language = Language.PYTHON))
+
+    val result = part.toA2A() as DataPart
+
+    assertThat(result.data).isEqualTo(mapOf("code" to "print('hi')", "language" to "PYTHON"))
+    assertThat(result.metadata).isEqualTo(mapOf(MetadataKeys.TYPE to TYPE_EXECUTABLE_CODE))
+  }
+
+  @Test
+  fun toAdk_withDataPartCodeExecutionResult_returnsAdkCodeExecutionResultPart() {
+    val data = mapOf("outcome" to "OUTCOME_OK", "output" to "hi")
+    val dataPart = DataPart(data, mapOf(MetadataKeys.TYPE to TYPE_CODE_EXECUTION_RESULT))
+
+    val result = dataPart.toAdk()
+
+    assertThat(result.codeExecutionResult)
+      .isEqualTo(CodeExecutionResult(outcome = Outcome.OUTCOME_OK, output = "hi"))
+  }
+
+  @Test
+  fun toAdk_withDataPartExecutableCodeInLowercaseLanguage_returnsKnownLanguage() {
+    val data = mapOf("code" to "print('hi')", "language" to "python")
+    val dataPart = DataPart(data, mapOf(MetadataKeys.TYPE to TYPE_EXECUTABLE_CODE))
+
+    val result = dataPart.toAdk()
+
+    assertThat(result.executableCode)
+      .isEqualTo(ExecutableCode(code = "print('hi')", language = Language.PYTHON))
+  }
+
+  @Test
+  fun toAdk_withDataPartExecutableCodeWithNonStringLanguage_returnsUnspecifiedLanguage() {
+    val data = mapOf("code" to "print('hi')", "language" to 1)
+    val dataPart = DataPart(data, mapOf(MetadataKeys.TYPE to TYPE_EXECUTABLE_CODE))
+
+    val result = dataPart.toAdk()
+
+    assertThat(result.executableCode)
+      .isEqualTo(ExecutableCode(code = "print('hi')", language = Language.LANGUAGE_UNSPECIFIED))
+  }
+
+  @Test
+  fun toAdk_withDataPartCodeExecutionResultWithUnknownOutcome_returnsUnspecifiedOutcome() {
+    val data = mapOf("outcome" to "OUTCOME_NOT_YET_DEFINED", "output" to "hi")
+    val dataPart = DataPart(data, mapOf(MetadataKeys.TYPE to TYPE_CODE_EXECUTION_RESULT))
+
+    val result = dataPart.toAdk()
+
+    assertThat(result.codeExecutionResult)
+      .isEqualTo(CodeExecutionResult(outcome = Outcome.OUTCOME_UNSPECIFIED, output = "hi"))
+  }
+
+  @Test
+  fun toA2A_withCodeExecutionResultPart_returnsDataPart() {
+    val part =
+      Part(codeExecutionResult = CodeExecutionResult(outcome = Outcome.OUTCOME_OK, output = "hi"))
+
+    val result = part.toA2A() as DataPart
+
+    assertThat(result.data).isEqualTo(mapOf("outcome" to "OUTCOME_OK", "output" to "hi"))
+    assertThat(result.metadata).isEqualTo(mapOf(MetadataKeys.TYPE to TYPE_CODE_EXECUTION_RESULT))
   }
 
   @Test

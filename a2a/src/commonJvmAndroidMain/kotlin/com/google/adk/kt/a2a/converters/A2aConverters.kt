@@ -27,15 +27,20 @@ import com.google.adk.kt.serialization.adkJson
 import com.google.adk.kt.serialization.anyToJsonElement
 import com.google.adk.kt.serialization.jsonElementToAny
 import com.google.adk.kt.types.Blob
+import com.google.adk.kt.types.CodeExecutionResult
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.ExecutableCode
 import com.google.adk.kt.types.FileData
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.GroundingMetadata
+import com.google.adk.kt.types.Language
+import com.google.adk.kt.types.Outcome
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.UsageMetadata
 import java.util.Base64
+import kotlin.enums.enumEntries
 import kotlin.reflect.KClass
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.JsonElement
@@ -97,6 +102,8 @@ private val PENDING_STATES = setOf(TaskState.TASK_STATE_WORKING, TaskState.TASK_
 // DataPart types
 internal const val TYPE_FUNCTION_CALL = "function_call"
 internal const val TYPE_FUNCTION_RESPONSE = "function_response"
+internal const val TYPE_EXECUTABLE_CODE = "executable_code"
+internal const val TYPE_CODE_EXECUTION_RESULT = "code_execution_result"
 internal const val DEFAULT_ERROR_MESSAGE = "A2A task failed"
 
 // Wrap a DataPart carried as an inline text blob; the other ADK ports use the same tags.
@@ -375,14 +382,41 @@ private fun DataPart.toAdk(): Part {
         adkJson.decodeFromJsonElement(FunctionResponse.serializer(), anyToJsonElement(coercedData))
       Part(functionResponse = fr)
     }
+    TYPE_EXECUTABLE_CODE ->
+      Part(
+        executableCode =
+          decodeData(ExecutableCode.serializer(), "language", Language.LANGUAGE_UNSPECIFIED)
+      )
+    TYPE_CODE_EXECUTION_RESULT ->
+      Part(
+        codeExecutionResult =
+          decodeData(CodeExecutionResult.serializer(), "outcome", Outcome.OUTCOME_UNSPECIFIED)
+      )
     else -> toInlineJsonPart()
   }
 }
 
-// In A2A v1.0, DataPart.data may hold any JSON value; ADK function call and response payloads are
-// JSON objects, so any other value fails this cast.
+// In A2A v1.0, DataPart.data may hold any JSON value; the ADK part payloads it carries are JSON
+// objects, so any other value fails this cast.
 @Suppress("UNCHECKED_CAST")
 private fun DataPart.dataAsMap(): Map<String, Any?> = data as Map<String, Any?>
+
+/**
+ * Decodes this DataPart's data, matching the enum value under [enumKey] case-insensitively, as ADK
+ * Python does. Any other value becomes [unspecified], so the rest of the part is kept.
+ */
+private inline fun <T, reified E : Enum<E>> DataPart.decodeData(
+  serializer: KSerializer<T>,
+  enumKey: String,
+  unspecified: E,
+): T {
+  val data = dataAsMap().toMutableMap()
+  data[enumKey]?.let { value ->
+    val entry = enumEntries<E>().firstOrNull { it.name.equals(value.toString(), ignoreCase = true) }
+    data[enumKey] = (entry ?: unspecified).name
+  }
+  return adkJson.decodeFromJsonElement(serializer, anyToJsonElement(data))
+}
 
 /**
  * Carries a DataPart with no matching ADK part type as inline JSON of its data, as ADK Python and
@@ -421,10 +455,16 @@ internal fun Part.toA2A(isPartial: Boolean = false): A2APart<*> {
     )
   }
   functionCall?.let {
-    return it.toA2A(isPartial)
+    return typedDataPart(TYPE_FUNCTION_CALL, FunctionCall.serializer(), it, isPartial)
   }
   functionResponse?.let {
-    return it.toA2A()
+    return typedDataPart(TYPE_FUNCTION_RESPONSE, FunctionResponse.serializer(), it)
+  }
+  codeExecutionResult?.let {
+    return typedDataPart(TYPE_CODE_EXECUTION_RESULT, CodeExecutionResult.serializer(), it)
+  }
+  executableCode?.let {
+    return typedDataPart(TYPE_EXECUTABLE_CODE, ExecutableCode.serializer(), it)
   }
   throw IllegalArgumentException("Unsupported ADK Part content")
 }
@@ -462,24 +502,21 @@ internal fun InvocationContext.extractA2aParts(): List<A2APart<*>> {
   }
 }
 
-private fun FunctionCall.toA2A(isPartial: Boolean): DataPart {
-  val metadata = mutableMapOf<String, Any>(MetadataKeys.TYPE to TYPE_FUNCTION_CALL)
-  if (isPartial) {
-    metadata[MetadataKeys.PARTIAL] = true
-  }
+/** Carries an ADK part payload as a DataPart whose `adk_type` metadata names its [type]. */
+private fun <T> typedDataPart(
+  type: String,
+  serializer: KSerializer<T>,
+  value: T,
+  isPartial: Boolean = false,
+): DataPart {
   @Suppress("UNCHECKED_CAST")
-  val dataMap =
-    jsonElementToAny(adkJson.encodeToJsonElement(FunctionCall.serializer(), this))
-      as Map<String, Any>
+  val dataMap = jsonElementToAny(adkJson.encodeToJsonElement(serializer, value)) as Map<String, Any>
+  val metadata =
+    buildMap<String, Any> {
+      put(MetadataKeys.TYPE, type)
+      if (isPartial) put(MetadataKeys.PARTIAL, true)
+    }
   return DataPart(dataMap, metadata)
-}
-
-private fun FunctionResponse.toA2A(): DataPart {
-  @Suppress("UNCHECKED_CAST")
-  val dataMap =
-    jsonElementToAny(adkJson.encodeToJsonElement(FunctionResponse.serializer(), this))
-      as Map<String, Any>
-  return DataPart(dataMap, mapOf(MetadataKeys.TYPE to TYPE_FUNCTION_RESPONSE))
 }
 
 private fun coerceToMap(value: Any?): Map<String, Any?> =
