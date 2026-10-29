@@ -290,6 +290,89 @@ class AnthropicConvertersTest {
   }
 
   @Test
+  fun toMessageCreateParams_dropsEarlierTurnsThoughtsAndKeepsTheCurrentTurns() {
+    val call = FunctionCall(name = "get_weather", args = emptyMap(), id = "call-1")
+    val request =
+      LlmRequest(
+        contents =
+          listOf(
+            userText("Hi"),
+            Content(
+              role = Role.MODEL,
+              parts =
+                listOf(
+                  Part(
+                    text = "first plan",
+                    thought = true,
+                    thoughtSignature = "sig-1".toByteArray(),
+                  ),
+                  Part(thought = true, thoughtSignature = "encrypted".toByteArray()),
+                  Part(text = "Hello"),
+                ),
+            ),
+            userText("What is the weather?"),
+            Content(
+              role = Role.MODEL,
+              parts =
+                listOf(
+                  Part(
+                    text = "second plan",
+                    thought = true,
+                    thoughtSignature = "sig-2".toByteArray(),
+                  ),
+                  Part(functionCall = call),
+                ),
+            ),
+            Content(
+              role = Role.USER,
+              parts =
+                listOf(
+                  Part(
+                    functionResponse =
+                      FunctionResponse(name = "get_weather", response = mapOf(), id = "call-1")
+                  )
+                ),
+            ),
+          )
+      )
+
+    val messages = request.toParams().messages()
+
+    assertThat(messages[1].content().asBlockParams().single().asText().text()).isEqualTo("Hello")
+    val currentTurn = messages[3].content().asBlockParams()
+    assertThat(currentTurn[0].asThinking().signature()).isEqualTo("sig-2")
+    assertThat(currentTurn[1].asToolUse().id()).isEqualTo("call-1")
+  }
+
+  @Test
+  fun toMessageCreateParams_dropsThoughtsBeforeUserContentAfterToolResults() {
+    val call = FunctionCall(name = "get_weather", args = emptyMap(), id = "call-1")
+    val result = FunctionResponse(name = "get_weather", response = mapOf(), id = "call-1")
+    val request =
+      LlmRequest(
+        contents =
+          listOf(
+            userText("What is the weather?"),
+            Content(
+              role = Role.MODEL,
+              parts =
+                listOf(
+                  Part(text = "plan", thought = true, thoughtSignature = "sig".toByteArray()),
+                  Part(functionCall = call),
+                ),
+            ),
+            Content(role = Role.USER, parts = listOf(Part(functionResponse = result))),
+            // A new user message, or the dynamic instruction ADK moves here from before the call.
+            userText("Answer briefly."),
+          )
+      )
+
+    val blocks = request.toParams().messages()[1].content().asBlockParams()
+
+    assertThat(blocks.single().asToolUse().id()).isEqualTo("call-1")
+  }
+
+  @Test
   fun toMessageCreateParams_sendsTheImageOfAPartWithEmptyText() {
     val image = Part(text = "", inlineData = Blob(mimeType = "image/png", data = byteArrayOf(1)))
     val request = LlmRequest(contents = listOf(Content(role = Role.USER, parts = listOf(image))))

@@ -109,7 +109,7 @@ internal fun LlmRequest.toMessageCreateParams(
 ): MessageCreateParams {
   val toolUseIds = ToolUseIds()
   val cacheControl = cacheControl()
-  val messages = contents.mapNotNull { it.toMessageParam(toolUseIds) }
+  val messages = contents.withoutEarlierTurnThoughts().mapNotNull { it.toMessageParam(toolUseIds) }
   val builder =
     MessageCreateParams.builder()
       .model(modelId(modelName))
@@ -315,12 +315,42 @@ private fun ContentBlockParam.withCacheControl(
   }
 
 /**
+ * Drops the thinking blocks of earlier turns. A turn starts at user content other than tool
+ * results, such as a new message or the dynamic instruction ADK moves behind tool results. Claude
+ * binds each block to the system prompt, tools, and messages sent before it, which ADK can change
+ * between requests, and the API accepts history without its oldest blocks.
+ */
+private fun List<Content>.withoutEarlierTurnThoughts(): List<Content> {
+  val turnStart = indexOfLast { it.startsTurn() }
+  if (turnStart <= 0) return this
+  return mapIndexed { index, content ->
+    if (index < turnStart && content.isFromModel()) {
+      content.copy(parts = content.parts.filterNot { it.isThinking() })
+    } else {
+      content
+    }
+  }
+}
+
+private fun Content.isFromModel(): Boolean =
+  role.equals(Role.MODEL, ignoreCase = true) || role.equals("assistant", ignoreCase = true)
+
+private fun Content.startsTurn(): Boolean =
+  !isFromModel() && parts.any { it.functionResponse == null }
+
+/**
+ * Whether this part is a thought to send as a thinking block, or to drop when unsigned. A
+ * thought-flagged call still goes out as tool_use, or its result would have no match.
+ */
+private fun Part.isThinking(): Boolean =
+  thought == true && functionCall == null && functionResponse == null
+
+/**
  * Converts an ADK [Content] to a Messages API turn, or null when it yields no blocks, since the API
  * rejects a message with empty content.
  */
 private fun Content.toMessageParam(toolUseIds: ToolUseIds): MessageParam? {
-  val isModel =
-    role.equals(Role.MODEL, ignoreCase = true) || role.equals("assistant", ignoreCase = true)
+  val isModel = isFromModel()
   // Claude takes no images or PDFs in assistant turns, so the Python ADK drops them there.
   val blocks =
     parts
@@ -352,8 +382,7 @@ private fun Part.toContentBlockParam(toolUseIds: ToolUseIds): ContentBlockParam?
   val code = executableCode
   val codeResult = codeExecutionResult
   return when {
-    // A thought-flagged call still goes out as tool_use, or its result would have no match.
-    thought == true && call == null && response == null -> toThinkingBlock()
+    isThinking() -> toThinkingBlock()
     // Empty text is falsy in the Python ADK, so other content on the same part still goes out.
     thought != true && !partText.isNullOrEmpty() -> ContentBlockParam.ofText(partText)
     call != null ->
