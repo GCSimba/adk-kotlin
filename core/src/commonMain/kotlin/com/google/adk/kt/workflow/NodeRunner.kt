@@ -63,6 +63,7 @@ private constructor(
   private val useSubBranch: Boolean = false,
   private val overrideBranch: String? = null,
   private val overrideIsolationScope: String? = null,
+  private val openInterrupts: Set<String> = emptySet(),
 ) {
 
   constructor(
@@ -74,6 +75,7 @@ private constructor(
     useSubBranch: Boolean = false,
     overrideBranch: String? = null,
     overrideIsolationScope: String? = null,
+    openInterrupts: Set<String> = emptySet(),
   ) : this(
     node = node,
     invocationContext = parent.invocationContext,
@@ -85,6 +87,7 @@ private constructor(
     useSubBranch = useSubBranch,
     overrideBranch = overrideBranch,
     overrideIsolationScope = overrideIsolationScope,
+    openInterrupts = openInterrupts,
   )
 
   private val childRunIds = ChildRunIds()
@@ -134,8 +137,20 @@ private constructor(
         attempt += 1
         continue
       }
+      keepOpenInterrupts(context)
       return context
     }
+  }
+
+  /**
+   * Keeps waiting on the interrupts a rerun started with when it ends without an output or route,
+   * as only an answer closes them. A handoff waits for them too, and so does an interrupt of a
+   * child the rerun no longer runs.
+   */
+  private fun keepOpenInterrupts(context: Context) {
+    val state = context.requireNodeState()
+    val hasResult = state.failure != null || context.hasProducedOutput || context.routes != null
+    if (openInterrupts.isNotEmpty() && !hasResult) state.addInterruptIds(openInterrupts)
   }
 
   /**

@@ -812,6 +812,7 @@ open class Context(
     overrideBranch: String?,
     overrideIsolationScope: String?,
     resumeInputs: Map<String, Any?>,
+    openInterrupts: Set<String>,
     firstHop: Context?,
   ): Context {
     val first =
@@ -825,6 +826,7 @@ open class Context(
           overrideBranch,
           overrideIsolationScope,
           resumeInputs = resumeInputs,
+          openInterrupts = openInterrupts,
           validateInput = true,
         )
     return followTransfers(
@@ -903,13 +905,14 @@ open class Context(
       overrideBranch,
       overrideIsolationScope,
       resumeInputs = interception.resumeInputs,
+      openInterrupts = interception.interrupts,
       validateInput = false,
     )
   }
 
   /**
-   * Runs [node] under this activation with [resumeInputs]. With [validateInput], as for a graph
-   * node, [node] validates [input] itself.
+   * Runs [node] under this activation with [resumeInputs], keeping its [openInterrupts] if it ends
+   * without a result. With [validateInput], as for a graph node, [node] validates [input] itself.
    */
   @ExperimentalWorkflowApi
   private suspend fun runChild(
@@ -921,6 +924,7 @@ open class Context(
     overrideBranch: String?,
     overrideIsolationScope: String?,
     resumeInputs: Map<String, Any?>,
+    openInterrupts: Set<String> = emptySet(),
     validateInput: Boolean,
   ): Context =
     NodeRunner(
@@ -931,6 +935,7 @@ open class Context(
         resumeInputs = resumeInputs,
         useSubBranch = useSubBranch,
         overrideBranch = overrideBranch,
+        openInterrupts = openInterrupts,
         // A task agent works in a scope of its own unless the caller picks one.
         overrideIsolationScope =
           overrideIsolationScope

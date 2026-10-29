@@ -37,7 +37,8 @@ import kotlinx.coroutines.flow.Flow
  * @property rerunOnResume On resume, whether to run the node again from scratch rather than
  *   completing it with the resuming answer as its output.
  * @property waitForOutput Whether the node stays re-triggerable until it produces an output or a
- *   route, instead of completing when its run completes.
+ *   route, instead of completing when its run completes. On resume, a run that finished without one
+ *   is repeated only after a new user message or a reply to a task it delegated.
  * @property config The node's retry policy and execution timeout.
  * @property inputSchema Checks the input as JSON; the node receives the checked value unless it
  *   takes a `Content`. An edge fails to build when the predecessor's output schema admits values

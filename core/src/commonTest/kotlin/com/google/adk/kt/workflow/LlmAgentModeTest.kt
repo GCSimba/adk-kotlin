@@ -173,8 +173,8 @@ private fun coordinator(
   tools: List<BaseTool> = emptyList(),
 ) = LlmAgent(name = "root_agent", model = model, subAgents = subAgents, tools = tools)
 
-/** Runs [root] passed as a node, so it may use agent modes. */
-private fun runnerFor(root: BaseAgent, resumable: Boolean = false) =
+/** Runs [root] passed as a node, so an agent may use agent modes. */
+private fun runnerFor(root: Node, resumable: Boolean = false) =
   InMemoryRunner(
     app =
       App(
@@ -186,6 +186,43 @@ private fun runnerFor(root: BaseAgent, resumable: Boolean = false) =
 
 private suspend fun InMemoryRunner.send(message: String): List<Event> =
   runAsync("u", "s", newMessage = Content.fromText(Role.USER, message)).toList()
+
+/** Counts its runs and emits a fixed output. */
+private class ModeCountingNode(override val name: String) : Node {
+  var runs = 0
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs++
+    emit("$name ran")
+  }
+}
+
+/** Asks for input on its first run and emits `answered` once it has an answer. */
+private class ModeAskingNode(override val name: String) : Node {
+  override val rerunOnResume = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    if (context.resumeInputs.isEmpty()) emit(RequestInput(interruptId = "ask_$name"))
+    else emit("answered")
+  }
+}
+
+/** A coordinator with a long-running `approve` tool and the task sub-agent `worker`. */
+private fun approvingCoordinator(model: Model, workerModel: Model, name: String = "root_agent") =
+  LlmAgent(
+    name = name,
+    model = model,
+    description = "Coordinates.",
+    subAgents = listOf(taskAgent("worker", workerModel)),
+    tools = listOf(DummyTool("approve", isLongRunning = true, onRun = { _, _ -> Unit })),
+  )
+
+/** A coordinator turn that calls `approve` and delegates to `worker`, then a closing reply. */
+private fun approveAndDelegateModel() =
+  ModeScriptedModel(
+    calls("approve" to emptyMap(), "worker" to mapOf("request" to "do it")),
+    text("all done"),
+  )
 
 private suspend fun runWorkflow(message: String, vararg edges: Edge): List<Event> =
   InMemoryRunner(app = App("app", rootNode = Workflow("wf", edges.toList())))
@@ -1685,6 +1722,335 @@ class LlmAgentModeTest {
     }
 
   @Test
+  fun runAsync_replyToTaskDelegatedBesideALongRunningCall_reachesTheTask() = runBlocking {
+    // Arrange: one coordinator turn calls a long-running tool and delegates a task that asks.
+    val workerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val root = approvingCoordinator(approveAndDelegateModel(), workerModel)
+    val runner = runnerFor(root, resumable = true)
+    val first = runner.send("go")
+    val paused = first.single { it.contentText() == "which one?" }
+    val approvalId = first.flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+
+    // Act
+    val reply = runner.send("the second one")
+    val answer = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+
+    // Assert: the reply finishes the task while the approval stays open, and the answer to the
+    // approval then lets the coordinator go on.
+    val taskAnswer = reply.single { e -> e.functionResponses().any { it.name == "worker" } }
+    assertEquals(paused.invocationId, taskAnswer.invocationId)
+    assertContains(workerModel.requests[1].contents.map { it.text() }, "the second one")
+    assertFalse(reply.any { it.contentText() == "all done" })
+    assertTrue(answer.any { it.contentText() == "all done" })
+  }
+
+  @Test
+  fun runAsync_answerToACallBesideATaskThatAsked_leavesTheTaskWaiting() = runBlocking {
+    // Arrange: one coordinator turn calls a long-running tool and delegates a task that asks.
+    val workerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val root = approvingCoordinator(approveAndDelegateModel(), workerModel)
+    val runner = runnerFor(root, resumable = true)
+    val approvalId =
+      runner.send("go").flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+
+    // Act
+    val answer = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+    val reply = runner.send("the second one")
+
+    // Assert: the answer does not make the task ask again; the reply then finishes it.
+    assertTrue(answer.none { it.author == "worker" })
+    assertEquals(2, workerModel.requests.size)
+    assertTrue(reply.any { it.contentText() == "all done" })
+  }
+
+  @Test
+  fun runAsync_graphCoordinatorReplyToTaskBesideALongRunningCall_reachesTheTask() = runBlocking {
+    // Arrange: a coordinator graph node calls a long-running tool and delegates a task that asks.
+    val workerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val coordinator = approvingCoordinator(approveAndDelegateModel(), workerModel)
+    val runner = runnerFor(Workflow("wf", listOf(Edge(Start, coordinator))), resumable = true)
+    val approvalId =
+      runner.send("go").flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+
+    // Act
+    val reply = runner.send("the second one")
+    val workerRequestsAfterReply = workerModel.requests.size
+    val answer = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+
+    // Assert: the reply reaches the task first while the workflow keeps waiting on the approval;
+    // the approval answer then lets the coordinator go on.
+    assertEquals(2, workerRequestsAfterReply)
+    assertContains(workerModel.requests[1].contents.map { it.text() }, "the second one")
+    assertFalse(reply.any { it.contentText() == "all done" })
+    assertTrue(reply.none { it.author == "wf" && it.actions.endOfAgent })
+    assertTrue(answer.any { it.contentText() == "all done" })
+  }
+
+  @Test
+  fun runAsync_nestedGraphCoordinatorReplyToTask_keepsTheOuterWorkflowWaiting() = runBlocking {
+    // Arrange: the coordinator runs inside `inner`, which `after` follows in the outer workflow.
+    val workerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val coordinator = approvingCoordinator(approveAndDelegateModel(), workerModel)
+    val inner = Workflow("inner", listOf(Edge(Start, coordinator)))
+    val after = ModeCountingNode("after")
+    val runner =
+      runnerFor(Workflow("outer", listOf(Edge(Start, inner), Edge(inner, after))), resumable = true)
+    val approvalId =
+      runner.send("go").flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+
+    // Act
+    val unusedReply = runner.send("the second one")
+    val afterRunsAfterReply = after.runs
+    val answer = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+
+    // Assert: the reply finishes the task, but `after` waits for the approval.
+    assertEquals(2, workerModel.requests.size)
+    assertEquals(0, afterRunsAfterReply)
+    assertEquals(1, after.runs)
+    assertTrue(answer.any { it.contentText() == "all done" })
+  }
+
+  @Test
+  fun runAsync_graphCoordinatorTaskAsksAgain_answerToAnotherBranchLeavesItWaiting() = runBlocking {
+    // Arrange: the task asks twice, and `other` asks on its own branch.
+    val workerModel =
+      ModeScriptedModel(
+        text("which one?"),
+        text("which color?"),
+        call("finish_task", mapOf("result" to "done")),
+      )
+    val coordinator = approvingCoordinator(approveAndDelegateModel(), workerModel)
+    val runner =
+      runnerFor(
+        Workflow("wf", listOf(Edge(Start, coordinator), Edge(Start, ModeAskingNode("other")))),
+        resumable = true,
+      )
+    val unusedGo = runner.send("go")
+    val unusedReply = runner.send("the second one")
+    val otherAnswer = answerTo(RequestInput.FUNCTION_CALL_NAME, "ask_other")
+
+    // Act
+    val answer = runner.runAsync("u", "s", newMessage = otherAnswer).toList()
+
+    // Assert: `other` finishes, while the task keeps its question and the workflow keeps waiting.
+    assertTrue(answer.any { it.output == "answered" })
+    assertEquals(2, workerModel.requests.size)
+    assertTrue(answer.none { it.author == "wf" && it.actions.endOfAgent })
+  }
+
+  @Test
+  fun runAsync_taskNodeWithAHelperMessagedWhileACallIsOpen_keepsTheWorkflowWaiting() = runBlocking {
+    // Arrange: a task node asks a single-turn helper, then calls the long-running `approve`.
+    val helper =
+      LlmAgent(
+        name = "helper",
+        model = ModeScriptedModel(text("a hint")),
+        description = "Helps.",
+        mode = AgentMode.SINGLE_TURN,
+      )
+    val taskModel =
+      ModeScriptedModel(
+        call("helper", mapOf("request" to "hint?")),
+        call("approve", emptyMap()),
+        call("finish_task", mapOf("result" to "done")),
+      )
+    val task =
+      LlmAgent(
+        name = "task",
+        model = taskModel,
+        description = "Does task.",
+        subAgents = listOf(helper),
+        tools = listOf(DummyTool("approve", isLongRunning = true, onRun = { _, _ -> Unit })),
+        mode = AgentMode.TASK,
+      )
+    val runner = runnerFor(Workflow("wf", listOf(Edge(Start, task))), resumable = true)
+    val approvalId =
+      runner.send("go").flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+
+    // Act
+    val message = runner.send("any news?")
+    val answer = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+
+    // Assert: the message is not a reply to the helper, so the task waits without running again,
+    // and the workflow does not end while the approval is open.
+    assertTrue(message.none { it.author == "task" })
+    assertTrue(message.none { it.author == "wf" && it.actions.endOfAgent })
+    assertTrue(answer.any { it.output == mapOf("result" to "done") })
+  }
+
+  @Test
+  fun runAsync_graphNodeWithTwoOpenCallsOneAnswered_keepsWaitingOnTheOther() = runBlocking {
+    // Arrange: a graph node calls two long-running tools in one turn, and `after` follows it.
+    val agent =
+      LlmAgent(
+        name = "agent",
+        model =
+          ModeScriptedModel(
+            calls("approve_a" to emptyMap(), "approve_b" to emptyMap()),
+            text("all done"),
+          ),
+        tools =
+          listOf(
+            DummyTool("approve_a", isLongRunning = true, onRun = { _, _ -> Unit }),
+            DummyTool("approve_b", isLongRunning = true, onRun = { _, _ -> Unit }),
+          ),
+      )
+    val after = ModeCountingNode("after")
+    val runner =
+      runnerFor(Workflow("wf", listOf(Edge(Start, agent), Edge(agent, after))), resumable = true)
+    val callIds = runner.send("go").flatMap { it.functionCalls() }.associate { it.name to it.id }
+
+    // Act
+    val first =
+      runner.runAsync("u", "s", newMessage = answerTo("approve_a", callIds["approve_a"])).toList()
+    val afterRunsAfterFirst = after.runs
+    val second =
+      runner.runAsync("u", "s", newMessage = answerTo("approve_b", callIds["approve_b"])).toList()
+
+    // Assert: the first answer leaves the node waiting on the second call; the second lets it go
+    // on.
+    assertEquals(0, afterRunsAfterFirst)
+    assertTrue(first.none { it.author == "wf" && it.actions.endOfAgent })
+    assertTrue(second.any { it.contentText() == "all done" })
+    assertEquals(1, after.runs)
+  }
+
+  @Test
+  fun runAsync_coordinatorReachedByAHandoffReplyToTask_reachesTheTask() = runBlocking {
+    // Arrange: graph node `first` hands off to a child coordinator, whose task asks.
+    val workerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val child = approvingCoordinator(approveAndDelegateModel(), workerModel, name = "child")
+    val first =
+      LlmAgent(
+        name = "first",
+        model = ModeScriptedModel(call("transfer_to_agent", mapOf("agent_name" to "child"))),
+        subAgents = listOf(child),
+      )
+    val runner = runnerFor(Workflow("wf", listOf(Edge(Start, first))), resumable = true)
+    val approvalId =
+      runner.send("go").flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+
+    // Act
+    val reply = runner.send("the second one")
+    val workerRequestsAfterReply = workerModel.requests.size
+    val answer = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+
+    // Assert: the reply reaches the task while the workflow keeps waiting on the approval.
+    assertEquals(2, workerRequestsAfterReply)
+    assertContains(workerModel.requests[1].contents.map { it.text() }, "the second one")
+    assertTrue(reply.none { it.author == "wf" && it.actions.endOfAgent })
+    assertTrue(answer.any { it.contentText() == "all done" })
+  }
+
+  @Test
+  fun runAsync_handoffBesideTwoOwnCallsOneAnswered_keepsWaitingOnTheOther() = runBlocking {
+    // Arrange: graph node `first` calls two long-running tools and hands off in one turn.
+    val childModel = ModeScriptedModel(text("from child"))
+    val first =
+      LlmAgent(
+        name = "first",
+        model =
+          ModeScriptedModel(
+            calls(
+              "approve_a" to emptyMap(),
+              "approve_b" to emptyMap(),
+              "transfer_to_agent" to mapOf("agent_name" to "child"),
+            )
+          ),
+        subAgents = listOf(LlmAgent(name = "child", model = childModel, description = "Helps.")),
+        tools =
+          listOf(
+            DummyTool("approve_a", isLongRunning = true, onRun = { _, _ -> Unit }),
+            DummyTool("approve_b", isLongRunning = true, onRun = { _, _ -> Unit }),
+          ),
+      )
+    val runner = runnerFor(Workflow("wf", listOf(Edge(Start, first))), resumable = true)
+    val callIds = runner.send("go").flatMap { it.functionCalls() }.associate { it.name to it.id }
+
+    // Act
+    val answer =
+      runner.runAsync("u", "s", newMessage = answerTo("approve_a", callIds["approve_a"])).toList()
+
+    // Assert: `first` still waits on `approve_b`, so the handoff waits too.
+    assertTrue(childModel.requests.isEmpty())
+    assertTrue(answer.none { it.author == "wf" && it.actions.endOfAgent })
+  }
+
+  @Test
+  fun runAsync_deferredHandoffAfterAReplyToTask_waitsForTheOpenCall() = runBlocking {
+    // Arrange: one coordinator turn calls `approve`, delegates a task that asks, and hands off.
+    val workerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val childModel = ModeScriptedModel(text("from child"))
+    val coordinator =
+      LlmAgent(
+        name = "root_agent",
+        model =
+          ModeScriptedModel(
+            calls(
+              "approve" to emptyMap(),
+              "worker" to mapOf("request" to "do it"),
+              "transfer_to_agent" to mapOf("agent_name" to "child"),
+            )
+          ),
+        subAgents =
+          listOf(
+            taskAgent("worker", workerModel),
+            LlmAgent(name = "child", model = childModel, description = "Helps."),
+          ),
+        tools = listOf(DummyTool("approve", isLongRunning = true, onRun = { _, _ -> Unit })),
+      )
+    val runner = runnerFor(Workflow("wf", listOf(Edge(Start, coordinator))), resumable = true)
+    val approvalId =
+      runner.send("go").flatMap { it.functionCalls() }.single { it.name == "approve" }.id
+
+    // Act
+    val reply = runner.send("the second one")
+    val childRequestsAfterReply = childModel.requests.size
+    val unusedAnswer = runner.runAsync("u", "s", newMessage = approvalAnswer(approvalId)).toList()
+
+    // Assert: the reply finishes the task, and the handoff waits for the approval.
+    assertEquals(2, workerModel.requests.size)
+    assertEquals(0, childRequestsAfterReply)
+    assertTrue(reply.none { it.author == "wf" && it.actions.endOfAgent })
+    assertEquals(1, childModel.requests.size)
+  }
+
+  @Test
+  fun runAsync_waitForOutputNodeThatWroteStateBeforeATask_replyReachesTheTask() = runBlocking {
+    // Arrange: a custom node writes state, then runs a task that asks.
+    val workerModel =
+      ModeScriptedModel(text("which one?"), call("finish_task", mapOf("result" to "done")))
+    val worker = taskAgent("worker", workerModel)
+    val driver =
+      object : Node {
+        override val name = "driver"
+        override val rerunOnResume = true
+        override val waitForOutput = true
+
+        override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+          context.updateState("touched", true)
+          emit(context.runNode(worker, nodeInput = "do it", raiseOnWait = true))
+        }
+      }
+    val runner = runnerFor(Workflow("wf", listOf(Edge(Start, driver))), resumable = true)
+    val unusedGo = runner.send("go")
+
+    // Act
+    val reply = runner.send("the second one")
+
+    // Assert: the node runs again, so the task gets the reply and finishes.
+    assertEquals(2, workerModel.requests.size)
+    val driverOutput = reply.single { it.nodeInfo?.path == "wf@1/driver@1" && it.output != null }
+    assertEquals(mapOf("result" to "done"), driverOutput.output)
+  }
+
+  @Test
   fun runAsync_functionResponseWhileTaskPaused_doesNotBorrowTaskInvocation() = runBlocking {
     // Arrange
     val (runner, approvalId, paused) = pausedTaskWithEarlierApproval()
@@ -1757,16 +2123,17 @@ class LlmAgentModeTest {
     return PausedTaskFixture(runner, approvalId, paused, workerModel)
   }
 
-  private fun approvalAnswer(id: String?) =
+  private fun answerTo(name: String, id: String?) =
     Content(
       Role.USER,
       listOf(
         Part(
-          functionResponse =
-            FunctionResponse(id = id, name = "approve", response = mapOf("ok" to true))
+          functionResponse = FunctionResponse(id = id, name = name, response = mapOf("ok" to true))
         )
       ),
     )
+
+  private fun approvalAnswer(id: String?) = answerTo("approve", id)
 
   @Test
   fun taskMode_node_handsFinishArgumentsToNextNode() = runBlocking {

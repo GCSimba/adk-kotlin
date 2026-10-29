@@ -651,6 +651,125 @@ class AgentTransferLoopTest {
   }
 
   @Test
+  fun runAsync_peerTargetThatRepliedBesideAPausedBranch_runsOnceOnResume() = runBlocking {
+    // Arrange: `first` hands off to `second`, which replies; `other`, on its own branch, asks.
+    val secondModel = CountingReplyModel("from second")
+    val first = chatAgent("first", transferModel("second"))
+    val unusedRoot =
+      chatAgent(
+        "root",
+        replyModel("unused"),
+        subAgents = listOf(first, chatAgent("second", secondModel)),
+      )
+
+    // Act
+    val events = answerOtherBesides(first)
+
+    // Assert: `second` keeps its one reply, and `other` finishes.
+    assertEquals(1, secondModel.calls)
+    assertTrue(events.any { it.output == "answered" })
+  }
+
+  @Test
+  fun runAsync_childTargetThatRepliedBesideAPausedBranch_runsOnceOnResume() = runBlocking {
+    // Arrange: the coordinator hands off to its child, which replies; `other` asks.
+    val childModel = CountingReplyModel("from child")
+    val coordinator =
+      chatAgent(
+        "coordinator",
+        transferModel("child"),
+        subAgents = listOf(chatAgent("child", childModel)),
+      )
+
+    // Act
+    val events = answerOtherBesides(coordinator)
+
+    // Assert
+    assertEquals(1, childModel.calls)
+    assertTrue(events.any { it.output == "answered" })
+  }
+
+  @Test
+  fun runAsync_chatNodeThatRepliedBesideAPausedBranch_runsOnceOnResume() = runBlocking {
+    // Arrange: a chat node replies without an output, so it waits; `other` asks.
+    val chatModel = CountingReplyModel("from chat")
+
+    // Act
+    val events = answerOtherBesides(chatAgent("chat", chatModel))
+
+    // Assert: answering `other` is not a message to the chat node, so it does not reply again.
+    assertEquals(1, chatModel.calls)
+    assertTrue(events.any { it.output == "answered" })
+  }
+
+  @Test
+  fun runAsync_peerTargetThatRepliedBesideATaskThatAsked_runsOnceOnTheReply() = runBlocking {
+    // Arrange: `first` hands off to `second`, which replies; a task on its own branch asks in text.
+    val secondModel = CountingReplyModel("from second")
+    val first = chatAgent("first", transferModel("second"))
+    val unusedRoot =
+      chatAgent(
+        "root",
+        replyModel("unused"),
+        subAgents = listOf(first, chatAgent("second", secondModel)),
+      )
+    val task =
+      LlmAgent(
+        name = "task",
+        model =
+          DummyModel.createSequential(
+            "m",
+            listOf(
+              LlmResponse(content = Content.fromText(Role.MODEL, "which one?")),
+              modelFunctionCallResponse("finish_task", mapOf("result" to "done")),
+            ),
+          ),
+        mode = AgentMode.TASK,
+      )
+    val runner =
+      InMemoryRunner(
+        app =
+          App(
+            appName = "app",
+            rootNode = Workflow(name = "wf", edges = listOf(Edge(Start, first), Edge(Start, task))),
+            resumabilityConfig = ResumabilityConfig(isResumable = true),
+          )
+      )
+    val unused = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+
+    // Act
+    val events = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "b")).toList()
+
+    // Assert: the reply is for the task, so `second` does not reply again.
+    assertEquals(1, secondModel.calls)
+    assertTrue(events.any { it.output == mapOf("result" to "done") })
+  }
+
+  /**
+   * Runs [node] beside an `other` node that asks for input on its own branch, answers `other`, and
+   * returns the events of that resumed turn.
+   */
+  private suspend fun answerOtherBesides(node: Node): List<Event> {
+    val runner =
+      InMemoryRunner(
+        app =
+          App(
+            appName = "app",
+            rootNode =
+              Workflow(
+                name = "wf",
+                edges = listOf(Edge(Start, node), Edge(Start, AskingAgent("other", "answered"))),
+              ),
+            resumabilityConfig = ResumabilityConfig(isResumable = true),
+          )
+      )
+    val unused = runner.runAsync("u", "s", newMessage = Content.fromText(Role.USER, "go")).toList()
+    val answer =
+      userFunctionResponse(RequestInput.FUNCTION_CALL_NAME, "ask_other", mapOf("ok" to true))
+    return runner.runAsync("u", "s", newMessage = answer).toList()
+  }
+
+  @Test
   fun runNode_dispatchedAgentTransferToSibling_returnsSiblingRun() = runBlocking {
     // Arrange
     val first = chatAgent("first", transferModel("second"))

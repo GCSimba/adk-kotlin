@@ -22,6 +22,7 @@ import com.google.adk.kt.SchemaUtils
 import com.google.adk.kt.ValueCoercer
 import com.google.adk.kt.agents.Context
 import com.google.adk.kt.agents.InvocationContext
+import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
@@ -44,10 +45,27 @@ internal class RecoveredNode {
   var branch: String? = null
   var transferToAgent: String? = null
   val interruptIds: MutableSet<String> = mutableSetOf()
+
+  /** The [interruptIds] the node raised itself, not a node under it. */
+  val directInterruptIds: MutableSet<String> = mutableSetOf()
   val resolvedResponses: MutableMap<String, Any?> = mutableMapOf()
 
   /** Whether the node's last direct event, since its last answer, shows it finished. */
   var finishedAfterResume: Boolean = false
+
+  /**
+   * Whether a user message in the node's scope, not just answers, followed its last direct event.
+   */
+  var userMessageSinceLastEvent: Boolean = false
+
+  /** The isolation scope of the node's last direct event. */
+  var isolationScope: String? = null
+
+  /** The isolation scopes of the node's descendants, such as the tasks it delegated to. */
+  val nestedScopes: MutableSet<String> = mutableSetOf()
+
+  /** Whether the user replied to one of those tasks after the node's last direct event. */
+  var replyToNestedTaskSinceLastEvent: Boolean = false
 
   /** Interrupt IDs raised by this node that have not yet been answered. */
   val unresolved: Set<String>
@@ -61,7 +79,10 @@ internal class RecoveredNode {
   }
 }
 
-/** Replay decision and recovered data for a previously visited node. */
+/**
+ * Replay decision and recovered data for a previously visited node. [interrupts] are the node's
+ * open interrupts: a replay waits on them, and a rerun that ends without a result keeps them.
+ */
 internal data class Interception(
   val shouldRun: Boolean,
   val output: Any? = null,
@@ -116,7 +137,7 @@ internal object ResumeScan {
     for (event in events) {
       if (event.invocationId != invocationId || event.partial) continue
       if (event.author == Role.USER) {
-        reconstruction.recordAnswers(event)
+        reconstruction.recordUserEvent(event)
       } else {
         reconstruction.recordNodeEvent(event)
       }
@@ -141,10 +162,14 @@ internal object ResumeScan {
     /** Response schema each `adk_request_input` carried, to validate its answer when it arrives. */
     private val schemas = mutableMapOf<String, Schema>()
 
+    /** Ids of every call in the invocation, so a response to one is not a new user message. */
+    private val callIds = mutableSetOf<String>()
+
     private val childPrefix = BranchPath.childNodePath(basePath, "")
 
     /** Attributes [event] to its owner and records what it says about that node. */
     fun recordNodeEvent(event: Event) {
+      event.functionCalls().mapNotNullTo(callIds) { it.id }
       val eventPath = event.nodeInfo?.path.orEmpty()
       val key = ownerKey(eventPath) ?: return
       val ownerPath = if (groupByDirectChild) BranchPath.childNodePath(basePath, key) else key
@@ -155,8 +180,13 @@ internal object ResumeScan {
 
       // Order matters: the finish check reads the error state and the interrupts raised here.
       recordOutcome(event, isDirect, ownerPath, node)
-      val raisedAny = recordRaisedInterrupts(event, node)
-      if (isDirect) {
+      val raisedAny = recordRaisedInterrupts(event, node, isDirect)
+      if (!isDirect) {
+        event.isolationScope?.let(node.nestedScopes::add)
+      } else {
+        node.userMessageSinceLastEvent = false
+        node.replyToNestedTaskSinceLastEvent = false
+        node.isolationScope = event.isolationScope
         node.finishedAfterResume =
           !raisedAny &&
             node.errorCode == null &&
@@ -166,9 +196,27 @@ internal object ResumeScan {
     }
 
     /**
+     * Records the answers in a user [event]. Anything else in it, such as text or a response to no
+     * recorded call, is a new user message for the nodes seen so far in the event's scope.
+     */
+    fun recordUserEvent(event: Event) {
+      recordAnswers(event)
+      val parts = event.content?.parts.orEmpty()
+      val onlyAnswers = parts.isNotEmpty() && parts.all { it.functionResponse?.id in callIds }
+      // A node's injected input or task answer carries its path; it is not the user writing.
+      if (onlyAnswers || !event.nodeInfo?.path.isNullOrEmpty()) return
+      val scope = event.isolationScope
+      for (node in recovered.values) {
+        // A single-turn helper shares its caller's scope, so a message there is not for a task.
+        if (node.isolationScope == scope) node.userMessageSinceLastEvent = true
+        else if (scope in node.nestedScopes) node.replyToNestedTaskSinceLastEvent = true
+      }
+    }
+
+    /**
      * Resolves the interrupts a user's function responses answer.
      *
-     * User events carry no `nodeInfo`, so every user `FunctionResponse` in the invocation reaches
+     * User events the runner stores carry no `nodeInfo`, so every user `FunctionResponse` reaches
      * here. When `interruptOwner[id]` is null, the response either belongs to a node outside
      * [basePath] or answers an inner prompt on a tool sub-branch named after an outer call ID (e.g.
      * `wf@1.task@ask_1`), in which case [interruptsMatchingBranch] attributes the answer to
@@ -255,11 +303,16 @@ internal object ResumeScan {
      * `adk_request_input` calls along with their `response_schema`) and returns whether any were
      * raised.
      */
-    private fun recordRaisedInterrupts(event: Event, node: RecoveredNode): Boolean {
+    private fun recordRaisedInterrupts(
+      event: Event,
+      node: RecoveredNode,
+      isDirect: Boolean,
+    ): Boolean {
       val requests = event.functionCalls().filter { it.name == RequestInput.FUNCTION_CALL_NAME }
       val raised = event.longRunningToolIds + requests.mapNotNull { it.id }
       for (id in raised) {
         node.interruptIds.add(id)
+        if (isDirect) node.directInterruptIds.add(id)
         interruptOwner[id] = node
       }
       for (request in requests) {
@@ -272,9 +325,10 @@ internal object ResumeScan {
 
   /**
    * Determines whether [node] should run or replay from [recovered]. With no recorded output or
-   * route, a node [cancelledMidRun] in this turn reruns, a [Node.rerunOnResume] node reruns unless
-   * it already finished since its last answer, and otherwise a [dynamic] node reruns while a static
-   * one does not.
+   * route, a node [cancelledMidRun] in this turn reruns, and a [Node.rerunOnResume] or
+   * [Node.waitForOutput] node reruns until it finishes its turn, the latter again after a new user
+   * message or a reply to a task it delegated. Otherwise a [dynamic] node reruns while a static one
+   * does not.
    */
   fun intercept(
     node: Node,
@@ -292,16 +346,25 @@ internal object ResumeScan {
     val unresolved = recovered.unresolved
 
     if (unresolved.isNotEmpty()) {
-      return if (node.rerunOnResume && resolved.isNotEmpty()) {
-        Interception(shouldRun = true, resumeInputs = resolved, transferToAgent = transfer)
-      } else {
-        Interception(
-          shouldRun = false,
-          branch = branch,
-          interrupts = unresolved,
-          transferToAgent = transfer,
-        )
+      // A reply to a task the node delegated reruns the node, so the task gets the reply.
+      val progressed = resolved.isNotEmpty() || recovered.replyToNestedTaskSinceLastEvent
+      if (node.rerunOnResume && progressed) {
+        // Follow a recorded handoff so its target gets the new input, unless the node still waits.
+        if (transfer == null) {
+          // An agent can't go past an open call; another node may go on without it, as in Python.
+          val open = if (node is LlmAgent) unresolved else emptySet()
+          return Interception(shouldRun = true, interrupts = open, resumeInputs = resolved)
+        }
+        if (unresolved.none { it in recovered.directInterruptIds }) {
+          return Interception(shouldRun = false, branch = branch, transferToAgent = transfer)
+        }
       }
+      return Interception(
+        shouldRun = false,
+        branch = branch,
+        interrupts = unresolved,
+        transferToAgent = transfer,
+      )
     }
 
     if (recovered.errorCode != null) {
@@ -332,10 +395,11 @@ internal object ResumeScan {
       )
     }
 
-    // A node that reran and finished without output stays done, so side effects do not repeat.
+    // A finished node stays done, unless the user writes to it or to a task it delegated.
+    val repliedTo = recovered.userMessageSinceLastEvent || recovered.replyToNestedTaskSinceLastEvent
     val shouldRun =
       when {
-        node.waitForOutput -> true
+        node.waitForOutput -> !recovered.finishedAfterResume || repliedTo
         node.rerunOnResume -> !recovered.finishedAfterResume
         else -> dynamic
       }

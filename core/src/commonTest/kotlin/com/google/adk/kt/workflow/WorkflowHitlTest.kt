@@ -2993,31 +2993,51 @@ class WorkflowHitlTest {
   }
 
   @Test
-  fun intercept_finishedRerunNodeThatWaitsForOutput_stillReruns() {
+  fun intercept_finishedNodeThatWaitsForOutput_rerunsOnlyAfterAUserMessage() {
     // Arrange
     val node =
       object : Node {
         override val name = "n"
-        override val rerunOnResume = true
         override val waitForOutput = true
 
         override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {}
       }
-    val answered =
+    val finished = RecoveredNode().apply { finishedAfterResume = true }
+    val messagedAfterFinishing =
       RecoveredNode().apply {
-        interruptIds += "a"
-        resolvedResponses["a"] = 1L
         finishedAfterResume = true
+        userMessageSinceLastEvent = true
       }
-    val unasked = RecoveredNode().apply { finishedAfterResume = true }
 
     // Act
-    val afterAnswer = ResumeScan.intercept(node, answered)
-    val withoutAsking = ResumeScan.intercept(node, unasked)
+    val withoutMessage = ResumeScan.intercept(node, finished)
+    val afterMessage = ResumeScan.intercept(node, messagedAfterFinishing)
+
+    // Assert: unlike Python, a finished turn is not run again until the user writes.
+    assertFalse(withoutMessage.shouldRun)
+    assertTrue(afterMessage.shouldRun)
+  }
+
+  @Test
+  fun scan_userTextAfterANodeFinished_marksAUserMessage() {
+    // Arrange
+    val events =
+      listOf(
+        Event(
+          author = "chat",
+          invocationId = "inv",
+          content = Content.fromText(Role.MODEL, "which one?"),
+          nodeInfo = NodeInfo(path = "wf@1/chat@1"),
+        ),
+        Event(author = Role.USER, invocationId = "inv", content = Content.fromText(Role.USER, "b")),
+      )
+
+    // Act
+    val recovered = ResumeScan.scan(events, "wf@1", "inv").getValue("chat@1")
 
     // Assert
-    assertTrue(afterAnswer.shouldRun)
-    assertTrue(withoutAsking.shouldRun)
+    assertTrue(recovered.finishedAfterResume)
+    assertTrue(recovered.userMessageSinceLastEvent)
   }
 
   @Test
@@ -3402,10 +3422,11 @@ class WorkflowHitlTest {
     val rerunWithoutProgress = ResumeScan.intercept(rerunNode, noProgress)
     val staticWithProgress = ResumeScan.intercept(staticNode, partialProgress)
 
-    // Assert: only a `rerunOnResume` node that has at least one resolved answer runs again; the
-    // others stay waiting on the unresolved interrupt ids.
+    // Assert: only a `rerunOnResume` node that has at least one resolved answer runs again, free to
+    // go on without the rest as in Python; the others stay waiting on the unresolved interrupt ids.
     assertTrue(rerunWithProgress.shouldRun)
     assertEquals(mapOf<String, Any?>("a" to 1L), rerunWithProgress.resumeInputs)
+    assertEquals(emptySet(), rerunWithProgress.interrupts)
     assertFalse(rerunWithoutProgress.shouldRun)
     assertEquals(setOf("a", "b"), rerunWithoutProgress.interrupts)
     assertFalse(staticWithProgress.shouldRun)

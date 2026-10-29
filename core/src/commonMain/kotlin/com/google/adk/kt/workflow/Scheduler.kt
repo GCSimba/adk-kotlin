@@ -201,6 +201,7 @@ internal class Scheduler(
           overrideBranch = trigger.branch,
           overrideIsolationScope = taskScopeFor(nodeName, runId),
           resumeInputs = interception.resumeInputs,
+          openInterrupts = interception.interrupts,
           firstHop = firstHop,
         )
       }
