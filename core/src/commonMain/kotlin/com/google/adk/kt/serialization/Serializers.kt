@@ -26,6 +26,8 @@ import kotlin.math.roundToLong
 import kotlin.time.Duration
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.descriptors.PrimitiveKind
 import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
 import kotlinx.serialization.descriptors.SerialDescriptor
@@ -146,6 +148,23 @@ fun jsonElementToAny(element: JsonElement): Any? =
       }
     is JsonArray -> element.map { jsonElementToAny(it) }
   }
+
+/**
+ * Serializes a string set as a sorted list, so equal sets serialize identically whatever order
+ * their elements were added in.
+ */
+internal object SortedStringSetSerializer : KSerializer<Set<String>> {
+  private val delegate = ListSerializer(String.serializer())
+
+  override val descriptor: SerialDescriptor = delegate.descriptor
+
+  override fun serialize(encoder: Encoder, value: Set<String>) {
+    encoder.encodeSerializableValue(delegate, value.sorted())
+  }
+
+  override fun deserialize(decoder: Decoder): Set<String> =
+    decoder.decodeSerializableValue(delegate).toSet()
+}
 
 /**
  * Writes a [ByteArray] as base64, and reads either base64 or the JSON number array this library

@@ -20,6 +20,7 @@ import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.ids.Uuid
 import com.google.adk.kt.models.CacheMetadata
 import com.google.adk.kt.serialization.LenientEpochMillisSerializer
+import com.google.adk.kt.serialization.SortedStringSetSerializer
 import com.google.adk.kt.tools.BaseTool
 import com.google.adk.kt.types.CitationMetadata
 import com.google.adk.kt.types.Content
@@ -104,7 +105,9 @@ constructor(
   @EncodeDefault(EncodeDefault.Mode.ALWAYS) val author: String = "",
   val content: Content? = null,
   val actions: EventActions = EventActions(),
-  @JsonNames("long_running_tool_ids") val longRunningToolIds: Set<String> = emptySet(),
+  @JsonNames("long_running_tool_ids")
+  @Serializable(with = SortedStringSetSerializer::class)
+  val longRunningToolIds: Set<String> = emptySet(),
   val partial: Boolean = false,
   @JsonNames("turn_complete") val turnComplete: Boolean = false,
   @JsonNames("error_code") val errorCode: String? = null,

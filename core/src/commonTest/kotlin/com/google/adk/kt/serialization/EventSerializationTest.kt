@@ -54,6 +54,7 @@ import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Test
 
 /** Round-trip tests for the kotlinx.serialization wiring of the [Event] graph. */
@@ -383,6 +384,28 @@ class EventSerializationTest {
       adkJson.decodeFromString(Part.serializer(), adkJson.encodeToString(Part.serializer(), part))
 
     assertEquals(part, decoded)
+  }
+
+  @Test
+  fun longRunningToolIds_encodedToJson_isSortedList() {
+    val event = Event(author = "agent", longRunningToolIds = linkedSetOf("b", "a", "c"))
+
+    val encoded = adkJson.encodeToJsonElement(Event.serializer(), event) as JsonObject
+
+    assertEquals(
+      JsonArray(listOf("a", "b", "c").map(::JsonPrimitive)),
+      encoded["longRunningToolIds"],
+    )
+  }
+
+  @Test
+  fun longRunningToolIds_unsortedJson_decodesToTheSet() {
+    // Older events and other writers may store the ids unsorted.
+    val json = """{"id":"e1","author":"agent","longRunningToolIds":["b","a"]}"""
+
+    val event = adkJson.decodeFromString(Event.serializer(), json)
+
+    assertEquals(setOf("a", "b"), event.longRunningToolIds)
   }
 
   @Test
