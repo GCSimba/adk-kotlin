@@ -23,6 +23,7 @@ import com.google.adk.kt.retry.exponentialBackoffDelay
 import kotlin.jvm.JvmStatic
 import kotlin.math.max
 import kotlin.random.Random
+import kotlin.reflect.KClass
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -37,9 +38,13 @@ import kotlin.time.Duration.Companion.milliseconds
  *   jitter)`. Zero removes randomness.
  * @property exceptions Reported type names to retry on, matched exactly with no subclass match. The
  *   reported name is the failure's own simple name, or for a [NodeExecutionException] the wrapped
- *   failure's type name -- so list e.g. "RuntimeError", not "NodeExecutionException". Null retries
- *   any failure and an empty list none; a [WorkflowConfigurationException] is never retried, even
- *   when listed.
+ *   failure's type name -- so list e.g. "RuntimeError", not "NodeExecutionException". A failure is
+ *   retried when it matches this list or [exceptionClasses], and any failure is retried when both
+ *   are null; a [WorkflowConfigurationException] is never retried, even when listed.
+ * @property exceptionClasses Failure types to retry on, each also matching its subclasses. A
+ *   failure is retried when it matches this list or [exceptions], and any failure is retried when
+ *   both are null. A [WorkflowConfigurationException] is never retried, even when its class is
+ *   listed.
  */
 @ExperimentalWorkflowApi
 data class RetryConfig(
@@ -49,6 +54,7 @@ data class RetryConfig(
   val backoffFactor: Double = DEFAULT_BACKOFF_FACTOR,
   val jitter: Double = DEFAULT_JITTER,
   val exceptions: List<String>? = null,
+  val exceptionClasses: List<KClass<out Exception>>? = null,
 ) {
 
   init {
@@ -67,8 +73,9 @@ data class RetryConfig(
    */
   internal fun shouldRetry(error: Throwable, attemptCount: Int): Boolean {
     if (attemptCount >= maxAttempts || error is WorkflowConfigurationException) return false
-    val retryable = exceptions ?: return true
-    return errorTypeName(error) in retryable
+    if (exceptions == null && exceptionClasses == null) return true
+    return errorTypeName(error) in exceptions.orEmpty() ||
+      exceptionClasses.orEmpty().any { it.isInstance(error) }
   }
 
   /** Returns how long to wait after the failed [attemptCount] before trying again. */
@@ -102,6 +109,7 @@ data class RetryConfig(
       .backoffFactor(backoffFactor)
       .jitter(jitter)
       .exceptions(exceptions)
+      .exceptionClasses(exceptionClasses)
 
   /**
    * Fluent builder for [RetryConfig], provided primarily for Java callers. Any property left unset
@@ -116,6 +124,7 @@ data class RetryConfig(
     private var backoffFactor: Double = DEFAULT_BACKOFF_FACTOR
     private var jitter: Double = DEFAULT_JITTER
     private var exceptions: List<String>? = null
+    private var exceptionClasses: List<KClass<out Exception>>? = null
 
     fun maxAttempts(maxAttempts: Int): Builder = apply { this.maxAttempts = maxAttempts }
 
@@ -140,7 +149,31 @@ data class RetryConfig(
 
     fun jitter(jitter: Double): Builder = apply { this.jitter = jitter }
 
+    /**
+     * Sets [RetryConfig.exceptions], the type names of failures to retry on, or unsets it if null.
+     * Leaves [RetryConfig.exceptionClasses] unchanged.
+     */
     fun exceptions(exceptions: List<String>?): Builder = apply { this.exceptions = exceptions }
+
+    /** Sets [RetryConfig.exceptions] from the given names, like the list overload. */
+    fun exceptions(exception: String, vararg moreExceptions: String): Builder =
+      exceptions(listOf(exception, *moreExceptions))
+
+    /**
+     * Sets [RetryConfig.exceptionClasses], the types of failures to retry on, or unsets it if null.
+     * Leaves [RetryConfig.exceptions] unchanged. Java callers convert each class with
+     * `JvmClassMappingKt.getKotlinClass`.
+     */
+    fun exceptionClasses(exceptionClasses: List<KClass<out Exception>>?): Builder = apply {
+      // Java callers can pass null elements, which would otherwise throw only when a node fails.
+      this.exceptionClasses = exceptionClasses?.requireNoNulls()
+    }
+
+    /** Sets [RetryConfig.exceptionClasses] from the given types, like the list overload. */
+    fun exceptionClasses(
+      exceptionClass: KClass<out Exception>,
+      vararg moreExceptionClasses: KClass<out Exception>,
+    ): Builder = exceptionClasses(listOf(exceptionClass, *moreExceptionClasses))
 
     fun build(): RetryConfig =
       RetryConfig(
@@ -150,6 +183,7 @@ data class RetryConfig(
         backoffFactor = backoffFactor,
         jitter = jitter,
         exceptions = exceptions,
+        exceptionClasses = exceptionClasses,
       )
   }
 

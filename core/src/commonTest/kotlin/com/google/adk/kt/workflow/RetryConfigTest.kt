@@ -21,6 +21,7 @@ package com.google.adk.kt.workflow
 import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import kotlin.random.Random
+import kotlin.reflect.KClass
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -49,6 +50,42 @@ class RetryConfigTest {
     assertFalse(
       RetryConfig(exceptions = listOf("WorkflowConfigurationException"))
         .shouldRetry(error, attemptCount = 1)
+    )
+    assertFalse(
+      RetryConfig(exceptionClasses = listOf(WorkflowConfigurationException::class))
+        .shouldRetry(error, attemptCount = 1)
+    )
+  }
+
+  @Test
+  fun exceptionClassesMatchListedClassesAndTheirSubclasses() {
+    val config = RetryConfig(exceptionClasses = listOf(NodeExecutionException::class))
+
+    assertTrue(config.shouldRetry(NodeExecutionException("RuntimeError", "boom"), attemptCount = 1))
+    assertTrue(config.shouldRetry(NodeTimeoutException("node", 1.seconds), attemptCount = 1))
+    assertFalse(config.shouldRetry(RuntimeException("boom"), attemptCount = 1))
+    assertFalse(config.shouldRetry(IllegalStateException("boom"), attemptCount = 1))
+  }
+
+  @Test
+  fun anEmptyExceptionClassesListRetriesNothing() {
+    val config = RetryConfig(exceptionClasses = emptyList())
+
+    assertFalse(config.shouldRetry(IllegalStateException("boom"), attemptCount = 1))
+  }
+
+  @Test
+  fun aFailureMatchingEitherNamesOrClassesIsRetried() {
+    val config =
+      RetryConfig(
+        exceptions = listOf("ValueError"),
+        exceptionClasses = listOf(IllegalStateException::class),
+      )
+
+    assertTrue(config.shouldRetry(NodeExecutionException("ValueError", "boom"), attemptCount = 1))
+    assertTrue(config.shouldRetry(IllegalStateException("boom"), attemptCount = 1))
+    assertFalse(
+      config.shouldRetry(NodeExecutionException("RuntimeError", "boom"), attemptCount = 1)
     )
   }
 
@@ -80,6 +117,7 @@ class RetryConfigTest {
         backoffFactor = 2.0,
         jitter = 1.0,
         exceptions = null,
+        exceptionClasses = null,
       ),
       RetryConfig(),
     )
@@ -174,6 +212,7 @@ class RetryConfigTest {
         backoffFactor = 1.5,
         jitter = 0.25,
         exceptions = listOf("RuntimeError"),
+        exceptionClasses = listOf(IllegalStateException::class),
       )
 
     assertEquals(config.copy(), config.toBuilder().build())
@@ -191,6 +230,48 @@ class RetryConfigTest {
     assertEquals(2_000L, config.initialDelayMillis())
     assertEquals(30_000L, config.maxDelayMillis())
     assertEquals(RetryConfig(), RetryConfig.builder().build())
+  }
+
+  @Test
+  fun builder_setsNamesAndClassesFromListsOrVarargs() {
+    val fromLists =
+      RetryConfig.builder()
+        .exceptions(listOf("ValueError", "KeyError"))
+        .exceptionClasses(listOf(IllegalStateException::class, IllegalArgumentException::class))
+        .build()
+    val fromVarargs =
+      RetryConfig.builder()
+        .exceptions("ValueError", "KeyError")
+        .exceptionClasses(IllegalStateException::class, IllegalArgumentException::class)
+        .build()
+
+    val expected =
+      RetryConfig(
+        exceptions = listOf("ValueError", "KeyError"),
+        exceptionClasses = listOf(IllegalStateException::class, IllegalArgumentException::class),
+      )
+    assertEquals(expected, fromLists)
+    assertEquals(expected, fromVarargs)
+  }
+
+  @Test
+  fun builder_withNull_unsetsBothLists() {
+    val config =
+      RetryConfig(
+        exceptions = listOf("ValueError"),
+        exceptionClasses = listOf(IllegalStateException::class),
+      )
+
+    assertEquals(RetryConfig(), config.toBuilder().exceptions(null).exceptionClasses(null).build())
+  }
+
+  @Test
+  fun builder_exceptionClasses_rejectsANullElement() {
+    // Java callers can put null in the list despite its non-null element type.
+    @Suppress("UNCHECKED_CAST")
+    val withNull = listOf(IllegalStateException::class, null) as List<KClass<out Exception>>
+
+    assertFailsWith<IllegalArgumentException> { RetryConfig.builder().exceptionClasses(withNull) }
   }
 }
 

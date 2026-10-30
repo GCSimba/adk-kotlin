@@ -22,6 +22,7 @@ import com.google.adk.kt.agents.Context
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.testing.testInvocationContext
+import kotlin.reflect.KClass
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -40,12 +41,17 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 
 /** Retries with no delay, so a test never waits on backoff. */
-private fun instantRetry(maxAttempts: Int, exceptions: List<String>? = null) =
+private fun instantRetry(
+  maxAttempts: Int,
+  exceptions: List<String>? = null,
+  exceptionClasses: List<KClass<out Exception>>? = null,
+) =
   RetryConfig(
     maxAttempts = maxAttempts,
     initialDelay = Duration.ZERO,
     jitter = 0.0,
     exceptions = exceptions,
+    exceptionClasses = exceptionClasses,
   )
 
 /** Raises on every attempt. */
@@ -204,6 +210,25 @@ class WorkflowFailureTest {
     // Assert
     assertContains(error.message!!, "boom")
     assertEquals(1, events.count { it.errorCode == "RuntimeError" })
+  }
+
+  @Test
+  fun retryAppliesToSubclassesOfTheListedExceptionClasses() {
+    // Arrange: the node raises a NodeExecutionException, which extends RuntimeException.
+    val flaky =
+      FailsUntilAttempt(
+        "flaky",
+        succeedFrom = 2,
+        retry = instantRetry(5, exceptionClasses = listOf(RuntimeException::class)),
+      )
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, flaky)))
+
+    // Act
+    val events = runWorkflow(workflow)
+
+    // Assert: the first attempt failed and was retried.
+    assertEquals(1, events.count { it.errorCode == "RuntimeError" })
+    assertEquals("B", events.last().output)
   }
 
   @Test
