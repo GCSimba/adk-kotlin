@@ -24,14 +24,20 @@ import com.google.adk.kt.testing.DummyAgent
 import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
+import com.google.adk.kt.types.Blob
 import com.google.adk.kt.types.CitationMetadata
+import com.google.adk.kt.types.CodeExecutionResult
 import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.ExecutableCode
+import com.google.adk.kt.types.FileData
 import com.google.adk.kt.types.FinishReason
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.GroundingMetadata
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
+import com.google.adk.kt.types.ToolCall
+import com.google.adk.kt.types.ToolResponse
 import com.google.adk.kt.types.UsageMetadata
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -192,7 +198,7 @@ class EventA2aSupportTest {
   fun remoteCallAsUserPart_textPart_returnsFormattedText() {
     val part = Part(text = "hello")
     val result = remoteCallAsUserPart("agent1", part)
-    assertEquals("[agent1] said: hello", result.text)
+    assertEquals("[agent1] said: hello", result?.text)
   }
 
   @Test
@@ -200,7 +206,7 @@ class EventA2aSupportTest {
     val fc = FunctionCall(name = "my-func", args = mapOf("arg1" to "val1"))
     val part = Part(functionCall = fc)
     val result = remoteCallAsUserPart("agent1", part)
-    assertEquals("[agent1] called tool my-func with parameters: {arg1=val1}", result.text)
+    assertEquals("[agent1] called tool my-func with parameters: {arg1=val1}", result?.text)
   }
 
   @Test
@@ -208,14 +214,40 @@ class EventA2aSupportTest {
     val fr = FunctionResponse(name = "my-func", response = mapOf("res1" to "val2"))
     val part = Part(functionResponse = fr)
     val result = remoteCallAsUserPart("agent1", part)
-    assertEquals("[agent1] my-func tool returned result: {res1=val2}", result.text)
+    assertEquals("[agent1] my-func tool returned result: {res1=val2}", result?.text)
   }
 
   @Test
-  fun remoteCallAsUserPart_emptyPart_returnsSamePart() {
-    val part = Part()
+  fun remoteCallAsUserPart_inlineDataPart_returnsSamePart() {
+    val part = Part(inlineData = Blob(mimeType = "image/png", data = byteArrayOf(1)))
     val result = remoteCallAsUserPart("agent1", part)
-    assertEquals(part, result)
+    assertSame(part, result)
+  }
+
+  @Test
+  fun remoteCallAsUserPart_fileDataPart_returnsSamePart() {
+    val part = Part(fileData = FileData(mimeType = "image/png", fileUri = "gs://bucket/image.png"))
+    val result = remoteCallAsUserPart("agent1", part)
+    assertSame(part, result)
+  }
+
+  @Test
+  fun remoteCallAsUserPart_executableCodePart_returnsSamePart() {
+    val part = Part(executableCode = ExecutableCode(code = "print(1)"))
+    val result = remoteCallAsUserPart("agent1", part)
+    assertSame(part, result)
+  }
+
+  @Test
+  fun remoteCallAsUserPart_codeExecutionResultPart_returnsSamePart() {
+    val part = Part(codeExecutionResult = CodeExecutionResult(output = "1"))
+    val result = remoteCallAsUserPart("agent1", part)
+    assertSame(part, result)
+  }
+
+  @Test
+  fun remoteCallAsUserPart_emptyPart_returnsNull() {
+    assertNull(remoteCallAsUserPart("agent1", Part()))
   }
 
   @Test
@@ -237,6 +269,24 @@ class EventA2aSupportTest {
     assertEquals(2, result.content?.parts?.size)
     assertEquals("For context:", result.content?.parts?.get(0)?.text)
     assertEquals("[agent1] said: hello", result.content?.parts?.get(1)?.text)
+  }
+
+  @Test
+  fun presentAsUserMessage_blankTextSignatureAndServerToolParts_relaysOnlyText() {
+    val parts =
+      listOf(
+        Part(text = "hello"),
+        Part(text = " "),
+        Part(thoughtSignature = byteArrayOf(1)),
+        Part(toolCall = ToolCall(id = "t1")),
+        Part(toolResponse = ToolResponse(id = "t1")),
+      )
+    val event = Event(author = "agent1", content = Content(role = Role.MODEL, parts = parts))
+    val result = presentAsUserMessage(event, "ctx-123", "inv-123")
+    assertEquals(
+      listOf("For context:", "[agent1] said: hello"),
+      result.content?.parts?.map { it.text },
+    )
   }
 
   @Test

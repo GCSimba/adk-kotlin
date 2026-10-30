@@ -151,7 +151,7 @@ internal fun Event.updateEventMetadata(
 /** Converts an event to a user message. */
 internal fun presentAsUserMessage(event: Event, contextId: String, invocationId: String): Event {
   val parts = event.content?.parts?.filter { it.thought != true } ?: emptyList()
-  val rephrasedParts = parts.map { remoteCallAsUserPart(event.author, it) }
+  val rephrasedParts = parts.mapNotNull { remoteCallAsUserPart(event.author, it) }
   val customMetadata = mapOf(ADK_METADATA_CONTEXT_ID to contextId)
 
   if (rephrasedParts.isEmpty()) {
@@ -168,10 +168,14 @@ internal fun presentAsUserMessage(event: Event, contextId: String, invocationId:
   )
 }
 
-/** Converts a part to a user message. */
-internal fun remoteCallAsUserPart(author: String, part: Part): Part {
+/**
+ * Rephrases [part] as text attributed to [author], returns a media or code part unchanged, and
+ * returns null for anything else, such as blank text, a server-side tool call, or a part carrying
+ * only a thought signature.
+ */
+internal fun remoteCallAsUserPart(author: String, part: Part): Part? {
   return when {
-    part.text != null -> {
+    !part.text.isNullOrBlank() -> {
       Part(text = "[$author] said: ${part.text}")
     }
     part.functionCall != null -> {
@@ -182,7 +186,11 @@ internal fun remoteCallAsUserPart(author: String, part: Part): Part {
       val fr = part.functionResponse
       Part(text = "[$author] ${fr?.name} tool returned result: ${fr?.response}")
     }
-    else -> part
+    part.inlineData != null ||
+      part.fileData != null ||
+      part.executableCode != null ||
+      part.codeExecutionResult != null -> part
+    else -> null
   }
 }
 

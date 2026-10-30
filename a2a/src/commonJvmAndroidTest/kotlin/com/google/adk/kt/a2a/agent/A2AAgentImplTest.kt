@@ -35,6 +35,8 @@ import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
+import com.google.adk.kt.types.ToolCall
+import com.google.adk.kt.types.ToolResponse
 import com.google.common.truth.Truth.assertThat
 import java.util.function.BiConsumer
 import java.util.function.Consumer
@@ -550,6 +552,47 @@ class A2AAgentImplTest {
     assertThat((message.parts[2] as TextPart).text).isEqualTo("[model] said: hi")
     assertThat((message.parts[3] as TextPart).text).isEqualTo("how are you?")
   }
+
+  @Test
+  fun runAsync_otherAgentToolAndSignatureParts_leavesThemOutOfRequest() =
+    runBlocking<Unit> {
+      val agent = createTestAgent()
+      val searchParts =
+        listOf(
+          Part(toolCall = ToolCall(id = "t1")),
+          Part(toolResponse = ToolResponse(id = "t1")),
+          Part(text = "found it"),
+          Part(thoughtSignature = byteArrayOf(1)),
+        )
+      val session =
+        Session(
+          key = SessionKey(appName = "demo", userId = "user", id = "session-2"),
+          events =
+            mutableListOf(
+              Event(
+                invocationId = "invocation-1",
+                author = "search_agent",
+                content = Content(role = Role.MODEL, parts = searchParts),
+              ),
+              Event(invocationId = "invocation-1", author = "user", content = userMessage("thanks")),
+            ),
+        )
+      mockStreamResponse(this) { consumer -> consumer.accept(createFinalEvent("ok"), agentCard) }
+
+      agent.runAsync(invocationContext.copy(session = session)).toList()
+
+      val messageCaptor = argumentCaptor<Message>()
+      verify(mockClient)
+        .sendMessage(
+          messageCaptor.capture(),
+          any<List<BiConsumer<ClientEvent, AgentCard>>>(),
+          any<Consumer<Throwable>>(),
+          isNull(),
+        )
+      assertThat(messageCaptor.firstValue.parts.map { (it as TextPart).text })
+        .containsExactly("For context:", "[search_agent] said: found it", "thanks")
+        .inOrder()
+    }
 
   @Test
   fun runAsync_constructsRequestWithFunctionResponse() = runTest {
