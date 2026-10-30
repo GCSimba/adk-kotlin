@@ -38,6 +38,8 @@ import com.google.adk.kt.types.Language
 import com.google.adk.kt.types.Outcome
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
+import com.google.adk.kt.types.ToolCall
+import com.google.adk.kt.types.ToolResponse
 import com.google.adk.kt.types.UsageMetadata
 import java.util.Base64
 import kotlin.enums.enumEntries
@@ -104,6 +106,8 @@ internal const val TYPE_FUNCTION_CALL = "function_call"
 internal const val TYPE_FUNCTION_RESPONSE = "function_response"
 internal const val TYPE_EXECUTABLE_CODE = "executable_code"
 internal const val TYPE_CODE_EXECUTION_RESULT = "code_execution_result"
+internal const val TYPE_TOOL_CALL = "tool_call"
+internal const val TYPE_TOOL_RESPONSE = "tool_response"
 internal const val DEFAULT_ERROR_MESSAGE = "A2A task failed"
 
 // Wrap a DataPart carried as an inline text blob; the other ADK ports use the same tags.
@@ -392,6 +396,8 @@ private fun DataPart.toAdk(): Part {
         codeExecutionResult =
           decodeData(CodeExecutionResult.serializer(), "outcome", Outcome.OUTCOME_UNSPECIFIED)
       )
+    TYPE_TOOL_CALL -> Part(toolCall = decodeData(ToolCall.serializer()))
+    TYPE_TOOL_RESPONSE -> Part(toolResponse = decodeData(ToolResponse.serializer()))
     else -> toInlineJsonPart()
   }
 }
@@ -400,6 +406,9 @@ private fun DataPart.toAdk(): Part {
 // objects, so any other value fails this cast.
 @Suppress("UNCHECKED_CAST")
 private fun DataPart.dataAsMap(): Map<String, Any?> = data as Map<String, Any?>
+
+private fun <T> DataPart.decodeData(serializer: KSerializer<T>): T =
+  adkJson.decodeFromJsonElement(serializer, anyToJsonElement(dataAsMap()))
 
 /**
  * Decodes this DataPart's data, matching the enum value under [enumKey] case-insensitively, as ADK
@@ -465,6 +474,12 @@ internal fun Part.toA2A(isPartial: Boolean = false): A2APart<*> {
   }
   executableCode?.let {
     return typedDataPart(TYPE_EXECUTABLE_CODE, ExecutableCode.serializer(), it)
+  }
+  toolCall?.let {
+    return typedDataPart(TYPE_TOOL_CALL, ToolCall.serializer(), it)
+  }
+  toolResponse?.let {
+    return typedDataPart(TYPE_TOOL_RESPONSE, ToolResponse.serializer(), it)
   }
   throw IllegalArgumentException("Unsupported ADK Part content")
 }

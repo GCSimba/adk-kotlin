@@ -35,6 +35,9 @@ import com.google.adk.kt.types.Language
 import com.google.adk.kt.types.Outcome
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
+import com.google.adk.kt.types.ToolCall
+import com.google.adk.kt.types.ToolResponse
+import com.google.adk.kt.types.ToolType
 import com.google.adk.kt.types.UsageMetadata
 import com.google.common.truth.Truth.assertThat
 import java.util.Base64
@@ -265,6 +268,77 @@ class A2aConvertersTest {
 
     assertThat(result.data).isEqualTo(mapOf("outcome" to "OUTCOME_OK", "output" to "hi"))
     assertThat(result.metadata).isEqualTo(mapOf(MetadataKeys.TYPE to TYPE_CODE_EXECUTION_RESULT))
+  }
+
+  @Test
+  fun toA2A_withToolCallPart_returnsDataPart() {
+    val part =
+      Part(
+        toolCall =
+          ToolCall(id = "t1", toolType = ToolType.URL_CONTEXT, args = mapOf("urls" to listOf("u")))
+      )
+
+    val result = part.toA2A() as DataPart
+
+    assertThat(result.data)
+      .isEqualTo(
+        mapOf("id" to "t1", "toolType" to "URL_CONTEXT", "args" to mapOf("urls" to listOf("u")))
+      )
+    assertThat(result.metadata).isEqualTo(mapOf(MetadataKeys.TYPE to TYPE_TOOL_CALL))
+  }
+
+  @Test
+  fun toAdk_withDataPartToolCall_returnsAdkToolCallPart() {
+    val data =
+      mapOf("id" to "t1", "toolType" to "URL_CONTEXT", "args" to mapOf("urls" to listOf("u")))
+    val dataPart = DataPart(data, mapOf(MetadataKeys.TYPE to TYPE_TOOL_CALL))
+
+    val result = dataPart.toAdk()
+
+    assertThat(result.toolCall)
+      .isEqualTo(
+        ToolCall(id = "t1", toolType = ToolType.URL_CONTEXT, args = mapOf("urls" to listOf("u")))
+      )
+  }
+
+  @Test
+  fun toAdk_withDataPartToolCallInSnakeCase_returnsAdkToolCallPart() {
+    val data = mapOf("id" to "t1", "tool_type" to "URL_CONTEXT")
+    val dataPart = DataPart(data, mapOf(MetadataKeys.TYPE to TYPE_TOOL_CALL))
+
+    val result = dataPart.toAdk()
+
+    assertThat(result.toolCall).isEqualTo(ToolCall(id = "t1", toolType = ToolType.URL_CONTEXT))
+  }
+
+  @Test
+  fun toA2A_withToolResponsePart_returnsDataPart() {
+    val part =
+      Part(
+        toolResponse =
+          ToolResponse(id = "t1", toolType = ToolType.URL_CONTEXT, response = mapOf("ok" to true))
+      )
+
+    val result = part.toA2A() as DataPart
+
+    assertThat(result.data)
+      .isEqualTo(
+        mapOf("id" to "t1", "toolType" to "URL_CONTEXT", "response" to mapOf("ok" to true))
+      )
+    assertThat(result.metadata).isEqualTo(mapOf(MetadataKeys.TYPE to TYPE_TOOL_RESPONSE))
+  }
+
+  @Test
+  fun toAdk_withDataPartToolResponse_returnsAdkToolResponsePart() {
+    val data = mapOf("id" to "t1", "toolType" to "URL_CONTEXT", "response" to mapOf("ok" to true))
+    val dataPart = DataPart(data, mapOf(MetadataKeys.TYPE to TYPE_TOOL_RESPONSE))
+
+    val result = dataPart.toAdk()
+
+    assertThat(result.toolResponse)
+      .isEqualTo(
+        ToolResponse(id = "t1", toolType = ToolType.URL_CONTEXT, response = mapOf("ok" to true))
+      )
   }
 
   @Test
