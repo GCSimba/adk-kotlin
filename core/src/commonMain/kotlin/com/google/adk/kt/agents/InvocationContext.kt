@@ -939,11 +939,6 @@ data class ContextFrameworkData(
    * child node there; `null` outside a node run.
    */
   @FrameworkInternalApi val nodeContext: Context? = null,
-  /**
-   * Whether the invocation's new message joined a paused task's invocation, so the message is the
-   * workflow's input rather than the invocation's first message.
-   */
-  @FrameworkInternalApi val continuesPausedTask: Boolean = false,
 ) {
   /**
    * The live run this invocation belongs to, set by [openLiveRun], or `null` on a turn-based

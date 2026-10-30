@@ -598,6 +598,56 @@ class InMemoryRunnerTest {
   }
 
   @Test
+  fun runAsync_messageWithoutARole_reachesTheModelAsAUserTurn() = runBlocking {
+    // Arrange: an app that is not resumable.
+    val requests = mutableListOf<LlmRequest>()
+    val runner = InMemoryRunner(agent = recordingAgent(requests))
+
+    // Act
+    val unused =
+      runner
+        .runAsync(
+          userId = "user1",
+          sessionId = "session1",
+          newMessage = Content(parts = listOf(Part(text = "hello"))),
+        )
+        .toList()
+
+    // Assert: the message is stored and sent as the user's turn.
+    val session = runner.sessionService.getSession(SessionKey(runner.appName, "user1", "session1"))
+    assertThat(session!!.events.first().content?.role).isEqualTo(Role.USER)
+    assertThat(
+        requests.single().contents.any { c ->
+          c.role == Role.USER && c.parts.any { it.text == "hello" }
+        }
+      )
+      .isTrue()
+  }
+
+  @Test
+  fun runAsync_messageWithAModelRole_reachesTheModelAsAUserTurn() = runBlocking {
+    // Arrange
+    val requests = mutableListOf<LlmRequest>()
+    val runner = InMemoryRunner(agent = recordingAgent(requests))
+
+    // Act
+    val unused =
+      runner
+        .runAsync(userId = "user1", sessionId = "session1", newMessage = modelMessage("hello"))
+        .toList()
+
+    // Assert: the message is stored and sent as the user's turn, not as the model's.
+    val session = runner.sessionService.getSession(SessionKey(runner.appName, "user1", "session1"))
+    assertThat(session!!.events.first().content?.role).isEqualTo(Role.USER)
+    assertThat(
+        requests.single().contents.any { c ->
+          c.role == Role.USER && c.parts.any { it.text == "hello" }
+        }
+      )
+      .isTrue()
+  }
+
+  @Test
   fun runAsync_withRunConfigCustomMetadata_appliesToAllEvents() = runTest {
     val runner =
       InMemoryRunner(
@@ -860,6 +910,17 @@ private fun llmAgent(
     tools = tools,
     toolsets = toolsets,
     subAgents = subAgents,
+  )
+
+/** An [LlmAgent] whose model records each request in [requests] and answers "hi". */
+private fun recordingAgent(requests: MutableList<LlmRequest>) =
+  LlmAgent(
+    name = "agent",
+    model =
+      DummyModel(name = "model") { request ->
+        requests += request
+        flowOf(LlmResponse(content = modelMessage("hi")))
+      },
   )
 
 /** A [BaseTool] that counts how many times it was closed. */

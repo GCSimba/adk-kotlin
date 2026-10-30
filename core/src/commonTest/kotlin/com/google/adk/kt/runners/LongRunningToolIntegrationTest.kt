@@ -1322,6 +1322,81 @@ class LongRunningToolIntegrationTest {
     )
   }
 
+  @Test
+  fun runAsync_resumable_answerWithoutARole_reachesTheModel() = runBlocking {
+    // Arrange: the agent pauses on a long-running call in a resumable app.
+    val callId = "lr_call_without_role"
+    val requests = mutableListOf<LlmRequest>()
+    val runner =
+      resumableRunner(singleCallThenAcknowledgeAgent(callId, Unit, captureRequest = requests::add))
+    val unused =
+      runner
+        .runAsync(userId = USER_ID, sessionId = SESSION_ID, newMessage = userMessage("start"))
+        .toList()
+    val answer = userFunctionResponse(TOOL_NAME_1, callId, mapOf("ok" to true)).copy(role = null)
+
+    // Act
+    val unusedEvents =
+      runner.runAsync(userId = USER_ID, sessionId = SESSION_ID, newMessage = answer).toList()
+
+    // Assert: the answer reaches the model as the user's turn.
+    assertEquals(2, requests.size)
+    assertTrue(
+      requests[1].contents.any { c ->
+        c.role == Role.USER && c.parts.any { it.functionResponse?.id == callId }
+      }
+    )
+  }
+
+  @Test
+  fun runAsync_answerWithoutARole_reachesTheModel() = runBlocking {
+    // Arrange: the agent pauses on a long-running call in an app that is not resumable.
+    val callId = "lr_call_without_role_not_resumable"
+    val requests = mutableListOf<LlmRequest>()
+    val runner =
+      InMemoryRunner(
+        agent = singleCallThenAcknowledgeAgent(callId, Unit, captureRequest = requests::add)
+      )
+    val unused =
+      runner
+        .runAsync(userId = USER_ID, sessionId = SESSION_ID, newMessage = userMessage("start"))
+        .toList()
+    val answer = userFunctionResponse(TOOL_NAME_1, callId, mapOf("ok" to true)).copy(role = null)
+
+    // Act
+    val unusedEvents =
+      runner.runAsync(userId = USER_ID, sessionId = SESSION_ID, newMessage = answer).toList()
+
+    // Assert: the answer reaches the model as the user's turn.
+    assertEquals(2, requests.size)
+    assertTrue(
+      requests[1].contents.any { c ->
+        c.role == Role.USER && c.parts.any { it.functionResponse?.id == callId }
+      }
+    )
+  }
+
+  @Test
+  fun runAsync_resumable_answerWithAnEmptyRole_isStoredAsAUserTurn() = runBlocking {
+    // Arrange
+    val callId = "lr_call_empty_role"
+    val runner = resumableRunner(singleCallThenAcknowledgeAgent(callId, Unit))
+    val unused =
+      runner
+        .runAsync(userId = USER_ID, sessionId = SESSION_ID, newMessage = userMessage("start"))
+        .toList()
+    val answer = userFunctionResponse(TOOL_NAME_1, callId, mapOf("ok" to true)).copy(role = "")
+
+    // Act
+    val unusedEvents =
+      runner.runAsync(userId = USER_ID, sessionId = SESSION_ID, newMessage = answer).toList()
+
+    // Assert
+    val session = runner.sessionService.getSession(SessionKey(runner.appName, USER_ID, SESSION_ID))
+    val stored = session!!.events.last { e -> e.functionResponses().any { it.id == callId } }
+    assertEquals(Role.USER, stored.content?.role)
+  }
+
   // -- Fixtures ----------------------------------------------------------------------------------
 
   /**
@@ -1362,6 +1437,15 @@ class LongRunningToolIntegrationTest {
         ),
     )
   }
+
+  private fun resumableRunner(agent: LlmAgent) =
+    InMemoryRunner(
+      App(
+        appName = "InMemoryRunner",
+        rootAgent = agent,
+        resumabilityConfig = ResumabilityConfig(isResumable = true),
+      )
+    )
 
   /**
    * Reduces this request's content history to a `(role, simplifiedContent)` list using

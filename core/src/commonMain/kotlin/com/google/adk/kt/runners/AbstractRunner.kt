@@ -583,7 +583,6 @@ abstract class AbstractRunner : Runner {
    * @param runConfig Configuration for the run.
    * @return A newly created [InvocationContext].
    */
-  @OptIn(FrameworkInternalApi::class)
   protected suspend fun createInvocationContext(
     session: Session,
     invocationId: String?,
@@ -594,19 +593,26 @@ abstract class AbstractRunner : Runner {
     val isResumable = resumabilityConfig.isResumable
     // A node-path root resolves function responses even when not resumable; other roots need it.
     val isNodeRoot = runsOnNodePath
-    if (isNodeRoot) requireNoTextWithFunctionResponses(newMessage)
+    // As in ADK Python, an inbound message is always a user turn, whatever role the caller set.
+    val message =
+      if (newMessage != null && newMessage.role != Role.USER) {
+        newMessage.copy(role = Role.USER)
+      } else {
+        newMessage
+      }
+    if (isNodeRoot) requireNoTextWithFunctionResponses(message)
     val resolvedInvocationId =
       if (isResumable || isNodeRoot) {
         // Without a caller-supplied id, a node root skips responses that carry no id.
         val requireFirstId = !isNodeRoot || invocationId != null
-        resolveInvocationId(session, newMessage, invocationId, requireFirstId)
+        resolveInvocationId(session, message, invocationId, requireFirstId)
       } else {
         invocationId
       }
     // A message that no function response ties to an invocation continues a paused task.
     val invocationIdToJoin =
       resolvedInvocationId
-        ?: if (isNodeRoot && newMessage != null && !newMessage.hasIdentifiedFunctionResponses()) {
+        ?: if (isNodeRoot && message != null && !message.hasIdentifiedFunctionResponses()) {
           pausedTaskEvent(session.events)?.invocationId
         } else {
           null
@@ -619,22 +625,18 @@ abstract class AbstractRunner : Runner {
     if (isResumable && resolvedInvocationId != null) {
       return setupContextForResumedInvocation(
         session,
-        newMessage,
+        message,
         resolvedInvocationId,
         runConfig,
         stateDelta,
       )
     }
 
-    requireNotNull(newMessage) {
+    requireNotNull(message) {
       if (isResumable) "No new message provided and no resumable invocation to resume"
       else "No new message provided and session is not resumable"
     }
-    val context =
-      setupContextForNewInvocation(session, invocationIdToJoin, newMessage, runConfig, stateDelta)
-    // A message that joins a paused task is the user's next turn there, not a replay of its first.
-    if (resolvedInvocationId != null || invocationIdToJoin == null) return context
-    return context.copy(frameworkData = context.frameworkData.copy(continuesPausedTask = true))
+    return setupContextForNewInvocation(session, invocationIdToJoin, message, runConfig, stateDelta)
   }
 
   /**
@@ -892,26 +894,22 @@ abstract class AbstractRunner : Runner {
       context.session.state.putAll(stateDelta)
     }
 
-    val currentContext =
-      context.copy(userContent = newMessage).let { updatedContext ->
-        updatedContext.copy(
-          userContent =
-            runOnUserMessageCallbacksPipeline(
-              pluginManager.onUserMessageCallbacks,
-              updatedContext,
-              newMessage,
-            )
-        )
-      }
+    val message =
+      runOnUserMessageCallbacksPipeline(
+        pluginManager.onUserMessageCallbacks,
+        context.copy(userContent = userContentFor(context, newMessage)),
+        newMessage,
+      )
+    val currentContext = context.copy(userContent = userContentFor(context, message))
 
     val event =
       Event(
           invocationId = currentContext.invocationId,
           author = Role.USER,
-          content = currentContext.userContent,
+          content = message,
           // A reply while a task is paused belongs to that task; an answer to a call, to the call.
           isolationScope =
-            if (currentContext.userContent?.hasIdentifiedFunctionResponses() == true) {
+            if (message.hasIdentifiedFunctionResponses()) {
               null
             } else {
               pausedTaskEvent(context.session.events)?.isolationScope
@@ -926,6 +924,17 @@ abstract class AbstractRunner : Runner {
 
     return currentContext
   }
+
+  /**
+   * Returns the user content for a run on [message]. As in ADK Python, a node root whose message
+   * answers calls by id, as on a resume, gets the message that started the invocation instead.
+   */
+  private fun userContentFor(context: InvocationContext, message: Content): Content =
+    if (runsOnNodePath && message.hasIdentifiedFunctionResponses()) {
+      findUserMessageForInvocation(context.session.events, context.invocationId) ?: message
+    } else {
+      message
+    }
 
   /**
    * Applies the provided [stateDelta] to the given [event].

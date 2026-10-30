@@ -28,6 +28,8 @@ import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.apps.App
+import com.google.adk.kt.callbacks.BeforeModelCallback
+import com.google.adk.kt.callbacks.CallbackChoice
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
 import com.google.adk.kt.events.ToolConfirmation
@@ -774,6 +776,22 @@ private class RoutesWithoutOutput(override val name: String) : Node {
   }
 }
 
+/** Records the user content of each run, and asks under [interruptId] until it has an answer. */
+private class RecordsUserContentThenAsks(
+  override val name: String,
+  private val interruptId: String,
+) : Node {
+  val userContents = mutableListOf<Content?>()
+
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    userContents += context.userContent
+    if (context.resumeInputs.isEmpty()) emit(RequestInput(interruptId = interruptId))
+    else emit("done")
+  }
+}
+
 /** Dispatches [child] under run ID `s`, with a short timeout and one retry. */
 private class DispatchWithTimeout(override val name: String, private val child: Node) : Node {
   override val rerunOnResume: Boolean = true
@@ -998,6 +1016,10 @@ private fun removalWorkflow(remove: Node, path: String = "/tmp/a"): Workflow {
   )
 }
 
+/** The text of every part of this request's contents. */
+private fun LlmRequest.text(): String =
+  contents.flatMap { it.parts }.mapNotNull { it.text }.joinToString("\n")
+
 /** What the workflow's `reply` node received in this turn. */
 private fun List<Event>.replyInput(): Any? =
   (single { it.nodeInfo?.path == "wf@1/reply@1" }.output as Map<*, *>)["received"]
@@ -1149,6 +1171,82 @@ class WorkflowHitlTest {
     // Assert
     val replyEvent = events.single { it.nodeInfo?.path == "wf@1/reply@1" }
     assertEquals(mapOf("received" to details), replyEvent.output)
+  }
+
+  @Test
+  fun resume_answeredRequestFollowedByAnLlmAgentNode_callsTheModel() {
+    // Arrange: a parentless `agent` runs as a single turn, so it gets `ask`'s answer as its input.
+    val requests = mutableListOf<LlmRequest>()
+    val agent =
+      LlmAgent(
+        name = "agent",
+        model =
+          DummyModel("model") { request ->
+            requests += request
+            flowOf(LlmResponse(content = modelMessage("thanks")))
+          },
+      )
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "need input"))
+    val session =
+      WorkflowSession(Workflow(name = "wf", edges = listOf(Edge(Start, ask), Edge(ask, agent))))
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("name" to "Ada")))
+
+    // Assert: the resumed turn calls the model once.
+    assertEquals(1, requests.size)
+    assertTrue(events.any { e -> e.content?.parts?.any { it.text == "thanks" } == true })
+  }
+
+  @Test
+  fun resume_answeredRequestFollowedByAnAgentWithoutHistory_sendsTheAnswerToTheModel() {
+    // Arrange: `agent` includes no history, so its request holds only the current turn.
+    val requests = mutableListOf<LlmRequest>()
+    val agent =
+      LlmAgent(
+        name = "agent",
+        model =
+          DummyModel("model") { request ->
+            requests += request
+            flowOf(LlmResponse(content = modelMessage("thanks")))
+          },
+        includeContents = LlmAgent.IncludeContents.NONE,
+      )
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "need input"))
+    val session =
+      WorkflowSession(Workflow(name = "wf", edges = listOf(Edge(Start, ask), Edge(ask, agent))))
+    session.advance(userMessage("go"))
+
+    // Act
+    session.advance(answer("ask_1", mapOf("name" to "Ada")))
+
+    // Assert: the answer reaches the model as the node input.
+    assertEquals(1, requests.size)
+    assertContains(requests.single().text(), "Ada")
+  }
+
+  @Test
+  fun resumableWorkflow_agentWithoutHistory_sendsTheUserMessageToTheModel() {
+    // Arrange: the workflow records content-less checkpoint events before `agent` runs.
+    val requests = mutableListOf<LlmRequest>()
+    val agent =
+      LlmAgent(
+        name = "agent",
+        model =
+          DummyModel("model") { request ->
+            requests += request
+            flowOf(LlmResponse(content = modelMessage("hi")))
+          },
+        includeContents = LlmAgent.IncludeContents.NONE,
+      )
+
+    // Act
+    WorkflowSession(Workflow(name = "wf", edges = listOf(Edge(Start, agent))))
+      .advance(userMessage("go"))
+
+    // Assert: a checkpoint does not start the turn, so the user's message reaches the model.
+    assertContains(requests.single().text(), "go")
   }
 
   @Test
@@ -3339,6 +3437,55 @@ class WorkflowHitlTest {
   }
 
   @Test
+  fun resume_nodeThatRunsAgain_seesTheOriginalUserMessageAsItsUserContent() {
+    // Arrange: `reader` asks on turn 1 and runs again with the answer on turn 2.
+    val reader = RecordsUserContentThenAsks("reader", "ask_r")
+    val session = WorkflowSession(Workflow(name = "wf", edges = listOf(Edge(Start, reader))))
+    session.advance(userMessage("go"))
+
+    // Act
+    session.advance(answer("ask_r", mapOf("v" to 1L)))
+
+    // Assert: both runs see the message that started the invocation, not the answer.
+    assertEquals(listOf("go", "go"), reader.userContents.map { it?.parts?.single()?.text })
+  }
+
+  @Test
+  fun resume_rootLlmAgentAnsweredById_seesTheOriginalUserMessageAsItsUserContent() {
+    // Arrange: the root agent calls a long-running tool on turn 1, and turn 2 answers the call.
+    val userContents = mutableListOf<Content?>()
+    var modelCalls = 0
+    val agent =
+      LlmAgent(
+        name = "agent",
+        model =
+          DummyModel("model") { _ ->
+            modelCalls += 1
+            flowOf(
+              if (modelCalls == 1) modelFunctionCallResponse("approve", id = "call_1")
+              else LlmResponse(content = modelMessage("approved"))
+            )
+          },
+        tools = listOf(DummyTool(name = "approve", isLongRunning = true, onRun = { _, _ -> Unit })),
+        beforeModelCallbacks =
+          listOf(
+            BeforeModelCallback { context, request ->
+              userContents += context.userContent
+              CallbackChoice.Continue(request)
+            }
+          ),
+      )
+    val session = WorkflowSession(agent)
+    session.advance(userMessage("go"))
+
+    // Act
+    session.advance(answer("call_1", mapOf("ok" to true), name = "approve"))
+
+    // Assert: both model calls see the message that started the invocation, not the answer.
+    assertEquals(listOf("go", "go"), userContents.map { it?.parts?.single()?.text })
+  }
+
+  @Test
   fun resume_standaloneRootNodeAnswered_completesWithTheAnswer() {
     // Arrange: the app's root is a node that asks, not a workflow.
     val session = WorkflowSession(Ask("ask", RequestInput(interruptId = "ask_1", message = "?")))
@@ -3405,6 +3552,41 @@ class WorkflowHitlTest {
     assertTrue(
       requests[1].contents.any { c -> c.parts.any { it.functionResponse?.id == "call_1" } },
       "expected the answer to call_1 in the second request",
+    )
+  }
+
+  @Test
+  fun resume_rolelessAnswer_reachesTheModel() {
+    // Arrange: the model calls a long-running tool on turn 1, which pauses the workflow.
+    val requests = mutableListOf<LlmRequest>()
+    val agent =
+      LlmAgent(
+        name = "agent",
+        model =
+          DummyModel("model") { request ->
+            requests += request
+            val modelCalls = requests.size
+            flowOf(
+              if (modelCalls == 1) modelFunctionCallResponse("approve", id = "call_1")
+              else LlmResponse(content = modelMessage("approved"))
+            )
+          },
+        tools = listOf(DummyTool(name = "approve", isLongRunning = true, onRun = { _, _ -> Unit })),
+      )
+    val session = WorkflowSession(Workflow(name = "wf", edges = listOf(Edge(Start, agent))))
+    session.advance(userMessage("go"))
+    val withRole = answer("call_1", mapOf("ok" to true), name = "approve")
+
+    // Act: the answer carries no role, as some clients send it.
+    session.advance(withRole.copy(role = null))
+
+    // Assert: the answer still reaches the model as the user's turn.
+    assertEquals(2, requests.size)
+    assertTrue(
+      requests[1].contents.any { c ->
+        c.role == Role.USER && c.parts.any { it.functionResponse?.id == "call_1" }
+      },
+      "expected the answer to call_1 in the second request as a user turn",
     )
   }
 

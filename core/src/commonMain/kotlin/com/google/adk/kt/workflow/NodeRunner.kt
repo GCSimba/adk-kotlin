@@ -29,7 +29,6 @@ import com.google.adk.kt.annotations.ExperimentalWorkflowApi
 import com.google.adk.kt.annotations.FrameworkInternalApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.events.EventActions
-import com.google.adk.kt.types.Content
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
@@ -506,7 +505,7 @@ private constructor(
           prefix = Context.buildNodePath(prefix.ifEmpty { null }, ancestor.name, id)
         }
       }
-      val input: Any? = if (rootNode is BaseAgent) null else rootInput(invocationContext)
+      val input: Any? = if (rootNode is BaseAgent) null else invocationContext.userContent
       val first = runTopLevelHop(rootNode, invocationContext, sink, input)
       val last =
         followHandoffs(rootNode, first, parent = null) { agent, parent ->
@@ -542,18 +541,6 @@ private constructor(
           .joinToString("/") { "${it.name}@1" }
       }
   }
-}
-
-/**
- * Returns the input for a root node: the user's message, or on resume, where the new message only
- * carries answers, the message that started the invocation. A message that joined a paused task
- * stays the input, as in ADK Python.
- */
-private fun rootInput(context: InvocationContext): Content? {
-  val message = context.userContent
-  val isAnswer = message != null && message.parts.all { it.functionResponse != null }
-  if (!isAnswer || context.frameworkData.continuesPausedTask) return message
-  return findUserMessageForInvocation(context.session.events, context.invocationId) ?: message
 }
 
 /**
