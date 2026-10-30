@@ -16,10 +16,13 @@
 
 package com.google.adk.kt.webserver
 
+import io.ktor.client.HttpClient
+import io.ktor.client.plugins.websocket.WebSockets as ClientWebSockets
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.setBody
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
+import io.ktor.server.testing.ApplicationTestBuilder
 
 /** Sends [body] as JSON, the shape every route test posts in. */
 internal fun HttpRequestBuilder.jsonBody(body: String) {
@@ -31,4 +34,9 @@ internal fun HttpRequestBuilder.jsonBody(body: String) {
 internal fun HttpRequestBuilder.textBody(body: String) {
   contentType(ContentType.Text.Plain)
   setBody(body)
+}
+
+/** A websocket client for the application under test. */
+internal fun ApplicationTestBuilder.liveClient(): HttpClient = createClient {
+  install(ClientWebSockets)
 }

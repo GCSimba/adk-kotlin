@@ -18,13 +18,33 @@
 
 package com.google.adk.kt.webserver.routes
 
+import com.google.adk.kt.agents.LiveRequest
 import com.google.adk.kt.agents.LiveRunConfig
 import com.google.adk.kt.agents.RunConfig
 import com.google.adk.kt.annotations.ExperimentalLiveApi
 import com.google.adk.kt.types.Modality
 import com.google.adk.kt.types.ProactivityConfig
 import com.google.adk.kt.types.SessionResumptionConfig
+import com.google.adk.kt.webserver.models.decodeLiveRequests
 import io.ktor.http.Parameters
+import io.ktor.server.application.Application
+import io.ktor.server.application.install
+import io.ktor.server.websocket.DefaultWebSocketServerSession
+import io.ktor.server.websocket.WebSockets
+import io.ktor.server.websocket.pingPeriod
+import io.ktor.server.websocket.timeout
+import io.ktor.websocket.CloseReason
+import io.ktor.websocket.Frame
+import io.ktor.websocket.FrameTooBigException
+import io.ktor.websocket.ProtocolViolationException
+import io.ktor.websocket.close
+import java.io.IOException
+import java.lang.invoke.MethodHandles
+import java.nio.charset.CharacterCodingException
+import kotlin.time.Duration.Companion.seconds
+import org.slf4j.LoggerFactory
+
+private val logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass())
 
 /** The modalities a live agent may answer in, matched by their exact enum names. */
 private val LIVE_MODALITIES = listOf(Modality.TEXT, Modality.AUDIO, Modality.VIDEO)
@@ -125,4 +145,73 @@ internal fun parseLiveRunParams(parameters: Parameters): LiveRunParamsResult {
         )
     )
   return LiveRunParamsResult.Success(LiveRunParams(appName, userId, sessionId, runConfig))
+}
+
+/**
+ * The largest message, in bytes, a live client may send. 16 MiB fits the audio chunks and camera
+ * images clients stream while bounding the memory one message takes; Ktor closes the socket with
+ * 1009 for anything bigger.
+ */
+internal const val MAX_LIVE_FRAME_BYTES = 16L * 1024 * 1024
+
+/** Installs `WebSockets` with the limits `/run_live` relies on. */
+internal fun Application.installLiveWebSockets() {
+  install(WebSockets) {
+    // A 20 s ping and timeout, so the socket of a client that stopped answering closes.
+    pingPeriod = 20.seconds
+    timeout = 20.seconds
+    maxFrameSize = MAX_LIVE_FRAME_BYTES
+  }
+}
+
+/**
+ * Decodes each text frame from the client and passes its requests to [onRequest] in order, up to
+ * and including a close request. Later text frames are ignored until the client disconnects, so the
+ * agent run can finish sending its events. A binary frame at any point, or a malformed text frame
+ * before the close, closes the websocket.
+ */
+internal suspend fun DefaultWebSocketServerSession.pumpLiveRequests(
+  onRequest: (LiveRequest) -> Unit
+) {
+  var closeRequested = false
+  try {
+    for (frame in incoming) {
+      if (frame is Frame.Binary) {
+        // Closing tells a client streaming raw audio why nothing it sends is used.
+        return close(
+          CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "Binary frames are not supported")
+        )
+      }
+      if (closeRequested || frame !is Frame.Text) continue
+
+      val requests =
+        try {
+          decodeLiveRequests(frame.data.decodeToString(throwOnInvalidSequence = true))
+        } catch (e: Exception) {
+          // Bytes that are not UTF-8, or a frame that does not decode, are the client's mistake.
+          if (e !is IllegalArgumentException && e !is CharacterCodingException) throw e
+          // The frame is the user's content, so only its shape is logged.
+          logger.warn(
+            "Rejecting a live request of {} bytes: {}",
+            frame.data.size,
+            e::class.simpleName,
+          )
+          return close(CloseReason(CloseReason.Codes.NOT_CONSISTENT, "Invalid live request"))
+        }
+
+      for (request in requests) {
+        onRequest(request)
+        if (request.close) closeRequested = true
+      }
+    }
+  } catch (e: FrameTooBigException) {
+    // Ktor has already closed the socket with 1009, so this is the client's end, not a run failure.
+    logger.warn("A live client sent a message over {} bytes", maxFrameSize)
+  } catch (e: ProtocolViolationException) {
+    // Ktor has already closed the socket with 1002.
+    logger.warn("A live client broke the websocket protocol")
+  } catch (e: IOException) {
+    // Ktor's ping timeout among them: the client is gone, as when it disconnects.
+    logger.info("A live client's connection failed: {}", e::class.simpleName)
+  }
 }
