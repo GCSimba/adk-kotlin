@@ -189,11 +189,11 @@ internal fun Message.toAdkEvent(invocationContext: InvocationContext): Event? {
 }
 
 /**
- * Converts an A2A message to an ADK event with thought marking, or returns null if none of its
- * parts converted.
+ * Converts an A2A message to an ADK event, marking every part as a thought when [isPending], or
+ * returns null if none of its parts converted.
  */
 internal fun Message.toAdkEvent(invocationContext: InvocationContext, isPending: Boolean): Event? {
-  val adkParts = parts.toAdk().map { it.copy(thought = isPending) }
+  val adkParts = parts.toAdk().map { if (isPending) it.copy(thought = true) else it }
   if (adkParts.isEmpty()) return null
   return remoteAgentEvent(invocationContext)
     .copy(content = Content(role = Role.MODEL, parts = adkParts))
@@ -252,7 +252,7 @@ internal fun Task.toAdkEvent(invocationContext: InvocationContext): Event {
 /** Converts an A2A Part to an ADK Part. */
 internal fun A2APart<*>.toAdk(): Part {
   return when (this) {
-    is TextPart -> Part(text = text)
+    is TextPart -> Part(text = text, thought = metadata?.get(MetadataKeys.THOUGHT) as? Boolean)
     is FilePart -> {
       val fileContent = file as FileContent
       when (fileContent) {
@@ -369,36 +369,52 @@ private fun TaskUpdateEvent.toAdkEvent(context: InvocationContext): Event? {
 // is received as a string or non-map type, matching Java behavior.
 private fun DataPart.toAdk(): Part {
   val type = metadata?.get(MetadataKeys.TYPE) as? String
-  return when (type) {
-    TYPE_FUNCTION_CALL -> {
-      val dataMap = dataAsMap()
-      val coercedData = dataMap.toMutableMap()
-      coercedData["args"] = coerceToMap(dataMap["args"])
-      val fc =
-        adkJson.decodeFromJsonElement(FunctionCall.serializer(), anyToJsonElement(coercedData))
-      Part(functionCall = fc)
+  val part =
+    when (type) {
+      TYPE_FUNCTION_CALL -> {
+        val dataMap = dataAsMap()
+        val coercedData = dataMap.toMutableMap()
+        coercedData["args"] = coerceToMap(dataMap["args"])
+        val fc =
+          adkJson.decodeFromJsonElement(FunctionCall.serializer(), anyToJsonElement(coercedData))
+        Part(functionCall = fc)
+      }
+      TYPE_FUNCTION_RESPONSE -> {
+        val dataMap = dataAsMap()
+        val coercedData = dataMap.toMutableMap()
+        coercedData["response"] = coerceToMap(dataMap["response"])
+        val fr =
+          adkJson.decodeFromJsonElement(
+            FunctionResponse.serializer(),
+            anyToJsonElement(coercedData),
+          )
+        Part(functionResponse = fr)
+      }
+      TYPE_EXECUTABLE_CODE ->
+        Part(
+          executableCode =
+            decodeData(ExecutableCode.serializer(), "language", Language.LANGUAGE_UNSPECIFIED)
+        )
+      TYPE_CODE_EXECUTION_RESULT ->
+        Part(
+          codeExecutionResult =
+            decodeData(CodeExecutionResult.serializer(), "outcome", Outcome.OUTCOME_UNSPECIFIED)
+        )
+      TYPE_TOOL_CALL -> Part(toolCall = decodeData(ToolCall.serializer()))
+      TYPE_TOOL_RESPONSE -> Part(toolResponse = decodeData(ToolResponse.serializer()))
+      else -> return toInlineJsonPart()
     }
-    TYPE_FUNCTION_RESPONSE -> {
-      val dataMap = dataAsMap()
-      val coercedData = dataMap.toMutableMap()
-      coercedData["response"] = coerceToMap(dataMap["response"])
-      val fr =
-        adkJson.decodeFromJsonElement(FunctionResponse.serializer(), anyToJsonElement(coercedData))
-      Part(functionResponse = fr)
-    }
-    TYPE_EXECUTABLE_CODE ->
-      Part(
-        executableCode =
-          decodeData(ExecutableCode.serializer(), "language", Language.LANGUAGE_UNSPECIFIED)
-      )
-    TYPE_CODE_EXECUTION_RESULT ->
-      Part(
-        codeExecutionResult =
-          decodeData(CodeExecutionResult.serializer(), "outcome", Outcome.OUTCOME_UNSPECIFIED)
-      )
-    TYPE_TOOL_CALL -> Part(toolCall = decodeData(ToolCall.serializer()))
-    TYPE_TOOL_RESPONSE -> Part(toolResponse = decodeData(ToolResponse.serializer()))
-    else -> toInlineJsonPart()
+  return part.copy(thoughtSignature = decodeThoughtSignature())
+}
+
+/** Decodes the thought signature this part's metadata carries in base64, if it is valid. */
+private fun DataPart.decodeThoughtSignature(): ByteArray? {
+  val encoded = metadata?.get(MetadataKeys.THOUGHT_SIGNATURE) as? String ?: return null
+  return try {
+    Base64.getDecoder().decode(encoded)
+  } catch (e: IllegalArgumentException) {
+    logger.warn("Ignoring a thought signature that is not valid base64")
+    null
   }
 }
 
@@ -452,7 +468,7 @@ internal fun Content.toA2aParts(isPartial: Boolean): List<A2APart<*>> {
 /** Converts an ADK Part to an A2A Part. */
 internal fun Part.toA2A(isPartial: Boolean = false): A2APart<*> {
   text?.let {
-    return TextPart(it)
+    return TextPart(it, thought?.let { thought -> mapOf(MetadataKeys.THOUGHT to thought) })
   }
   fileData?.let { fd ->
     return FilePart(FileWithUri(fd.mimeType ?: "application/octet-stream", "", fd.fileUri ?: ""))
@@ -517,8 +533,11 @@ internal fun InvocationContext.extractA2aParts(): List<A2APart<*>> {
   }
 }
 
-/** Carries an ADK part payload as a DataPart whose `adk_type` metadata names its [type]. */
-private fun <T> typedDataPart(
+/**
+ * Carries a payload of this part as a DataPart whose `adk_type` metadata names its [type], with the
+ * part's thought signature in base64.
+ */
+private fun <T> Part.typedDataPart(
   type: String,
   serializer: KSerializer<T>,
   value: T,
@@ -530,6 +549,9 @@ private fun <T> typedDataPart(
     buildMap<String, Any> {
       put(MetadataKeys.TYPE, type)
       if (isPartial) put(MetadataKeys.PARTIAL, true)
+      thoughtSignature?.let {
+        put(MetadataKeys.THOUGHT_SIGNATURE, Base64.getEncoder().encodeToString(it))
+      }
     }
   return DataPart(dataMap, metadata)
 }

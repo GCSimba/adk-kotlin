@@ -40,6 +40,7 @@ import com.google.adk.kt.types.ToolResponse
 import com.google.adk.kt.types.ToolType
 import com.google.adk.kt.types.UsageMetadata
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import java.util.Base64
 import kotlin.test.assertFailsWith
 import org.a2aproject.sdk.client.MessageEvent
@@ -88,6 +89,26 @@ class A2aConvertersTest {
     val part = Part(text = "Hello")
     val result = part.toA2A()
     assertThat((result as TextPart).text).isEqualTo("Hello")
+    assertThat(result.metadata).isNull()
+  }
+
+  @Test
+  fun toA2A_withThoughtTextPart_marksTextPartThought() {
+    val part = Part(text = "Hello", thought = true)
+
+    val result = part.toA2A() as TextPart
+
+    assertThat(result.text).isEqualTo("Hello")
+    assertThat(result.metadata).isEqualTo(mapOf(MetadataKeys.THOUGHT to true))
+  }
+
+  @Test
+  fun toAdk_withThoughtTextPart_returnsThoughtPart() {
+    val textPart = TextPart("Thinking...", mapOf(MetadataKeys.THOUGHT to true))
+
+    val result = textPart.toAdk()
+
+    assertThat(result).isEqualTo(Part(text = "Thinking...", thought = true))
   }
 
   @Test
@@ -166,6 +187,81 @@ class A2aConvertersTest {
 
     assertThat(result.metadata)
       .isEqualTo(mapOf(MetadataKeys.TYPE to TYPE_FUNCTION_CALL, MetadataKeys.PARTIAL to true))
+  }
+
+  @Test
+  fun toA2A_withFunctionCallThoughtSignature_putsSignatureInMetadata() {
+    val signature = "gemini3_signature_bytes".encodeToByteArray()
+    val part =
+      Part(
+        functionCall = FunctionCall(name = "my_tool", id = "fc_1", args = mapOf()),
+        thoughtSignature = signature,
+      )
+
+    val result = part.toA2A() as DataPart
+
+    assertThat(result.metadata)
+      .isEqualTo(
+        mapOf(
+          MetadataKeys.TYPE to TYPE_FUNCTION_CALL,
+          MetadataKeys.THOUGHT_SIGNATURE to Base64.getEncoder().encodeToString(signature),
+        )
+      )
+  }
+
+  @Test
+  fun toAdk_withTypedDataPartThoughtSignature_restoresSignature() {
+    val signature = "restored_signature".encodeToByteArray()
+    val dataByType =
+      mapOf(
+        TYPE_FUNCTION_CALL to mapOf("name" to "my_tool", "args" to mapOf<String, Any>()),
+        TYPE_FUNCTION_RESPONSE to mapOf("name" to "my_tool", "response" to mapOf<String, Any>()),
+        TYPE_EXECUTABLE_CODE to mapOf("code" to "print(1)"),
+        TYPE_CODE_EXECUTION_RESULT to mapOf("output" to "1"),
+        TYPE_TOOL_CALL to mapOf("id" to "t1"),
+        TYPE_TOOL_RESPONSE to mapOf("id" to "t1"),
+      )
+
+    for ((type, data) in dataByType) {
+      val metadata =
+        mapOf(
+          MetadataKeys.TYPE to type,
+          MetadataKeys.THOUGHT_SIGNATURE to Base64.getEncoder().encodeToString(signature),
+        )
+
+      val result = DataPart(data, metadata).toAdk()
+
+      assertWithMessage(type).that(result.thoughtSignature).isEqualTo(signature)
+    }
+  }
+
+  @Test
+  fun toAdk_withUntypedDataPartThoughtSignature_ignoresSignature() {
+    val signature = Base64.getEncoder().encodeToString("signature".encodeToByteArray())
+    val dataPart =
+      DataPart(mapOf("key" to "value"), mapOf(MetadataKeys.THOUGHT_SIGNATURE to signature))
+
+    val result = dataPart.toAdk()
+
+    assertThat(result.inlineData).isNotNull()
+    assertThat(result.thoughtSignature).isNull()
+  }
+
+  @Test
+  fun toAdk_withDataPartInvalidBase64ThoughtSignature_dropsOnlySignature() {
+    val dataPart =
+      DataPart(
+        mapOf("name" to "my_tool", "id" to "fc_1", "args" to mapOf<String, Any>()),
+        mapOf(
+          MetadataKeys.TYPE to TYPE_FUNCTION_CALL,
+          MetadataKeys.THOUGHT_SIGNATURE to "not_valid_base64!!!",
+        ),
+      )
+
+    val result = dataPart.toAdk()
+
+    assertThat(result)
+      .isEqualTo(Part(functionCall = FunctionCall(name = "my_tool", id = "fc_1", args = mapOf())))
   }
 
   @Test
@@ -824,6 +920,24 @@ class A2aConvertersTest {
     assertThat(result).isNotNull()
     assertThat(result!!.content?.parts?.get(0)?.text).isEqualTo("thought-1")
     assertThat(result.content?.parts?.get(0)?.thought).isEqualTo(true)
+  }
+
+  @Test
+  fun clientEventToEvent_withCompletedTaskUpdateEventThoughtPart_keepsThought() {
+    val statusMessage =
+      Message.builder()
+        .role(Message.Role.ROLE_AGENT)
+        .parts(
+          listOf(TextPart("reasoning", mapOf(MetadataKeys.THOUGHT to true)), TextPart("answer"))
+        )
+        .build()
+    val status = TaskStatus(TaskState.TASK_STATE_COMPLETED, statusMessage, null)
+    val task = Task.builder().id("task-1").contextId("context-1").status(status).build()
+    val event = TaskUpdateEvent(task, TaskStatusUpdateEvent("task-1", status, "context-1", null))
+
+    val result = event.toAdkEvent(invocationContext)
+
+    assertThat(result?.content?.parts?.map { it.thought }).containsExactly(true, null).inOrder()
   }
 
   @Test
