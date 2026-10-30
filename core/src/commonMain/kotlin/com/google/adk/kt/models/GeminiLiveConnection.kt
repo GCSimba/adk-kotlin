@@ -37,7 +37,6 @@ import com.google.genai.kotlin.types.LiveServerMessage as GenAiLiveServerMessage
 import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
-import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Duration
@@ -46,6 +45,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -146,8 +146,8 @@ internal class GeminiLiveConnection(
   private val session: LiveSessionHandle,
   private val modelVersion: String?,
   private val closeTimeout: Duration = CLOSE_SESSION_TIMEOUT,
-  // The collector's context; only its dispatcher is taken, so the pump keeps its own lifecycle.
-  pumpDispatcher: CoroutineContext = EmptyCoroutineContext,
+  // The collector's context; its Job is dropped so the pump keeps its own lifecycle.
+  pumpContext: CoroutineContext = EmptyCoroutineContext,
 ) : SingleCollectorLiveConnection() {
 
   /**
@@ -176,9 +176,7 @@ internal class GeminiLiveConnection(
 
   /** Scope for [pump], tied to this connection and so to the one session it wraps. */
   private val pumpScope =
-    CoroutineScope(
-      SupervisorJob() + (pumpDispatcher[ContinuationInterceptor] ?: Dispatchers.Default)
-    )
+    CoroutineScope(SupervisorJob() + Dispatchers.Default + pumpContext.minusKey(Job))
 
   /**
    * Reads the session into [frames] for the lifetime of the connection.

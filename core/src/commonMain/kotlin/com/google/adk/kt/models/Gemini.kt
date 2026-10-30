@@ -36,13 +36,12 @@ import com.google.genai.kotlin.GenAiApiException
 import com.google.genai.kotlin.types.HttpOptions
 import com.google.genai.kotlin.types.HttpRetryOptions
 import com.google.genai.kotlin.types.LiveConnectConfig as GenAiLiveConnectConfig
-import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.jvm.JvmOverloads
 import kotlin.jvm.JvmStatic
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
@@ -237,10 +236,10 @@ internal constructor(
         .carryingAgentConfig(request.config)
         .toGenaiSdk()
         .copy(httpOptions = requestHttpOptions)
-    val collector = currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext
-    val handle = openHandle(modelName, config, collector)
+    val callerContext = currentCoroutineContext().minusKey(Job)
+    val handle = openHandle(modelName, config, callerContext)
     val connection =
-      GeminiLiveConnection(handle, modelVersion = modelName, pumpDispatcher = collector)
+      GeminiLiveConnection(handle, modelVersion = modelName, pumpContext = callerContext)
     // Return only once the server confirms setup; a refused setup throws and closes the socket.
     connection.awaitSetup()
     return connection
@@ -253,11 +252,11 @@ internal constructor(
   private suspend fun openHandle(
     modelName: String,
     config: GenAiLiveConnectConfig,
-    collector: CoroutineContext,
+    callerContext: CoroutineContext,
   ): LiveSessionHandle {
     val opener = live
     @Suppress("UnsafeCoroutineCrossing") // Only locals the caller hands over cross the scope.
-    val opening = CoroutineScope(collector).async { opener.connect(modelName, config) }
+    val opening = CoroutineScope(callerContext).async { opener.connect(modelName, config) }
     return try {
       // A completed await() skips the cancel check, so check here and let the closer run.
       opening.await().also { currentCoroutineContext().ensureActive() }
@@ -269,7 +268,7 @@ internal constructor(
       // Closed once it opens; cancelling the open instead is what loses the socket.
       @Suppress("UnsafeCoroutineCrossing") // Same reason as above.
       val unusedCloser =
-        CoroutineScope(collector).launch {
+        CoroutineScope(callerContext).launch {
           runCatching { GeminiLiveConnection.closeOrDrop(opening.await()) }
         }
       throw e

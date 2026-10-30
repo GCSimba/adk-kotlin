@@ -25,12 +25,11 @@ import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.models.Model
 import com.google.adk.kt.models.liveConnectionsUnsupported
 import java.util.concurrent.CompletableFuture
-import kotlin.coroutines.ContinuationInterceptor
-import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -81,7 +80,7 @@ abstract class BasePublisherModel(final override val name: String) : Model {
 
   @OptIn(ExperimentalLiveApi::class)
   final override suspend fun connect(request: LlmRequest): LiveConnection {
-    val collector = currentCoroutineContext()[ContinuationInterceptor] ?: EmptyCoroutineContext
+    val callerContext = currentCoroutineContext().minusKey(Job)
     val future = connectAsync(request)
     val connection: LiveConnection? =
       try {
@@ -93,7 +92,7 @@ abstract class BasePublisherModel(final override val name: String) : Model {
         // No caller gets the connection now, so close it if it arrives.
         @Suppress("UnsafeCoroutineCrossing") // Only the Java future is shared with the closer.
         val unusedCloser =
-          CoroutineScope(collector).launch(start = CoroutineStart.UNDISPATCHED) {
+          CoroutineScope(callerContext).launch(start = CoroutineStart.UNDISPATCHED) {
             closeLateConnection(future)
           }
         throw e

@@ -39,7 +39,9 @@ import com.google.common.truth.Truth.assertThat
 import java.util.function.BiConsumer
 import java.util.function.Consumer
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
@@ -772,6 +774,30 @@ class A2AAgentImplTest {
 
     verify(mockClient, timeout(5000)).cancelTask(any())
     Unit
+  }
+
+  @Test
+  fun runAsync_nonTerminalTaskAbandoned_cancelsItInTheCallersContext() {
+    // Stands in for MDC: thread-local state a caller carries in its coroutine context.
+    val requestId = ThreadLocal<String?>()
+    runBlocking(requestId.asContextElement("caller")) {
+      val cancelledWith = CompletableDeferred<String?>()
+      whenever(mockClient.cancelTask(any())).thenAnswer {
+        cancelledWith.complete(requestId.get())
+        null
+      }
+      val agent = createTestAgent()
+      mockStreamResponse(this) { consumer ->
+        consumer.accept(
+          createStatusUpdateEvent(TaskState.TASK_STATE_WORKING, "working..."),
+          agentCard,
+        )
+      }
+
+      agent.runAsync(invocationContext).first()
+
+      assertThat(withTimeout(5.seconds) { cancelledWith.await() }).isEqualTo("caller")
+    }
   }
 
   @Test

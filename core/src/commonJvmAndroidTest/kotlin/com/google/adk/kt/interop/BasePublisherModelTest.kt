@@ -36,9 +36,11 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
@@ -70,6 +72,9 @@ class BasePublisherModelTest {
   ) : LiveConnection {
     var closeSessionCalls = 0
 
+    /** The coroutine name [closeSession] last ran with. */
+    var closedIn: String? = null
+
     /** Completes once [closeSession] returns or throws, even when the base gives up on it. */
     val closeFinished = CompletableDeferred<Unit>()
 
@@ -85,6 +90,7 @@ class BasePublisherModelTest {
       try {
         // Suspends first, so a close run from a cancelled caller's context throws before counting.
         yield()
+        closedIn = currentCoroutineContext()[CoroutineName]?.name
         closeSessionCalls++
         if (closeError != null) throw closeError
         closeGate?.await()
@@ -253,6 +259,23 @@ class BasePublisherModelTest {
       withTimeout(GUARD_TIMEOUT) { connection.closeFinished.await() }
       assertThat(pending.isCancelled).isFalse()
       assertThat(connection.closeSessionCalls).isEqualTo(1)
+    }
+
+  @Test
+  fun connect_callerCancelledBeforeFutureCompletes_closesTheLateConnectionInTheCallersContext():
+    Unit =
+    runBlocking(CoroutineName("caller")) {
+      val pending = CompletableFuture<LiveConnection>()
+      val connection = StubLiveConnection()
+      val connect =
+        async(start = CoroutineStart.UNDISPATCHED) { LiveModel(pending).connect(LlmRequest()) }
+
+      connect.cancel()
+      withTimeout(GUARD_TIMEOUT) { connect.join() }
+      assertThat(pending.complete(connection)).isTrue()
+      withTimeout(GUARD_TIMEOUT) { connection.closeFinished.await() }
+
+      assertThat(connection.closedIn).isEqualTo("caller")
     }
 
   @Test

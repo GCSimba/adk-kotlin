@@ -51,6 +51,7 @@ import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -62,6 +63,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
@@ -498,6 +500,38 @@ class GeminiLiveConnectTest {
       collector.shutdown()
     }
   }
+
+  @Test
+  fun connect_opensAndReadsTheSessionInTheCollectorsContext(): Unit =
+    runBlocking(CoroutineName("caller")) {
+      val openedIn = CompletableDeferred<String?>()
+      val readIn = CompletableDeferred<String?>()
+      val live =
+        object : Gemini.GeminiLive {
+          override suspend fun connect(
+            model: String,
+            config: GenAiLiveConnectConfig,
+          ): LiveSessionHandle {
+            openedIn.complete(currentCoroutineContext()[CoroutineName]?.name)
+            return object : LiveSessionHandle by ParkingHandle() {
+              override fun receive(): Flow<SdkLiveServerMessage> = flow {
+                readIn.complete(currentCoroutineContext()[CoroutineName]?.name)
+                emit(SETUP_COMPLETE)
+                awaitCancellation()
+              }
+            }
+          }
+        }
+
+      val connection = gemini().apply { this.live = live }.connect(requestWithAgentConfig())
+
+      try {
+        assertEquals("caller", openedIn.await())
+        assertEquals("caller", withTimeout(5.seconds) { readIn.await() })
+      } finally {
+        withContext(NonCancellable) { connection.closeSession() }
+      }
+    }
 
   @Test
   fun connect_callerCancelledWhileTheSocketOpens_closesTheSessionOnceItOpens(): Unit = runBlocking {

@@ -36,8 +36,10 @@ import com.google.adk.kt.logging.LoggerFactory
 import java.util.concurrent.atomic.AtomicReference
 import java.util.function.BiConsumer
 import java.util.function.Consumer
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -174,7 +176,7 @@ internal class A2AAgentImpl(
       processorJob.cancel()
       val abandonedTaskId = if (!isTaskTerminal.get()) activeTaskId.get() else null
       if (abandonedTaskId != null) {
-        cancelAndClose(a2aClient, abandonedTaskId)
+        cancelAndClose(a2aClient, abandonedTaskId, coroutineContext)
       } else {
         a2aClient.close()
       }
@@ -210,10 +212,15 @@ internal class A2AAgentImpl(
     )
   }
 
-  private fun cancelAndClose(a2aClient: Client, taskId: String) {
+  /**
+   * Cancels [taskId] and closes [a2aClient] on `Dispatchers.IO` without [callerContext]'s [Job], so
+   * both calls still run after the abandoned flow is cancelled. Keeps the rest of [callerContext],
+   * such as MDC, so logs carry the caller's context.
+   */
+  private fun cancelAndClose(a2aClient: Client, taskId: String, callerContext: CoroutineContext) {
     @Suppress("GlobalCoroutineDispatchers", "UnsafeCoroutineCrossing")
     val unusedJob =
-      CoroutineScope(Dispatchers.IO).launch {
+      CoroutineScope(callerContext.minusKey(Job) + Dispatchers.IO).launch {
         try {
           a2aClient.cancelTask(CancelTaskParams(taskId))
         } catch (e: Exception) {
