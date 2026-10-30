@@ -48,6 +48,7 @@ import com.google.adk.kt.workflow.ValueCodec
 import com.google.adk.kt.workflow.Workflow
 import com.google.adk.kt.workflow.followHandoffs
 import com.google.adk.kt.workflow.requireJsonForm
+import com.google.adk.kt.workflow.scheduledInvocationContext
 import com.google.adk.kt.workflow.schemaForm
 import com.google.adk.kt.workflow.validateInput
 import com.google.adk.kt.workflow.validateNodeName
@@ -915,7 +916,9 @@ open class Context(
         cancelledMidRun = isCancelledMidRun(childKey),
       )
     if (!interception.shouldRun) {
-      return ResumeScan.replayContext(this, node, id, useAsOutput, interception)
+      val scheduled =
+        scheduledInvocationContext(invocationContext, overrideBranch, useSubBranch, node.name, id)
+      return ResumeScan.replayContext(this, scheduled, node, id, useAsOutput, interception)
     }
     return runChild(
       node,

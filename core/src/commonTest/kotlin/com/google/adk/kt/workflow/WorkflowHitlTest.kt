@@ -41,6 +41,7 @@ import com.google.adk.kt.testing.DummyModel
 import com.google.adk.kt.testing.DummyTool
 import com.google.adk.kt.testing.modelFunctionCallResponse
 import com.google.adk.kt.testing.modelMessage
+import com.google.adk.kt.testing.testInvocationContext
 import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.types.Content
@@ -742,6 +743,37 @@ private class CallsTwice(override val name: String, private val child: Node) : N
   }
 }
 
+/** Delegates its output to [child] under run ID `c`, then dispatches [ask], counting its runs. */
+private class DelegateThenDispatch(
+  override val name: String,
+  private val child: Node,
+  private val ask: Node,
+) : Node {
+  var runs = 0
+    private set
+
+  override val rerunOnResume: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    context.runNode(child, runId = "c", useAsOutput = true)
+    context.runNode(ask, runId = "a")
+  }
+}
+
+/** Waits for an output but only selects a route, counting its runs. */
+private class RoutesWithoutOutput(override val name: String) : Node {
+  var runs = 0
+    private set
+
+  override val waitForOutput: Boolean = true
+
+  override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> = flow {
+    runs += 1
+    context.routes = listOf(yes())
+  }
+}
+
 /** Dispatches [child] under run ID `s`, with a short timeout and one retry. */
 private class DispatchWithTimeout(override val name: String, private val child: Node) : Node {
   override val rerunOnResume: Boolean = true
@@ -903,6 +935,15 @@ private fun requestEvent(path: String, interruptId: String, invocationId: String
   RequestInput(interruptId = interruptId, message = "?")
     .toEvent()
     .copy(author = "wf", invocationId = invocationId, nodeInfo = NodeInfo(path = path))
+
+/** The context of a node named `root` that runs on the `root` branch. */
+private fun parentContext() =
+  Context(
+    invocationContext = testInvocationContext(branch = "root"),
+    node = StubNode("root"),
+    eventSink = { _, _ -> },
+    nodePath = "",
+  )
 
 /** The user's function-response event as it sits in the session. */
 private fun answerEvent(
@@ -2011,6 +2052,146 @@ class WorkflowHitlTest {
   }
 
   @Test
+  fun resume_rootWorkflowWhoseTerminalNodeReplayed_sendsNoOutputOfItsOwn() {
+    // Arrange: `done` finishes on turn 1 while `ask` waits, so turn 2 replays it.
+    val done = RunCountingEmitter("done", "DONE")
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "?"))
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, done), Edge(Start, ask), Edge(ask, WritesStateOnly("sink"))),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("v" to 1L)))
+
+    // Assert: `done` re-sends its replayed output, but the workflow sends none of its own.
+    assertEquals(1, done.runs)
+    val doneOutput = events.single { it.nodeInfo?.path == "wf@1/done@1" && it.output != null }
+    assertEquals("DONE", doneOutput.output)
+    assertTrue(events.none { it.nodeInfo?.path == "wf@1" })
+  }
+
+  @Test
+  fun resume_terminalChildWorkflowWhoseTerminalNodeReplayed_sendsNoOutputOfItsOwn() {
+    // Arrange: `sub` is a terminal node of `wf`; its `done` finishes on turn 1 while `ask` waits.
+    val done = RunCountingEmitter("done", "DONE")
+    val sub = Workflow(name = "sub", edges = listOf(Edge(Start, done)))
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "?"))
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges = listOf(Edge(Start, sub), Edge(Start, ask), Edge(ask, WritesStateOnly("sink"))),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("v" to 1L)))
+
+    // Assert: `sub` reruns with the replayed `done` but sends no output event of its own.
+    assertEquals(1, done.runs)
+    assertTrue(events.none { it.nodeInfo?.path == "wf@1/sub@1" && it.output != null })
+  }
+
+  @Test
+  fun resume_callerRerunOverAReplayingChildWorkflow_isReplayedOnTheNextTurn() {
+    // Arrange: `caller` delegates to a child workflow and then asks, while `other` holds `j` back.
+    val child =
+      Workflow(name = "sub", edges = listOf(Edge(Start, RunCountingEmitter("done", "DONE"))))
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "?"))
+    val caller = DelegateThenDispatch("caller", child, ask)
+    val other = Ask("other", RequestInput(interruptId = "o_1", message = "?"))
+    val join = JoinNode("j")
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges =
+          listOf(Edge(Start, caller), Edge(Start, other), Edge(caller, join), Edge(other, join)),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+    session.advance(answer("ask_1", mapOf("v" to 1L)))
+
+    // Act
+    val events = session.turn(answer("o_1", mapOf("v" to 2L)))
+
+    // Assert: the turn that reran `caller` recorded its replayed output, so this turn replays it.
+    assertEquals(2, caller.runs)
+    val joinOutput = events.single { it.nodeInfo?.path == "wf@1/j@1" }.output
+    assertEquals(mapOf("caller" to "DONE", "other" to mapOf("v" to 2L)), joinOutput)
+  }
+
+  @Test
+  fun resume_callerRerunOverANestedReplayingChildWorkflow_isReplayedOnTheNextTurn() {
+    // Arrange: as in the test above, but the child's terminal node is the workflow `sub`.
+    val sub =
+      Workflow(name = "sub", edges = listOf(Edge(Start, RunCountingEmitter("done", "DONE"))))
+    val child = Workflow(name = "outer", edges = listOf(Edge(Start, sub)))
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "?"))
+    val caller = DelegateThenDispatch("caller", child, ask)
+    val other = Ask("other", RequestInput(interruptId = "o_1", message = "?"))
+    val join = JoinNode("j")
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges =
+          listOf(Edge(Start, caller), Edge(Start, other), Edge(caller, join), Edge(other, join)),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+    session.advance(answer("ask_1", mapOf("v" to 1L)))
+
+    // Act
+    val events = session.turn(answer("o_1", mapOf("v" to 2L)))
+
+    // Assert: `sub` sent replayed output for `caller` through `outer`, so this turn replays it.
+    assertEquals(2, caller.runs)
+    val joinOutput = events.single { it.nodeInfo?.path == "wf@1/j@1" }.output
+    assertEquals(mapOf("caller" to "DONE", "other" to mapOf("v" to 2L)), joinOutput)
+  }
+
+  @Test
+  fun resume_callerRerunOverAReplayingChildWorkflowWithACheckedOutput_sendsItOnce() {
+    // Arrange: as in the test above, but the schema of `sub` reads "5" as 5.
+    val countSchema =
+      Schema(type = Type.OBJECT, properties = mapOf("count" to Schema(type = Type.INTEGER)))
+    val child =
+      Workflow(
+        name = "sub",
+        edges = listOf(Edge(Start, RunCountingEmitter("done", mapOf("count" to "5")))),
+        outputSchema = countSchema,
+      )
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "?"))
+    val caller = DelegateThenDispatch("caller", child, ask)
+    val other = Ask("other", RequestInput(interruptId = "o_1", message = "?"))
+    val join = JoinNode("j")
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges =
+          listOf(Edge(Start, caller), Edge(Start, other), Edge(caller, join), Edge(other, join)),
+      )
+    val session = WorkflowSession(workflow)
+    session.advance(userMessage("go"))
+
+    // Act
+    val rerun = session.turn(answer("ask_1", mapOf("v" to 1L)))
+    val events = session.turn(answer("o_1", mapOf("v" to 2L)))
+
+    // Assert: the turn that reran `caller` sent the checked value once; the next turn replays it.
+    val subOutputs = rerun.filter {
+      it.output != null && it.nodeInfo?.path.orEmpty().endsWith("/sub@c")
+    }
+    assertEquals(listOf<Any?>(mapOf("count" to 5L)), subOutputs.map { it.output })
+    assertEquals(2, caller.runs)
+    val joinOutput = events.single { it.nodeInfo?.path == "wf@1/j@1" }.output
+    assertEquals(mapOf("caller" to mapOf("count" to 5L), "other" to mapOf("v" to 2L)), joinOutput)
+  }
+
+  @Test
   fun resume_interruptRaisedByADescendant_reachesTheNodesResumeInputs() {
     // Arrange: the interrupt comes from a child the node dispatched, not from the node itself.
     val node =
@@ -2626,6 +2807,19 @@ class WorkflowHitlTest {
   }
 
   @Test
+  fun runNode_sameExplicitRunIdTwiceForAWaitingChildThatOnlyRoutes_runsItOnce() {
+    // Arrange: `router` waits for an output but leaves only a route.
+    val router = RoutesWithoutOutput("router")
+    val workflow = Workflow(name = "wf", edges = listOf(Edge(Start, CallsTwice("caller", router))))
+
+    // Act
+    WorkflowSession(workflow).advance(userMessage("go"))
+
+    // Assert: a route is an outcome, so the second call shares the first run.
+    assertEquals(1, router.runs)
+  }
+
+  @Test
   fun retry_childSwallowedTheAttemptCancellation_runsTheChildAgain() {
     // Arrange: `swallower` catches the timeout's cancellation and returns without output.
     val swallower = SwallowsCancellationOnFirstRun("swallower")
@@ -2806,6 +3000,34 @@ class WorkflowHitlTest {
   }
 
   @Test
+  fun resume_fannedOutRouterReplayed_keepsItsSuccessorOnItsSubBranch() {
+    // Arrange: START fans out, so `router` runs on `router@1` and only picks a route for `ask`.
+    val router = RunCountingRouter("router", yes())
+    val ask = Ask("ask", RequestInput(interruptId = "ask_1", message = "need input"))
+    val workflow =
+      Workflow(
+        name = "wf",
+        edges =
+          listOf(
+            Edge(Start, router),
+            Edge(Start, WritesStateOnly("other")),
+            Edge(router, ask, yes()),
+          ),
+      )
+    val session = WorkflowSession(workflow)
+    val askBranch =
+      session.turn(userMessage("go")).single { it.nodeInfo?.path == "wf@1/ask@1" }.branch
+
+    // Act
+    val events = session.turn(answer("ask_1", mapOf("v" to 1L)))
+
+    // Assert: `ask` completes on the sub-branch that it paused on.
+    assertEquals("router@1", askBranch)
+    val output = events.single { it.nodeInfo?.path == "wf@1/ask@1" && it.output != null }
+    assertEquals(askBranch, output.branch)
+  }
+
+  @Test
   fun runId_nodeReenteredAfterResume_takesTheNextRunId() {
     // Arrange: `ask` suspends the first turn; once it is answered, `again` loops back to it.
     val ask = AsksEveryRun("ask")
@@ -2880,6 +3102,68 @@ class WorkflowHitlTest {
 
     // Assert
     assertEquals(setOf("ask_1"), recovered.unresolved)
+  }
+
+  @Test
+  fun scan_outputDelegatedByAChild_leavesTheOwnersBranchUnset() {
+    // Arrange: `d@1`'s child `c@c` produced the output for it, on the child's own branch.
+    val delegated =
+      Event(
+        author = "wf",
+        invocationId = "inv",
+        branch = "d@1.c@c",
+        output = "out",
+        nodeInfo = NodeInfo(path = "wf@1/d@1/c@c", outputFor = listOf("wf@1/d@1/c@c", "wf@1/d@1")),
+      )
+
+    // Act
+    val recovered = ResumeScan.scan(listOf(delegated), "wf@1", "inv").getValue("d@1")
+
+    // Assert
+    assertEquals("out", recovered.output)
+    assertNull(recovered.branch)
+  }
+
+  @Test
+  fun replayContext_withoutARecordedBranch_replaysOnTheScheduledBranch() {
+    // Arrange
+    val parent = parentContext()
+    val scheduled = parent.invocationContext.copy(branch = "root.a@1")
+
+    // Act
+    val replayed =
+      ResumeScan.replayContext(
+        parent = parent,
+        scheduled = scheduled,
+        node = StubNode("a"),
+        runId = "1",
+        useAsOutput = false,
+        interception = Interception(shouldRun = false, output = "out"),
+      )
+
+    // Assert
+    assertEquals("root.a@1", replayed.invocationContext.branch)
+  }
+
+  @Test
+  fun replayContext_withARecordedBranch_replaysOnThatBranch() {
+    // Arrange
+    val parent = parentContext()
+    val scheduled = parent.invocationContext.copy(branch = "root.a@1")
+
+    // Act
+    val replayed =
+      ResumeScan.replayContext(
+        parent = parent,
+        scheduled = scheduled,
+        node = StubNode("a"),
+        runId = "1",
+        useAsOutput = false,
+        interception = Interception(shouldRun = false, output = "out", branch = "recorded"),
+      )
+
+    // Assert
+    assertEquals("recorded", replayed.invocationContext.branch)
   }
 
   @Test

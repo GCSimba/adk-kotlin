@@ -60,6 +60,9 @@ internal class Scheduler(
   /** Nodes replayed from history in the current activation. */
   private val replayed = mutableSetOf<String>()
 
+  /** Nodes whose latest output was replayed, so no event in this turn carried it in `outputFor`. */
+  private val replayedOutputs = mutableSetOf<String>()
+
   private val isResumable: Boolean
     get() = context.invocationContext.isResumable
 
@@ -214,8 +217,16 @@ internal class Scheduler(
         // output back, and a plain node fails.
         val followsTransfer = interception.transferToAgent != null
         if (!completesTransfer) replayed.add(nodeName)
+        val scheduled =
+          scheduledInvocationContext(
+            context.invocationContext,
+            trigger.branch,
+            trigger.useSubBranch,
+            nodeName,
+            runId,
+          )
         val replayContext =
-          ResumeScan.replayContext(context, node, runId, useAsOutput, interception)
+          ResumeScan.replayContext(context, scheduled, node, runId, useAsOutput, interception)
         running[nodeName] =
           if (followsTransfer) dispatch(firstHop = replayContext) else scope.async { replayContext }
         return completesTransfer
@@ -251,7 +262,10 @@ internal class Scheduler(
 
     state.status = NodeStatus.COMPLETED
     nodeBranches[nodeName] = childContext.invocationContext.branch
-    if (childContext.hasProducedOutput) nodeOutputs[nodeName] = childContext.output
+    if (childContext.hasProducedOutput) {
+      nodeOutputs[nodeName] = childContext.output
+      if (wasReplayed) replayedOutputs.add(nodeName) else replayedOutputs.remove(nodeName)
+    }
 
     if (wasReplayed) reemitReplayedOutput(childContext) else emitCheckpoint()
 
@@ -404,7 +418,8 @@ internal class Scheduler(
       )
     }
     if (terminalOutputs.size == 1) {
-      val output = nodeOutputs[terminalOutputs.single()]
+      val terminalNode = terminalOutputs.single()
+      val output = nodeOutputs[terminalNode]
       val schema = workflow.outputSchema
       val side = "output of workflow '${workflow.name}'"
       context.output =
@@ -415,8 +430,12 @@ internal class Scheduler(
       if (context.hasProducedOutput) {
         // Sent only when the check changed the value. A node that delegated to this workflow
         // replays the checked value from this event on resume or retry.
-        if (context.output != output && state.isDelegatedToANode()) emitOutput(state)
-        state.markOutputEmitted()
+        val sentChecked = context.output != output && state.isDelegatedToANode()
+        if (sentChecked) emitOutput(state)
+        // Unmarked so NodeRunner sends a replayed terminal node's output for the delegating node.
+        if (sentChecked || terminalNode !in replayedOutputs || !state.isDelegatedToANode()) {
+          state.markOutputEmitted()
+        }
       } else if (output != null) {
         state.clearDelegatedOutput(output)
       }

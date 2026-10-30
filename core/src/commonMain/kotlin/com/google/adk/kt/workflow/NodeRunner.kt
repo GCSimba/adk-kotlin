@@ -191,21 +191,8 @@ private constructor(
       isolationScope = overrideIsolationScope,
     )
 
-  /**
-   * The invocation context the node runs against. A fanned-out node runs on a sub-branch derived
-   * from its base branch; an override branch (a single successor inheriting its predecessor's, or a
-   * join re-merging to the common prefix) replaces the inherited one; otherwise the parent's
-   * context is shared unchanged. The branch keeps one parallel branch's events out of a sibling's
-   * LLM history.
-   */
-  private fun childInvocationContext(): InvocationContext {
-    val base = overrideBranch ?: invocationContext.branch
-    return when {
-      useSubBranch -> invocationContext.copy(branch = BranchPath.subBranch(base, node.name, runId))
-      overrideBranch != null -> invocationContext.copy(branch = overrideBranch)
-      else -> invocationContext
-    }
-  }
+  private fun childInvocationContext(): InvocationContext =
+    scheduledInvocationContext(invocationContext, overrideBranch, useSubBranch, node.name, runId)
 
   /**
    * State for a single execution of [node].
@@ -607,3 +594,25 @@ internal fun asBaseNode(node: Node): BaseNode =
       override fun runNode(context: Context, nodeInput: Any?): Flow<Any?> =
         node.runNode(context, nodeInput)
     }
+
+/**
+ * The invocation context the run [runId] of the node [name] runs against. A fanned-out node runs on
+ * a sub-branch derived from its base branch; an override branch (a single successor inheriting its
+ * predecessor's, or a join re-merging to the common prefix) replaces the inherited one; otherwise
+ * [parent] is shared unchanged. The branch keeps one parallel branch's events out of a sibling's
+ * LLM history.
+ */
+internal fun scheduledInvocationContext(
+  parent: InvocationContext,
+  overrideBranch: String?,
+  useSubBranch: Boolean,
+  name: String,
+  runId: String,
+): InvocationContext {
+  val base = overrideBranch ?: parent.branch
+  return when {
+    useSubBranch -> parent.copy(branch = BranchPath.subBranch(base, name, runId))
+    overrideBranch != null -> parent.copy(branch = overrideBranch)
+    else -> parent
+  }
+}

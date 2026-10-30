@@ -277,7 +277,8 @@ internal object ResumeScan {
 
       if (eventOutput != null) {
         node.output = eventOutput
-        if (event.output != null) node.branch = event.branch
+        // A delegate's output event carries the delegate's branch, not this node's.
+        if (isDirect && event.output != null) node.branch = event.branch
       }
       event.actions.route?.let { node.route = it }
       event.actions.transferToAgent?.let {
@@ -411,17 +412,21 @@ internal object ResumeScan {
     )
   }
 
-  /** Builds a [Context] carrying the recovered [interception] state without running [node]. */
+  /**
+   * Builds a [Context] carrying the recovered [interception] state without running [node]. The node
+   * replays on the branch it recorded, or else on the branch of [scheduled], the context that it
+   * would run against.
+   */
   fun replayContext(
     parent: Context,
+    scheduled: InvocationContext,
     node: Node,
     runId: String,
     useAsOutput: Boolean,
     interception: Interception,
   ): Context {
     val invocationContext =
-      if (interception.branch != null) parent.invocationContext.copy(branch = interception.branch)
-      else parent.invocationContext
+      if (interception.branch != null) scheduled.copy(branch = interception.branch) else scheduled
     val context =
       Context(
         invocationContext = invocationContext,
