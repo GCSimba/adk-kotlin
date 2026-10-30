@@ -826,10 +826,13 @@ internal class LlmAgentTurn(
             // Held until the write returns, so a cancellation in between re-sends it.
             val pending = PendingSend(liveRequest, persisted = false, screened = null)
             pendingRequest.store(pending)
+            // Copied once, as taken off the queue; the replay above is not copied again.
+            liveTools?.copyInput(liveRequest)
             if (!sendOrReplay(pending)) return@launch
             pendingRequest.store(null)
           }
           // receiveRequest returns null only once the caller has closed the queue.
+          liveTools?.closeInput()
           result.closedByCaller = true
           val closedInTime = close()
           // A close that timed out may never end the connection's receive, so stop reading too.

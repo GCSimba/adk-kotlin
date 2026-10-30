@@ -31,6 +31,7 @@ import com.google.adk.kt.types.Role
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
@@ -38,8 +39,10 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import org.junit.Test
@@ -338,6 +341,33 @@ class LiveStreamingToolsTest {
       assertThat(answer)
         .isEqualTo(mapOf("status" to "No active streaming function named monitor found"))
       assertThat(closed).isEmpty()
+    }
+  }
+
+  @Test
+  fun requests_inputClosedBeforeCollection_completesEmpty() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      tools.closeInput()
+      try {
+        assertThat(tools.requests(streamingToolContext("c1")).toList()).isEmpty()
+      } finally {
+        withContext(NonCancellable) { tools.close() }
+      }
+    }
+  }
+
+  @Test
+  fun requests_ownerNotStreaming_completesEmpty() {
+    runBlocking {
+      val tools = LiveStreamingTools(LiveRequestQueue(), "agent", "invocation", coroutineContext)
+      try {
+        val heard = withTimeout(5.seconds) { tools.requests(streamingToolContext("c1")).toList() }
+
+        assertThat(heard).isEmpty()
+      } finally {
+        withContext(NonCancellable) { tools.close() }
+      }
     }
   }
 

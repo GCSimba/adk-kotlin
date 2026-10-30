@@ -18,6 +18,7 @@
 
 package com.google.adk.kt.runners
 
+import com.google.adk.kt.agents.LiveRequest
 import com.google.adk.kt.agents.LiveRequestQueue
 import com.google.adk.kt.agents.LlmAgent
 import com.google.adk.kt.agents.RunConfig
@@ -39,9 +40,13 @@ import com.google.adk.kt.testing.DummyTool
 import com.google.adk.kt.testing.audioFrame
 import com.google.adk.kt.testing.awaitToolResponse
 import com.google.adk.kt.testing.modelFunctionCallResponse
+import com.google.adk.kt.testing.modelMessage
+import com.google.adk.kt.testing.modelTransferToAgentResponse
 import com.google.adk.kt.testing.simpleAudioTurn
 import com.google.adk.kt.testing.spokenModelTurn
 import com.google.adk.kt.testing.turnCompleteStep
+import com.google.adk.kt.testing.userMessage
+import com.google.adk.kt.tools.ToolContext
 import com.google.adk.kt.types.Blob
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
@@ -54,11 +59,16 @@ import com.google.common.truth.Truth.assertWithMessage
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
@@ -66,14 +76,18 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 
 /** Drives whole live runs through the public runner against scripted presets of real traffic. */
@@ -122,6 +136,22 @@ class LiveRunIntegrationTest {
   private fun Any.toolAnswers(): List<FunctionResponse> =
     (this as? ContentInput)?.content?.parts?.mapNotNull { it.functionResponse }.orEmpty()
 
+  /** Whether a sent message has a part whose text is [text]. */
+  private fun Any.hasSentText(text: String): Boolean =
+    (this as? ContentInput)?.content?.parts?.any { it.text == text } == true
+
+  /** The index of the first sent message with a part whose text is [text], or -1 if none. */
+  private fun List<Any>.indexOfSentText(text: String): Int = indexOfFirst { it.hasSentText(text) }
+
+  /** The index of the first sent message answering call [callId], or -1 if none. */
+  private fun List<Any>.indexOfAnswerTo(callId: String): Int = indexOfFirst { message ->
+    message.toolAnswers().any { it.id == callId }
+  }
+
+  /** The ids of the calls answered by sent messages after [index]. */
+  private fun List<Any>.idsAnsweredAfter(index: Int): List<String?> =
+    drop(index + 1).flatMap { it.toolAnswers() }.map { it.id }
+
   private fun answers(callId: String, response: Map<String, Any?>): (Any) -> Boolean = { message ->
     message.toolAnswers().any { it.id == callId && it.response == response }
   }
@@ -162,6 +192,50 @@ class LiveRunIntegrationTest {
   /** A `monitor` tool returning an [endlessStream]. */
   private fun endlessTool(cancelled: CompletableDeferred<Unit>) =
     DummyTool(name = "monitor") { _, _ -> endlessStream(cancelled) }
+
+  /** A tool streaming back each user text it hears, as "heard <text>". */
+  private fun echoTool(name: String) =
+    DummyTool(name = name) { context, _ ->
+      context.liveRequests.mapNotNull { request ->
+        (request.input as? ContentInput)
+          ?.content
+          ?.parts
+          ?.firstNotNullOfOrNull { it.text }
+          ?.let { HEARD + it }
+      }
+    }
+
+  /** Whether a sent message answers [callId] with an echo of a ping. */
+  private fun echoes(callId: String): (Any) -> Boolean = { message ->
+    message.toolAnswers().any {
+      it.id == callId && (it.response["result"] as? String)?.startsWith(HEARD + PING) == true
+    }
+  }
+
+  /**
+   * Runs live, sending `ping(n)` as the n-th message every 20 ms until the model completes a turn,
+   * then hangs up. Real time: a collector starts listening asynchronously, so the caller repeats
+   * itself until it is heard.
+   */
+  private suspend fun InMemoryRunner.runPingingUntilTurnComplete(
+    ping: (Int) -> String = { PING }
+  ): List<Event> = coroutineScope {
+    val queue = LiveRequestQueue()
+    val pinger = launch {
+      var sends = 0
+      while (true) {
+        queue.sendContent(userMessage(ping(++sends)))
+        delay(20.milliseconds)
+      }
+    }
+    try {
+      runLive(USER_ID, SESSION_ID, queue, liveConfig())
+        .onEach { if (it.turnComplete) queue.close() }
+        .toList()
+    } finally {
+      pinger.cancel()
+    }
+  }
 
   @Test
   fun runLive_spokenTurn_emitsTheTurnsContentAndCompletesWhenTheQueueCloses(): Unit = runBlocking {
@@ -1155,6 +1229,379 @@ class LiveRunIntegrationTest {
     }
   }
 
+  @Test
+  fun runLive_toolCollectsLiveRequests_streamsBackWhatTheCallerSends() {
+    runBlocking {
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("echo", id = "c1")),
+          AwaitSent("the pending answer", answers("c1", PENDING)),
+          AwaitSent("an echo", answers("c1", mapOf("result" to HEARD + PING))),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) = runnerFor(script, tools = listOf(echoTool("echo")))
+
+      val unused = runner.runPingingUntilTurnComplete()
+
+      model.connections.single().assertAllWaitsMet()
+    }
+  }
+
+  @Test
+  fun runLive_stoppedToolCollectingLiveRequests_stopsHearingAndARecallHearsAfresh() {
+    runBlocking {
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("echo", id = "c1")),
+          AwaitSent("the first echo", echoes("c1")),
+          stopStreamingCall("echo", "s1"),
+          AwaitSent("the stop answer", answers("s1", stopStreamingAnswer("echo"))),
+          Respond(modelFunctionCallResponse("echo", id = "c2")),
+          AwaitSent("the second echo", echoes("c2")),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) = runnerFor(script, tools = listOf(echoTool("echo"), stopStreamingTool()))
+
+      val unused = runner.runPingingUntilTurnComplete { "$PING $it" }
+
+      model.connections.single().assertAllWaitsMet()
+      val sent = model.connections.single().sent
+      val stopAnswer = sent.indexOfAnswerTo("s1")
+      assertThat(sent.idsAnsweredAfter(stopAnswer)).doesNotContain("c1")
+      val echo =
+        sent.flatMap { it.toolAnswers() }.first { it.id == "c2" && "result" in it.response }
+      val ping = (echo.response["result"] as String).removePrefix(HEARD)
+      assertThat(sent.indexOfSentText(ping)).isGreaterThan(stopAnswer)
+    }
+  }
+
+  @Test
+  fun runLive_stoppedToolHandedLiveRequestsToAnotherScope_endsThatCollection() {
+    runBlocking {
+      // Outside the tool's flow, so stopping the tool does not cancel the collection.
+      val elsewhere = CoroutineScope(coroutineContext + Job())
+      val collecting = CompletableDeferred<Unit>()
+      val stopped = CompletableDeferred<Unit>()
+      val endedHow = CompletableDeferred<Throwable?>()
+      val heard = mutableListOf<String>()
+      val goAhead = "go"
+
+      val handOff =
+        DummyTool(name = "hand_off") { context, _ ->
+          flow<String> {
+            elsewhere.launch {
+              context.liveRequests
+                .onStart { collecting.complete(Unit) }
+                .onCompletion { endedHow.complete(it) }
+                .collect { request ->
+                  (request.input as? ContentInput)?.content?.parts?.mapNotNullTo(heard) { it.text }
+                }
+            }
+            try {
+              awaitCancellation()
+            } finally {
+              stopped.complete(Unit)
+            }
+          }
+        }
+
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("hand_off", id = "c1")),
+          AwaitSent("the go-ahead") { it.hasSentText(goAhead) },
+          stopStreamingCall("hand_off", "s1"),
+          AwaitSent("the stop answer", answers("s1", stopStreamingAnswer("hand_off"))),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) = runnerFor(script, tools = listOf(handOff, stopStreamingTool()))
+      val queue = LiveRequestQueue()
+      val turnComplete = CompletableDeferred<Unit>()
+
+      val run = launch {
+        runner.runLive(USER_ID, SESSION_ID, queue, liveConfig()).collect {
+          if (it.turnComplete) turnComplete.complete(Unit)
+        }
+      }
+      val endedOnStop =
+        try {
+          collecting.await()
+          queue.sendContent(userMessage(goAhead))
+          stopped.await()
+          queue.sendContent(userMessage("after"))
+          val ended = withTimeoutOrNull(2.seconds) { endedHow.join() } != null
+          turnComplete.await()
+          ended
+        } finally {
+          queue.close()
+          withContext(NonCancellable) { run.join() }
+          elsewhere.cancel()
+        }
+
+      model.connections.single().assertAllWaitsMet()
+      assertWithMessage("the collection should end when its tool is stopped")
+        .that(endedOnStop)
+        .isTrue()
+      assertWithMessage("the collection should complete, not be cancelled")
+        .that(endedHow.await())
+        .isNull()
+      assertThat(heard).containsExactly(goAhead)
+    }
+  }
+
+  /**
+   * A tool collecting the live input: it completes [collecting] when it starts, adds what it hears
+   * to [heard], and completes [ended] with how the collection ends.
+   */
+  private fun listenerTool(
+    collecting: CompletableDeferred<Unit>,
+    ended: CompletableDeferred<Throwable?>,
+    heard: MutableList<LiveRequest> = mutableListOf(),
+  ) =
+    DummyTool(name = "listener") { context, _ ->
+      flow<String> {
+        context.liveRequests
+          .onStart { collecting.complete(Unit) }
+          .onCompletion { cause -> ended.complete(cause) }
+          .collect { heard += it }
+      }
+    }
+
+  @Test
+  fun runLive_callerClosesTheQueue_completesWhatAToolCollectsFromLiveRequests() {
+    runBlocking {
+      val collecting = CompletableDeferred<Unit>()
+      val ended = CompletableDeferred<Throwable?>()
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("listener", id = "c1")),
+          AwaitSent("the pending answer", answers("c1", PENDING)),
+        )
+      val (runner, _) = runnerFor(script, tools = listOf(listenerTool(collecting, ended)))
+      val queue = LiveRequestQueue()
+
+      val run = launch { runner.runLive(USER_ID, SESSION_ID, queue, liveConfig()).collect {} }
+      collecting.await()
+      queue.close()
+      run.join()
+
+      assertThat(ended.await()).isNull()
+    }
+  }
+
+  @Test
+  fun runLive_runEndsWithTheQueueOpen_cancelsWhatAToolCollectsFromLiveRequests() {
+    runBlocking {
+      val collecting = CompletableDeferred<Unit>()
+      val ended = CompletableDeferred<Throwable?>()
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("listener", id = "c1")),
+          AwaitSent("the pending answer", answers("c1", PENDING)),
+        )
+      val (runner, _) = runnerFor(script, tools = listOf(listenerTool(collecting, ended)))
+
+      val run = launch {
+        runner.runLive(USER_ID, SESSION_ID, LiveRequestQueue(), liveConfig()).collect {}
+      }
+      collecting.await()
+      run.cancelAndJoin()
+
+      assertThat(ended.await()).isInstanceOf(CancellationException::class.java)
+    }
+  }
+
+  @Test
+  fun runLive_toolCollectsLiveRequests_hearsAnotherToolsAnswers() {
+    runBlocking {
+      val collecting = CompletableDeferred<Unit>()
+      val heard = mutableListOf<LiveRequest>()
+      val listener = listenerTool(collecting, CompletableDeferred(), heard)
+      val ticker =
+        DummyTool(name = "ticker") { _, _ ->
+          flow {
+            collecting.await()
+            emit("tick")
+            awaitCancellation()
+          }
+        }
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("listener", id = "c1")),
+          AwaitSent("the listener's pending answer", answers("c1", PENDING)),
+          Respond(modelFunctionCallResponse("ticker", id = "c2")),
+          AwaitSent("the tick", answers("c2", mapOf("result" to "tick"))),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) = runnerFor(script, tools = listOf(listener, ticker))
+
+      val unused = runner.runUntilTurnComplete()
+
+      model.connections.single().assertAllWaitsMet()
+      assertThat(heard.flatMap { it.input?.toolAnswers().orEmpty() }.map { it.id to it.response })
+        .contains("c2" to mapOf("result" to "tick"))
+    }
+  }
+
+  @Test
+  fun runLive_toolContextKeptAfterItsStreamEnds_findsLiveRequestsEmpty() {
+    runBlocking {
+      val kept = CompletableDeferred<ToolContext>()
+      val streamEnded = CompletableDeferred<Unit>()
+      val once =
+        DummyTool(name = "once") { context, _ ->
+          flow {
+              kept.complete(context)
+              emit("done")
+            }
+            .onCompletion { streamEnded.complete(Unit) }
+        }
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("once", id = "c1")),
+          AwaitSent("the answer", answers("c1", mapOf("result" to "done"))),
+        )
+      val (runner, _) = runnerFor(script, tools = listOf(once))
+      val queue = LiveRequestQueue()
+      val run = launch { runner.runLive(USER_ID, SESSION_ID, queue, liveConfig()).collect {} }
+
+      val heard =
+        try {
+          streamEnded.await()
+          withTimeoutOrNull(500.milliseconds) { kept.await().liveRequests.toList() }
+        } finally {
+          queue.close()
+          withContext(NonCancellable) { run.join() }
+        }
+
+      assertThat(heard).isNotNull()
+      assertThat(heard).isEmpty()
+    }
+  }
+
+  @Test
+  fun runLive_handoverWhileAToolCollectsLiveRequests_cancelsTheCollection() {
+    runBlocking {
+      val ended = CompletableDeferred<Throwable?>()
+      val listener =
+        DummyTool(name = "listener") { context, _ ->
+          flow {
+            emit("listening")
+            context.liveRequests.onCompletion { ended.complete(it) }.collect {}
+          }
+        }
+      val parentModel =
+        DummyLiveModel(
+          listOf(
+            Respond(modelFunctionCallResponse("listener", id = "c1")),
+            AwaitSent("the listener's first answer", answers("c1", mapOf("result" to "listening"))),
+            Respond(modelTransferToAgentResponse("child")),
+            DummyLiveStep.EndStream,
+          )
+        )
+      val childModel =
+        DummyLiveModel(
+          listOf(
+            Respond(LlmResponse(content = modelMessage("hi"), partial = false)),
+            DummyLiveStep.EndStream,
+          )
+        )
+      val child = LlmAgent(name = "child", model = childModel)
+      val parent =
+        LlmAgent(
+          name = "parent",
+          model = parentModel,
+          subAgents = listOf(child),
+          tools = listOf(listener),
+        )
+
+      // Each event's author, with whether the collection had already ended when it arrived.
+      val authorsAndEnded =
+        InMemoryRunner(agent = parent)
+          .runLive(USER_ID, SESSION_ID, LiveRequestQueue(), liveConfig())
+          .map { it.author to ended.isCompleted }
+          .toList()
+
+      parentModel.connections.single().assertAllWaitsMet()
+      assertThat(authorsAndEnded.first { (author, _) -> author == "child" }.second).isTrue()
+      assertThat(ended.await()).isInstanceOf(CancellationException::class.java)
+    }
+  }
+
+  @Test
+  fun runLive_twoToolsCollectLiveRequests_bothHearTheCaller() {
+    runBlocking {
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("echo_a", id = "c1")),
+          AwaitSent("the first pending answer", answers("c1", PENDING)),
+          Respond(modelFunctionCallResponse("echo_b", id = "c2")),
+          AwaitSent("the second pending answer", answers("c2", PENDING)),
+          AwaitSent("the first echo", answers("c1", mapOf("result" to HEARD + PING))),
+          AwaitSent("the second echo", answers("c2", mapOf("result" to HEARD + PING))),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) =
+        runnerFor(script, tools = listOf(echoTool("echo_a"), echoTool("echo_b")))
+
+      val unused = runner.runPingingUntilTurnComplete()
+
+      model.connections.single().assertAllWaitsMet()
+    }
+  }
+
+  @Test
+  fun runLive_oneOfTwoCollectingToolsStopped_theOtherKeepsHearing() {
+    runBlocking {
+      // AwaitSent shows only messages after the stop answer, so this sees only later pings.
+      val pingsAfterTheStop = mutableSetOf<String>()
+      val echoAfterTheStop: (Any) -> Boolean = { message ->
+        (message as? ContentInput)?.content?.parts?.mapNotNullTo(pingsAfterTheStop) { it.text }
+        message.toolAnswers().any { answer ->
+          val ping = (answer.response["result"] as? String)?.removePrefix(HEARD)
+          answer.id == "c2" && ping != null && ping in pingsAfterTheStop
+        }
+      }
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("echo_a", id = "c1")),
+          AwaitSent("echo_a's first echo", echoes("c1")),
+          Respond(modelFunctionCallResponse("echo_b", id = "c2")),
+          AwaitSent("echo_b's first echo", echoes("c2")),
+          stopStreamingCall("echo_a", "s1"),
+          AwaitSent("the stop answer", answers("s1", stopStreamingAnswer("echo_a"))),
+          AwaitSent("echo_b hearing a ping sent after the stop", echoAfterTheStop),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val tools = listOf(echoTool("echo_a"), echoTool("echo_b"), stopStreamingTool())
+      val (runner, model) = runnerFor(script, tools = tools)
+
+      val unused = runner.runPingingUntilTurnComplete { "$PING $it" }
+
+      model.connections.single().assertAllWaitsMet()
+      val sent = model.connections.single().sent
+      assertThat(sent.idsAnsweredAfter(sent.indexOfAnswerTo("s1"))).doesNotContain("c1")
+    }
+  }
+
+  @Test
+  fun runLive_plainToolCollectingLiveRequests_returnsAtOnceWithNothing() {
+    runBlocking {
+      // Only a streaming tool hears the run's input; a plain one would otherwise block the turn.
+      val plain = DummyTool(name = "plain") { context, _ -> context.liveRequests.toList().size }
+      val script =
+        listOf(
+          Respond(modelFunctionCallResponse("plain", id = "c1")),
+          AwaitSent("the plain answer", answers("c1", mapOf("result" to 0))),
+          Respond(LlmResponse(turnComplete = true)),
+        )
+      val (runner, model) = runnerFor(script, tools = listOf(plain))
+
+      val unused = runner.runUntilTurnComplete()
+
+      model.connections.single().assertAllWaitsMet()
+    }
+  }
+
   companion object {
     private const val USER_ID = "user"
     private const val SESSION_ID = "session"
@@ -1172,5 +1619,11 @@ class LiveRunIntegrationTest {
           "monitor is already running with these arguments; wait for its updates " +
             "instead of calling again."
       )
+
+    /** What [echoTool] puts before each text it hears. */
+    private const val HEARD = "heard "
+
+    /** What [runPingingUntilTurnComplete] sends, alone or followed by the send's number. */
+    private const val PING = "ping"
   }
 }

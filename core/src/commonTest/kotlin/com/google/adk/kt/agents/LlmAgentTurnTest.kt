@@ -117,6 +117,7 @@ import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
@@ -8956,6 +8957,68 @@ class LlmAgentTurnTest {
   }
 
   private class ScriptedTurnFailure : RuntimeException("the turn failed")
+
+  @Test
+  fun runLive_writeFailsAndIsReplayed_copiesTheRequestToLiveRequestsOnce() {
+    runBlocking {
+      val collecting = CompletableDeferred<Unit>()
+      val heard = mutableListOf<LiveRequest>()
+      val listener =
+        DummyTool(name = "listener") { context, _ ->
+          flow<String> {
+            context.liveRequests.onStart { collecting.complete(Unit) }.collect { heard += it }
+          }
+        }
+
+      val isHello: (Content) -> Boolean = { content -> content.parts.any { it.text == "hello" } }
+      val queue = LiveRequestQueue()
+      val first =
+        ScriptedConn("c0") {
+          emit(handleUpdate("h-1"))
+          emit(modelFunctionCallResponse("listener", id = "c1"))
+          it.closed.await()
+        }
+      first.onSendContent = { if (isHello(it)) throw connectionDrop() }
+      val second = ScriptedConn("c1") { it.closed.await() }
+      second.onSendContent = { if (isHello(it)) queue.close() }
+
+      val agent =
+        LlmAgent(name = "a", model = RecordingLiveModel(first, second), tools = listOf(listener))
+
+      withTimeout(10.seconds) {
+        val run = launch { agent.runLive(liveContextFor(agent, queue)).collect {} }
+        collecting.await()
+        queue.sendContent(userMessage("hello"))
+        run.join()
+      }
+
+      assertEquals(1, heard.count { (it.input as? ContentInput)?.content?.let(isHello) == true })
+    }
+  }
+
+  @Test
+  fun runAsync_toolCollectsLiveRequests_findsThemEmpty() {
+    runBlocking {
+      val tool = DummyTool(name = "listener") { context, _ -> context.liveRequests.toList().size }
+      val model =
+        DummyModel.createSequential(
+          "model",
+          listOf(
+            modelFunctionCallResponse("listener", id = "c1"),
+            LlmResponse(content = modelMessage("done")),
+          ),
+        )
+      val agent = LlmAgent(name = "agent", model = model, tools = listOf(tool))
+
+      val events =
+        InMemoryRunner(agent = agent)
+          .runAsync(userId = "u", sessionId = "s", newMessage = userMessage("run"))
+          .toList()
+
+      val answer = events.flatMap { it.functionResponses() }.single { it.id == "c1" }
+      assertEquals(mapOf("result" to 0), answer.response)
+    }
+  }
 
   private class TeardownFailure : RuntimeException("teardown failed")
 }
