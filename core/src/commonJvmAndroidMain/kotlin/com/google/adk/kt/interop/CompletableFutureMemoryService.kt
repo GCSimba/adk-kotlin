@@ -23,6 +23,8 @@ import com.google.adk.kt.memory.MemoryService
 import com.google.adk.kt.memory.SearchMemoryResponse
 import com.google.adk.kt.sessions.Session
 import java.util.concurrent.CompletableFuture
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -30,10 +32,12 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.future.future
 
 /**
- * Java-friendly wrapper around a [MemoryService] that it owns. Each method calls the `suspend`
+ * Java-friendly wrapper around a [MemoryService] that it owns: each method calls the `suspend`
  * method of the same name and returns a [CompletableFuture] of its result, so Java callers never
- * pass a `Continuation`. Canceling a future cancels its call, and [close] cancels every call in
- * flight, then closes the service if it is [AutoCloseable].
+ * pass a `Continuation`. Each call runs in the caller's OpenTelemetry context and in the
+ * `coroutineContext` passed to it, such as `MDCContext()` from kotlinx-coroutines-slf4j to carry
+ * the caller's MDC. Canceling a future cancels its call, a `Job` in `coroutineContext` is ignored,
+ * and [close] cancels every call in flight, then closes the service if it is [AutoCloseable].
  */
 @AdkJavaInteropApi
 class CompletableFutureMemoryService private constructor(private val delegate: MemoryService) :
@@ -47,10 +51,15 @@ class CompletableFutureMemoryService private constructor(private val delegate: M
   fun asKotlinMemoryService(): MemoryService = delegate
 
   /** Calls [MemoryService.addSessionToMemory]. */
-  fun addSessionToMemory(session: Session): CompletableFuture<Void?> = scope.future {
-    delegate.addSessionToMemory(session)
-    null
-  }
+  @JvmOverloads
+  fun addSessionToMemory(
+    session: Session,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Void?> =
+    scope.future(callerContext(coroutineContext)) {
+      delegate.addSessionToMemory(session)
+      null
+    }
 
   /**
    * Calls [MemoryService.addEventsToMemory]. The future fails with [UnsupportedOperationException]
@@ -63,10 +72,12 @@ class CompletableFutureMemoryService private constructor(private val delegate: M
     events: List<Event>,
     sessionId: String? = null,
     customMetadata: Map<String, Any?>? = null,
-  ): CompletableFuture<Void?> = scope.future {
-    delegate.addEventsToMemory(appName, userId, events, sessionId, customMetadata)
-    null
-  }
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Void?> =
+    scope.future(callerContext(coroutineContext)) {
+      delegate.addEventsToMemory(appName, userId, events, sessionId, customMetadata)
+      null
+    }
 
   /**
    * Calls [MemoryService.addMemory]. The future fails with [UnsupportedOperationException] if the
@@ -78,19 +89,22 @@ class CompletableFutureMemoryService private constructor(private val delegate: M
     userId: String,
     memories: List<MemoryEntry>,
     customMetadata: Map<String, Any?>? = null,
-  ): CompletableFuture<Void?> = scope.future {
-    delegate.addMemory(appName, userId, memories, customMetadata)
-    null
-  }
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Void?> =
+    scope.future(callerContext(coroutineContext)) {
+      delegate.addMemory(appName, userId, memories, customMetadata)
+      null
+    }
 
   /** Calls [MemoryService.searchMemory]. */
+  @JvmOverloads
   fun searchMemory(
     appName: String,
     userId: String,
     query: String,
-  ): CompletableFuture<SearchMemoryResponse> = scope.future {
-    delegate.searchMemory(appName, userId, query)
-  }
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<SearchMemoryResponse> =
+    scope.future(callerContext(coroutineContext)) { delegate.searchMemory(appName, userId, query) }
 
   /**
    * Cancels calls in flight, then closes the service if it is [AutoCloseable]. Every later call

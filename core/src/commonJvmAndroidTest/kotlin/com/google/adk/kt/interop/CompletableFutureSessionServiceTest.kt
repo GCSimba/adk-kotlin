@@ -20,6 +20,8 @@ import com.google.adk.kt.annotations.AdkJavaInteropApi
 import com.google.adk.kt.events.Event
 import com.google.adk.kt.sessions.GetSessionConfig
 import com.google.adk.kt.sessions.InMemorySessionService
+import com.google.adk.kt.sessions.ListEventsResponse
+import com.google.adk.kt.sessions.ListSessionsResponse
 import com.google.adk.kt.sessions.Session
 import com.google.adk.kt.sessions.SessionException
 import com.google.adk.kt.sessions.SessionKey
@@ -28,12 +30,15 @@ import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Role
 import com.google.common.truth.Truth.assertThat
 import java.util.concurrent.CancellationException
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit.SECONDS
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -203,6 +208,95 @@ class CompletableFutureSessionServiceTest {
     CompletableFutureSessionService.of(closeable).close()
 
     assertThat(closed).isTrue()
+  }
+
+  @Test
+  fun getSession_callerHasATraceContext_runsInIt() {
+    val recorder = ContextRecordingSessionService(inMemory)
+
+    CompletableFutureSessionService.of(recorder).use { recorded ->
+      CallerTrace.CONTEXT.makeCurrent().use { recorded.getSession(key).get(5, SECONDS) }
+    }
+
+    assertThat(recorder.seen).containsExactly("caller/null")
+  }
+
+  @Test
+  fun everyMethod_withCoroutineContext_runsInItAndTheCallersTraceContext() {
+    val recorder = ContextRecordingSessionService(inMemory)
+    val name = CoroutineName("call")
+
+    CompletableFutureSessionService.of(recorder).use { recorded ->
+      CallerTrace.CONTEXT.makeCurrent().use {
+        val session = recorded.createSession(key, null, name).get(5, SECONDS)
+        recorded.getSession(key, null, name).get(5, SECONDS)
+        recorded.listSessions("app", "user", name).get(5, SECONDS)
+        recorded.listEvents(key, name).get(5, SECONDS)
+        recorded.appendEvent(session, Event(author = "user"), name).get(5, SECONDS)
+        recorded.flush(key, name).get(5, SECONDS)
+        recorded.closeSession(session, name).get(5, SECONDS)
+        recorded.deleteSession(key, name).get(5, SECONDS)
+      }
+    }
+
+    assertThat(recorder.seen).containsExactlyElementsIn(List(8) { "caller/call" })
+  }
+
+  @Test
+  fun getSession_canceledJobInTheCoroutineContext_isIgnored() {
+    val canceled = Job().apply { cancel() }
+
+    assertThat(sessions.getSession(key, null, canceled).get(5, SECONDS)).isNull()
+  }
+
+  /** Records the trace value and coroutine name of each call as `trace/name`. */
+  private class ContextRecordingSessionService(private val delegate: SessionService) :
+    SessionService by delegate {
+    val seen = ConcurrentLinkedQueue<String>()
+
+    private suspend fun record() {
+      seen += CallerTrace.traceAndName()
+    }
+
+    override suspend fun createSession(key: SessionKey, state: Map<String, Any>?): Session {
+      record()
+      return delegate.createSession(key, state)
+    }
+
+    override suspend fun getSession(key: SessionKey, config: GetSessionConfig?): Session? {
+      record()
+      return delegate.getSession(key, config)
+    }
+
+    override suspend fun listSessions(appName: String, userId: String): ListSessionsResponse {
+      record()
+      return delegate.listSessions(appName, userId)
+    }
+
+    override suspend fun deleteSession(key: SessionKey) {
+      record()
+      delegate.deleteSession(key)
+    }
+
+    override suspend fun listEvents(key: SessionKey): ListEventsResponse {
+      record()
+      return delegate.listEvents(key)
+    }
+
+    override suspend fun closeSession(session: Session) {
+      record()
+      delegate.closeSession(session)
+    }
+
+    override suspend fun appendEvent(session: Session, event: Event): Event {
+      record()
+      return delegate.appendEvent(session, event)
+    }
+
+    override suspend fun flush(key: SessionKey?) {
+      record()
+      delegate.flush(key)
+    }
   }
 
   /** A session service whose [getSession] suspends until it is canceled. */

@@ -28,6 +28,8 @@ import com.google.adk.kt.events.Event
 import com.google.adk.kt.models.ContentInput
 import com.google.adk.kt.models.LlmResponse
 import com.google.adk.kt.models.Model
+import com.google.adk.kt.runners.InMemoryRunner
+import com.google.adk.kt.runners.Runner
 import com.google.adk.kt.testing.DummyLiveModel
 import com.google.adk.kt.testing.DummyLiveStep
 import com.google.adk.kt.testing.DummyLiveStep.AwaitSent
@@ -52,9 +54,12 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit.MILLISECONDS
+import java.util.concurrent.TimeUnit.SECONDS
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.NonCancellable
@@ -62,6 +67,7 @@ import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
@@ -81,9 +87,9 @@ import org.reactivestreams.Subscription
 class PublisherRunnerTest {
 
   /**
-   * Records what a Java subscriber would see, and on which threads, and can end the run from a
-   * signal: closing [queue] on turn complete or cancelling after the first event. With [blockUntil]
-   * it blocks in `onNext` until that latch opens, as slow inline work would.
+   * Records what a Java subscriber would see, on which threads, and in which trace, and can end the
+   * run from a signal: closing [queue] on turn complete or cancelling after the first event. With
+   * [blockUntil] it blocks in `onNext` until that latch opens, as slow inline work would.
    */
   private class RecordingSubscriber(
     private val queue: LiveRequestQueue? = null,
@@ -92,6 +98,7 @@ class PublisherRunnerTest {
   ) : Subscriber<Event> {
     val events = CopyOnWriteArrayList<Event>()
     val threads = CopyOnWriteArrayList<Thread>()
+    val traces = CopyOnWriteArrayList<String?>()
     val firstEvent = CompletableDeferred<Unit>()
     val terminated = CompletableDeferred<Throwable?>()
     private lateinit var subscription: Subscription
@@ -103,6 +110,7 @@ class PublisherRunnerTest {
 
     override fun onNext(event: Event) {
       threads.add(Thread.currentThread())
+      traces.add(CallerTrace.trace())
       events.add(event)
       firstEvent.complete(Unit)
       blockUntil?.await()
@@ -120,6 +128,9 @@ class PublisherRunnerTest {
   }
 
   private val runners = CopyOnWriteArrayList<PublisherRunner>()
+
+  /** What the runners from [rewindRecordingRunner] recorded at their last rewind. */
+  private val rewoundIn = AtomicReference<String>()
 
   @After
   fun closeRunners() {
@@ -452,6 +463,98 @@ class PublisherRunnerTest {
       Dispatchers.Default.asExecutor().execute { ranOnDefault.complete(Unit) }
       withTimeout(GUARD_TIMEOUT) { ranOnDefault.await() }
     }
+  }
+
+  @Test
+  fun runAsync_callerHasATraceContext_runsTheModelInIt() {
+    val seenByModel = AtomicReference<String>()
+    val model =
+      DummyModel(
+        "model",
+        listOf(
+          flow {
+            seenByModel.set(CallerTrace.traceAndName())
+            emit(LlmResponse(content = modelMessage("done")))
+          }
+        ),
+      )
+    val runner = runnerFor(model)
+
+    val events =
+      CallerTrace.CONTEXT.makeCurrent().use { runner.runAsync("u", "s", null, userMessage("hi")) }
+    AsyncJavaHelpers.forEach(events) {}
+
+    assertThat(seenByModel.get()).isEqualTo("caller/null")
+  }
+
+  @Test
+  fun runLive_callerHasATraceContext_runsAndCallsOnNextInIt(): Unit = runBlocking {
+    val ranIn = AtomicReference<String>()
+    val engine = InMemoryRunner(LlmAgent(name = "agent", model = DummyModel("model", emptyList())))
+    // Captures no context when called, so the run sees only what PublisherRunner gives it.
+    val runner =
+      PublisherRunner.of(
+        object : Runner by engine {
+          override fun runLive(
+            userId: String,
+            sessionId: String,
+            liveRequestQueue: LiveRequestQueue,
+            runConfig: RunConfig?,
+          ): Flow<Event> = flow {
+            ranIn.set(CallerTrace.traceAndName())
+            emit(Event(author = "agent"))
+          }
+        }
+      )
+    runners += runner
+    val subscriber = RecordingSubscriber()
+
+    val events =
+      CallerTrace.CONTEXT.makeCurrent().use { runner.runLive("u", "s", LiveRequestQueue()) }
+    events.subscribe(subscriber)
+
+    assertThat(withTimeout(GUARD_TIMEOUT) { subscriber.terminated.await() }).isNull()
+    assertThat(ranIn.get()).isEqualTo("caller/null")
+    assertThat(subscriber.traces).containsExactly("caller")
+  }
+
+  @Test
+  fun rewindAsync_callerHasATraceContext_runsInIt() {
+    val runner = rewindRecordingRunner()
+
+    CallerTrace.CONTEXT.makeCurrent().use {
+      runner.rewindAsync("u", "s", "invocation").get(5, SECONDS)
+    }
+
+    assertThat(rewoundIn.get()).isEqualTo("caller/null")
+  }
+
+  @Test
+  fun rewindAsync_withCoroutineContext_runsInIt() {
+    val runner = rewindRecordingRunner()
+
+    runner.rewindAsync("u", "s", "invocation", CoroutineName("call")).get(5, SECONDS)
+
+    assertThat(rewoundIn.get()).isEqualTo("null/call")
+  }
+
+  /** A runner whose rewind records its trace value and coroutine name as `trace/name`. */
+  private fun rewindRecordingRunner(): PublisherRunner {
+    val engine = InMemoryRunner(LlmAgent(name = "agent", model = DummyModel("model", emptyList())))
+    val runner =
+      PublisherRunner.of(
+        object : Runner by engine {
+          override suspend fun rewindAsync(
+            userId: String,
+            sessionId: String,
+            rewindBeforeInvocationId: String,
+          ) {
+            rewoundIn.set(CallerTrace.traceAndName())
+          }
+        }
+      )
+    runners += runner
+    return runner
   }
 
   /**

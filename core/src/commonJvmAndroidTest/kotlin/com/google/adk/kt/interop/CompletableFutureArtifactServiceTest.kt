@@ -23,11 +23,13 @@ import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.types.Part
 import com.google.common.truth.Truth.assertThat
 import java.util.concurrent.CancellationException
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit.SECONDS
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -132,6 +134,90 @@ class CompletableFutureArtifactServiceTest {
     CompletableFutureArtifactService.of(closeable).close()
 
     assertThat(closed).isTrue()
+  }
+
+  @Test
+  fun listArtifactKeys_callerHasATraceContext_runsInIt() {
+    val recorder = ContextRecordingArtifactService()
+
+    CompletableFutureArtifactService.of(recorder).use { recorded ->
+      CallerTrace.CONTEXT.makeCurrent().use { recorded.listArtifactKeys(key).get(5, SECONDS) }
+    }
+
+    assertThat(recorder.seen).containsExactly("caller/null")
+  }
+
+  @Test
+  fun everyMethod_withCoroutineContext_runsInItAndTheCallersTraceContext() {
+    val recorder = ContextRecordingArtifactService()
+    val name = CoroutineName("call")
+    val draft = Part(text = "draft")
+
+    CompletableFutureArtifactService.of(recorder).use { recorded ->
+      CallerTrace.CONTEXT.makeCurrent().use {
+        recorded.saveArtifact(key, "report.txt", draft, name).get(5, SECONDS)
+        recorded.saveAndReloadArtifact(key, "report.txt", draft, name).get(5, SECONDS)
+        recorded.loadArtifact(key, "report.txt", null, name).get(5, SECONDS)
+        recorded.listArtifactKeys(key, name).get(5, SECONDS)
+        recorded.listVersions(key, "report.txt", name).get(5, SECONDS)
+        recorded.deleteArtifact(key, "report.txt", name).get(5, SECONDS)
+      }
+    }
+
+    assertThat(recorder.seen).containsExactlyElementsIn(List(6) { "caller/call" })
+  }
+
+  /** Records the trace value and coroutine name of each call as `trace/name`. */
+  private class ContextRecordingArtifactService(
+    private val delegate: ArtifactService = InMemoryArtifactService()
+  ) : ArtifactService by delegate {
+    val seen = ConcurrentLinkedQueue<String>()
+
+    private suspend fun record() {
+      seen += CallerTrace.traceAndName()
+    }
+
+    override suspend fun saveArtifact(
+      sessionKey: SessionKey,
+      filename: String,
+      artifact: Part,
+    ): Int {
+      record()
+      return delegate.saveArtifact(sessionKey, filename, artifact)
+    }
+
+    override suspend fun saveAndReloadArtifact(
+      sessionKey: SessionKey,
+      filename: String,
+      artifact: Part,
+    ): Part {
+      record()
+      return delegate.saveAndReloadArtifact(sessionKey, filename, artifact)
+    }
+
+    override suspend fun loadArtifact(
+      sessionKey: SessionKey,
+      filename: String,
+      version: Int?,
+    ): Part? {
+      record()
+      return delegate.loadArtifact(sessionKey, filename, version)
+    }
+
+    override suspend fun listArtifactKeys(sessionKey: SessionKey): List<String> {
+      record()
+      return delegate.listArtifactKeys(sessionKey)
+    }
+
+    override suspend fun deleteArtifact(sessionKey: SessionKey, filename: String) {
+      record()
+      delegate.deleteArtifact(sessionKey, filename)
+    }
+
+    override suspend fun listVersions(sessionKey: SessionKey, filename: String): List<Int> {
+      record()
+      return delegate.listVersions(sessionKey, filename)
+    }
   }
 
   /** An artifact service whose [listArtifactKeys] suspends until it is canceled. */

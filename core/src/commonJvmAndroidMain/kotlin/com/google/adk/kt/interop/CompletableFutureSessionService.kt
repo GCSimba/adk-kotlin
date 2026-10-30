@@ -25,6 +25,8 @@ import com.google.adk.kt.sessions.Session
 import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.sessions.SessionService
 import java.util.concurrent.CompletableFuture
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -32,10 +34,12 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.future.future
 
 /**
- * Java-friendly wrapper around a [SessionService] that it owns. Each method calls the `suspend`
+ * Java-friendly wrapper around a [SessionService] that it owns: each method calls the `suspend`
  * method of the same name and returns a [CompletableFuture] of its result, so Java callers never
- * pass a `Continuation`. Canceling a future cancels its call, and [close] cancels every call in
- * flight, then closes the service if it is [AutoCloseable].
+ * pass a `Continuation`. Each call runs in the caller's OpenTelemetry context and in the
+ * `coroutineContext` passed to it, such as `MDCContext()` from kotlinx-coroutines-slf4j to carry
+ * the caller's MDC. Canceling a future cancels its call, a `Job` in `coroutineContext` is ignored,
+ * and [close] cancels every call in flight, then closes the service if it is [AutoCloseable].
  */
 @AdkJavaInteropApi
 class CompletableFutureSessionService private constructor(private val delegate: SessionService) :
@@ -50,55 +54,83 @@ class CompletableFutureSessionService private constructor(private val delegate: 
 
   /** Calls [SessionService.createSession]. */
   @JvmOverloads
-  fun createSession(key: SessionKey, state: Map<String, Any>? = null): CompletableFuture<Session> =
-    scope.future {
-      delegate.createSession(key, state)
-    }
+  fun createSession(
+    key: SessionKey,
+    state: Map<String, Any>? = null,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Session> =
+    scope.future(callerContext(coroutineContext)) { delegate.createSession(key, state) }
 
   /** Calls [SessionService.getSession]; the future completes with `null` if there is no session. */
   @JvmOverloads
-  fun getSession(key: SessionKey, config: GetSessionConfig? = null): CompletableFuture<Session?> =
-    scope.future {
-      delegate.getSession(key, config)
-    }
+  fun getSession(
+    key: SessionKey,
+    config: GetSessionConfig? = null,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Session?> =
+    scope.future(callerContext(coroutineContext)) { delegate.getSession(key, config) }
 
   /** Calls [SessionService.listSessions]. */
-  fun listSessions(appName: String, userId: String): CompletableFuture<ListSessionsResponse> =
-    scope.future {
-      delegate.listSessions(appName, userId)
-    }
+  @JvmOverloads
+  fun listSessions(
+    appName: String,
+    userId: String,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<ListSessionsResponse> =
+    scope.future(callerContext(coroutineContext)) { delegate.listSessions(appName, userId) }
 
   /** Calls [SessionService.deleteSession]. */
-  fun deleteSession(key: SessionKey): CompletableFuture<Void?> = scope.future {
-    delegate.deleteSession(key)
-    null
-  }
+  @JvmOverloads
+  fun deleteSession(
+    key: SessionKey,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Void?> =
+    scope.future(callerContext(coroutineContext)) {
+      delegate.deleteSession(key)
+      null
+    }
 
   /** Calls [SessionService.listEvents]. */
-  fun listEvents(key: SessionKey): CompletableFuture<ListEventsResponse> = scope.future {
-    delegate.listEvents(key)
-  }
+  @JvmOverloads
+  fun listEvents(
+    key: SessionKey,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<ListEventsResponse> =
+    scope.future(callerContext(coroutineContext)) { delegate.listEvents(key) }
 
   /** Calls [SessionService.closeSession]. */
-  fun closeSession(session: Session): CompletableFuture<Void?> = scope.future {
-    delegate.closeSession(session)
-    null
-  }
+  @JvmOverloads
+  fun closeSession(
+    session: Session,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Void?> =
+    scope.future(callerContext(coroutineContext)) {
+      delegate.closeSession(session)
+      null
+    }
 
   /**
    * Calls [SessionService.appendEvent], which updates [session] in place on another thread, so
    * leave [session] alone until the future completes.
    */
-  fun appendEvent(session: Session, event: Event): CompletableFuture<Event> = scope.future {
-    delegate.appendEvent(session, event)
-  }
+  @JvmOverloads
+  fun appendEvent(
+    session: Session,
+    event: Event,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Event> =
+    scope.future(callerContext(coroutineContext)) { delegate.appendEvent(session, event) }
 
   /** Calls [SessionService.flush]. */
   @JvmOverloads
-  fun flush(key: SessionKey? = null): CompletableFuture<Void?> = scope.future {
-    delegate.flush(key)
-    null
-  }
+  fun flush(
+    key: SessionKey? = null,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Void?> =
+    scope.future(callerContext(coroutineContext)) {
+      delegate.flush(key)
+      null
+    }
 
   /**
    * Cancels calls in flight, then closes the service if it is [AutoCloseable]. Every later call

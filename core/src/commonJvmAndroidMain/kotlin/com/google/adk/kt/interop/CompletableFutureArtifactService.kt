@@ -21,6 +21,8 @@ import com.google.adk.kt.artifacts.ArtifactService
 import com.google.adk.kt.sessions.SessionKey
 import com.google.adk.kt.types.Part
 import java.util.concurrent.CompletableFuture
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -28,10 +30,12 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.future.future
 
 /**
- * Java-friendly wrapper around an [ArtifactService] that it owns. Each method calls the `suspend`
+ * Java-friendly wrapper around an [ArtifactService] that it owns: each method calls the `suspend`
  * method of the same name and returns a [CompletableFuture] of its result, so Java callers never
- * pass a `Continuation`. Canceling a future cancels its call, and [close] cancels every call in
- * flight, then closes the service if it is [AutoCloseable].
+ * pass a `Continuation`. Each call runs in the caller's OpenTelemetry context and in the
+ * `coroutineContext` passed to it, such as `MDCContext()` from kotlinx-coroutines-slf4j to carry
+ * the caller's MDC. Canceling a future cancels its call, a `Job` in `coroutineContext` is ignored,
+ * and [close] cancels every call in flight, then closes the service if it is [AutoCloseable].
  */
 @AdkJavaInteropApi
 class CompletableFutureArtifactService private constructor(private val delegate: ArtifactService) :
@@ -45,20 +49,28 @@ class CompletableFutureArtifactService private constructor(private val delegate:
   fun asKotlinArtifactService(): ArtifactService = delegate
 
   /** Calls [ArtifactService.saveArtifact]; the future completes with the saved version. */
+  @JvmOverloads
   fun saveArtifact(
     sessionKey: SessionKey,
     filename: String,
     artifact: Part,
-  ): CompletableFuture<Int> = scope.future { delegate.saveArtifact(sessionKey, filename, artifact) }
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Int> =
+    scope.future(callerContext(coroutineContext)) {
+      delegate.saveArtifact(sessionKey, filename, artifact)
+    }
 
   /** Calls [ArtifactService.saveAndReloadArtifact]. */
+  @JvmOverloads
   fun saveAndReloadArtifact(
     sessionKey: SessionKey,
     filename: String,
     artifact: Part,
-  ): CompletableFuture<Part> = scope.future {
-    delegate.saveAndReloadArtifact(sessionKey, filename, artifact)
-  }
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Part> =
+    scope.future(callerContext(coroutineContext)) {
+      delegate.saveAndReloadArtifact(sessionKey, filename, artifact)
+    }
 
   /**
    * Calls [ArtifactService.loadArtifact], which loads the latest version when [version] is `null`.
@@ -69,27 +81,40 @@ class CompletableFutureArtifactService private constructor(private val delegate:
     sessionKey: SessionKey,
     filename: String,
     version: Int? = null,
-  ): CompletableFuture<Part?> = scope.future {
-    delegate.loadArtifact(sessionKey, filename, version)
-  }
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Part?> =
+    scope.future(callerContext(coroutineContext)) {
+      delegate.loadArtifact(sessionKey, filename, version)
+    }
 
   /** Calls [ArtifactService.listArtifactKeys]. */
-  fun listArtifactKeys(sessionKey: SessionKey): CompletableFuture<List<String>> = scope.future {
-    delegate.listArtifactKeys(sessionKey)
-  }
+  @JvmOverloads
+  fun listArtifactKeys(
+    sessionKey: SessionKey,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<List<String>> =
+    scope.future(callerContext(coroutineContext)) { delegate.listArtifactKeys(sessionKey) }
 
   /** Calls [ArtifactService.deleteArtifact]. */
-  fun deleteArtifact(sessionKey: SessionKey, filename: String): CompletableFuture<Void?> =
-    scope.future {
+  @JvmOverloads
+  fun deleteArtifact(
+    sessionKey: SessionKey,
+    filename: String,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<Void?> =
+    scope.future(callerContext(coroutineContext)) {
       delegate.deleteArtifact(sessionKey, filename)
       null
     }
 
   /** Calls [ArtifactService.listVersions]. */
-  fun listVersions(sessionKey: SessionKey, filename: String): CompletableFuture<List<Int>> =
-    scope.future {
-      delegate.listVersions(sessionKey, filename)
-    }
+  @JvmOverloads
+  fun listVersions(
+    sessionKey: SessionKey,
+    filename: String,
+    coroutineContext: CoroutineContext = EmptyCoroutineContext,
+  ): CompletableFuture<List<Int>> =
+    scope.future(callerContext(coroutineContext)) { delegate.listVersions(sessionKey, filename) }
 
   /**
    * Cancels calls in flight, then closes the service if it is [AutoCloseable]. Every later call

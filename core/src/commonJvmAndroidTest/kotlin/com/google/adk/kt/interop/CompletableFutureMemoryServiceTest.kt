@@ -28,12 +28,14 @@ import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.Role
 import com.google.common.truth.Truth.assertThat
 import java.util.concurrent.CancellationException
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit.SECONDS
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertFailsWith
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -145,6 +147,37 @@ class CompletableFutureMemoryServiceTest {
   }
 
   @Test
+  fun searchMemory_callerHasATraceContext_runsInIt() {
+    val recorder = ContextRecordingMemoryService()
+
+    CompletableFutureMemoryService.of(recorder).use { recorded ->
+      CallerTrace.CONTEXT.makeCurrent().use {
+        recorded.searchMemory("app", "user", "q").get(5, SECONDS)
+      }
+    }
+
+    assertThat(recorder.seen).containsExactly("caller/null")
+  }
+
+  @Test
+  fun everyMethod_withCoroutineContext_runsInItAndTheCallersTraceContext() {
+    val recorder = ContextRecordingMemoryService()
+    val name = CoroutineName("call")
+    val session = Session(key = SessionKey("app", "user", "session"))
+
+    CompletableFutureMemoryService.of(recorder).use { recorded ->
+      CallerTrace.CONTEXT.makeCurrent().use {
+        recorded.addSessionToMemory(session, name).get(5, SECONDS)
+        recorded.addEventsToMemory("app", "user", emptyList(), null, null, name).get(5, SECONDS)
+        recorded.addMemory("app", "user", emptyList(), null, name).get(5, SECONDS)
+        recorded.searchMemory("app", "user", "q", name).get(5, SECONDS)
+      }
+    }
+
+    assertThat(recorder.seen).containsExactlyElementsIn(List(4) { "caller/call" })
+  }
+
+  @Test
   fun close_cancelsCallsInFlightAndLaterCalls() {
     val hanging = HangingMemoryService()
     CompletableFutureMemoryService.of(hanging).use { wrapper ->
@@ -211,6 +244,47 @@ class CompletableFutureMemoryServiceTest {
       } finally {
         canceled.complete(Unit)
       }
+    }
+  }
+
+  /** Records the trace value and coroutine name of each call as `trace/name`. */
+  private class ContextRecordingMemoryService : MemoryService by InMemoryMemoryService() {
+    val seen = ConcurrentLinkedQueue<String>()
+
+    private suspend fun record() {
+      seen += CallerTrace.traceAndName()
+    }
+
+    override suspend fun addSessionToMemory(session: Session) {
+      record()
+    }
+
+    override suspend fun addEventsToMemory(
+      appName: String,
+      userId: String,
+      events: List<Event>,
+      sessionId: String?,
+      customMetadata: Map<String, Any?>?,
+    ) {
+      record()
+    }
+
+    override suspend fun addMemory(
+      appName: String,
+      userId: String,
+      memories: List<MemoryEntry>,
+      customMetadata: Map<String, Any?>?,
+    ) {
+      record()
+    }
+
+    override suspend fun searchMemory(
+      appName: String,
+      userId: String,
+      query: String,
+    ): SearchMemoryResponse {
+      record()
+      return SearchMemoryResponse(memories = emptyList())
     }
   }
 }
