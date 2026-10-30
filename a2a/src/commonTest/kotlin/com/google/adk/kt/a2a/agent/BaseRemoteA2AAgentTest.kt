@@ -24,6 +24,7 @@ import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FunctionCall
+import com.google.adk.kt.types.FunctionResponse
 import com.google.adk.kt.types.Part
 import com.google.adk.kt.types.Role
 import kotlin.test.Test
@@ -79,6 +80,82 @@ class BaseRemoteA2AAgentTest {
     assertEquals(userResponse.content, result.content)
     assertEquals("task-123", result.customMetadata?.get("adk_task_id"))
     assertEquals("ctx-456", result.customMetadata?.get("adk_context_id"))
+  }
+
+  @Test
+  fun prepareOutboundEvent_answerToCredentialCall_isLeftOut() {
+    val agent = TestRemoteAgent("my-agent")
+    val remoteCalls =
+      Event(
+        author = "my-agent",
+        content =
+          modelMessage(
+            Part(functionCall = FunctionCall(name = "adk_request_credential", id = "cred-id")),
+            Part(functionCall = FunctionCall(name = "lookup", id = "fc-id")),
+          ),
+      )
+    val credential =
+      FunctionResponse(name = "my-auth", id = "cred-id", response = mapOf("token" to "t"))
+    val lookup = FunctionResponse(name = "lookup", id = "fc-id", response = mapOf("ok" to true))
+    val userResponse =
+      Event(
+        author = Role.USER,
+        content =
+          Content(
+            role = Role.USER,
+            parts = listOf(Part(functionResponse = credential), Part(functionResponse = lookup)),
+          ),
+      )
+    val session = Session(key = SessionKey(appName = "demo", userId = "user", id = "session-1"))
+    session.events.addAll(listOf(remoteCalls, userResponse))
+    val context =
+      InvocationContext(
+        invocationId = "inv-123",
+        agent = agent,
+        session = session,
+        runConfig = null,
+      )
+
+    val result = agent.testPrepareOutboundEvent(context)
+
+    assertEquals(listOf(lookup), result.content?.parts?.map { it.functionResponse })
+  }
+
+  @Test
+  fun prepareOutboundEvent_onlyCredentialAnswer_fallsBackToScrubbedHistory() {
+    val agent = TestRemoteAgent("my-agent")
+    val remoteCall =
+      Event(
+        author = "my-agent",
+        content =
+          modelMessage(
+            Part(functionCall = FunctionCall(name = "adk_request_credential", id = "cred-id"))
+          ),
+      )
+    val userResponse =
+      Event(
+        author = Role.USER,
+        content =
+          userFunctionResponse(name = "my-auth", id = "cred-id", response = mapOf("token" to "t")),
+      )
+    val otherAgentEvent =
+      Event(author = "other-agent", content = modelMessage("Use the saved key."))
+    val session = Session(key = SessionKey(appName = "demo", userId = "user", id = "session-1"))
+    session.events.addAll(listOf(remoteCall, otherAgentEvent, userResponse))
+    val context =
+      InvocationContext(
+        invocationId = "inv-123",
+        agent = agent,
+        session = session,
+        runConfig = null,
+      )
+
+    val result = agent.testPrepareOutboundEvent(context)
+
+    assertEquals(
+      listOf("For context:", "[other-agent] said: Use the saved key."),
+      result.content?.parts?.map { it.text },
+    )
   }
 
   @Test

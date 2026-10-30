@@ -31,6 +31,10 @@ import com.google.adk.kt.testing.DummyAgent
 import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
+import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.FunctionCall
+import com.google.adk.kt.types.Part
+import com.google.adk.kt.types.Role
 import com.google.common.truth.Truth.assertThat
 import java.util.function.BiConsumer
 import java.util.function.Consumer
@@ -585,6 +589,93 @@ class A2AAgentImplTest {
     assertThat(data["id"]).isEqualTo("call-1")
     assertThat(dataPart.metadata?.get("adk_type")).isEqualTo("function_response")
   }
+
+  @Test
+  fun runAsync_otherAgentCredentialRequest_leavesItOutOfRequest() =
+    runBlocking<Unit> {
+      val agent = createTestAgent()
+      val authConfig =
+        mapOf("rawAuthCredential" to mapOf("oauth2" to mapOf("clientSecret" to "s3cr3t")))
+      val credentialCall =
+        FunctionCall(name = "adk_request_credential", args = mapOf("authConfig" to authConfig))
+      val session =
+        Session(
+          key = SessionKey(appName = "demo", userId = "user", id = "session-2"),
+          events =
+            mutableListOf(
+              Event(
+                invocationId = "invocation-1",
+                author = "auth_agent",
+                content =
+                  Content(
+                    role = Role.MODEL,
+                    parts =
+                      listOf(Part(text = "Please sign in."), Part(functionCall = credentialCall)),
+                  ),
+              ),
+              Event(invocationId = "invocation-1", author = "user", content = userMessage("thanks")),
+            ),
+        )
+      mockStreamResponse(this) { consumer -> consumer.accept(createFinalEvent("ok"), agentCard) }
+
+      agent.runAsync(invocationContext.copy(session = session)).toList()
+
+      val messageCaptor = argumentCaptor<Message>()
+      verify(mockClient)
+        .sendMessage(
+          messageCaptor.capture(),
+          any<List<BiConsumer<ClientEvent, AgentCard>>>(),
+          any<Consumer<Throwable>>(),
+          isNull(),
+        )
+      assertThat(messageCaptor.firstValue.parts.map { (it as TextPart).text })
+        .containsExactly("For context:", "[auth_agent] said: Please sign in.", "thanks")
+        .inOrder()
+    }
+
+  @Test
+  fun runAsync_onlyCredentialAnswer_skipsCallAndKeepsContextId() =
+    runBlocking<Unit> {
+      val agent = createTestAgent()
+      val credentialCall = FunctionCall(name = "adk_request_credential", id = "cred-id")
+      val session =
+        Session(
+          key = SessionKey(appName = "demo", userId = "user", id = "session-4"),
+          events =
+            mutableListOf(
+              Event(
+                invocationId = "invocation-1",
+                author = "remote-agent",
+                content = modelMessage(Part(functionCall = credentialCall)),
+                customMetadata = mapOf("adk_context_id" to "context-1"),
+              ),
+              Event(
+                invocationId = "invocation-1",
+                author = "user",
+                content =
+                  userFunctionResponse(
+                    name = "adk_request_credential",
+                    id = "cred-id",
+                    response = mapOf("token" to "t"),
+                  ),
+              ),
+            ),
+        )
+
+      val events =
+        withTimeout(5.seconds) {
+          agent.runAsync(invocationContext.copy(session = session)).toList()
+        }
+
+      assertThat(events.single().contextId).isEqualTo("context-1")
+      verify(mockClient, never())
+        .sendMessage(
+          any<Message>(),
+          any<List<BiConsumer<ClientEvent, AgentCard>>>(),
+          any<Consumer<Throwable>>(),
+          isNull(),
+        )
+    }
 
   @Test
   fun runAsync_handlesClientError() = runTest {

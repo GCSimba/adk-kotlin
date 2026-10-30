@@ -25,6 +25,7 @@ import com.google.adk.kt.testing.modelMessage
 import com.google.adk.kt.testing.userFunctionResponse
 import com.google.adk.kt.testing.userMessage
 import com.google.adk.kt.types.CitationMetadata
+import com.google.adk.kt.types.Content
 import com.google.adk.kt.types.FinishReason
 import com.google.adk.kt.types.FunctionCall
 import com.google.adk.kt.types.FunctionResponse
@@ -34,8 +35,10 @@ import com.google.adk.kt.types.Role
 import com.google.adk.kt.types.UsageMetadata
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertSame
+import kotlin.test.assertTrue
 
 class EventA2aSupportTest {
 
@@ -342,6 +345,149 @@ class EventA2aSupportTest {
   }
 
   @Test
+  fun extractPreprocessedEvents_dropsCredentialParts() {
+    val agent = DummyAgent(name = "my-agent")
+    val credentialCall =
+      FunctionCall(
+        name = "adk_request_credential",
+        id = "cred-id",
+        args = mapOf("authConfig" to AUTH_CONFIG),
+      )
+    // Only the call id marks this answer as a credential.
+    val credentialAnswer =
+      FunctionResponse(name = "my-auth", id = "cred-id", response = mapOf("token" to "t"))
+    val session = Session(key = SessionKey(appName = "demo", userId = "user", id = "session-1"))
+    session.events.addAll(
+      listOf(
+        Event(author = "other-agent", content = modelMessage(Part(text = "Signing in."))),
+        Event(author = "other-agent", content = modelMessage(Part(functionCall = credentialCall))),
+        Event(
+          author = Role.USER,
+          content =
+            Content(
+              role = Role.USER,
+              parts = listOf(Part(functionResponse = credentialAnswer), Part(text = "Done.")),
+            ),
+        ),
+      )
+    )
+    val context =
+      InvocationContext(
+        invocationId = "inv-123",
+        agent = agent,
+        session = session,
+        runConfig = null,
+      )
+
+    val result = context.extractPreprocessedEvents()
+
+    assertEquals(
+      listOf("For context:", "[other-agent] said: Signing in.", "Done."),
+      result.flatMap { it.content?.parts.orEmpty() }.map { it.text },
+    )
+  }
+
+  @Test
+  fun withoutCredentialParts_credentialRequestCall_dropsIt() {
+    val call = FunctionCall(name = "adk_request_credential")
+    assertTrue(Part(functionCall = call).isDroppedFromEvent(emptySet()))
+  }
+
+  @Test
+  fun withoutCredentialParts_callWithAuthConfigArgument_dropsIt() {
+    val call = FunctionCall(name = "my-func", args = mapOf("auth_config" to AUTH_CONFIG))
+    assertTrue(Part(functionCall = call).isDroppedFromEvent(emptySet()))
+  }
+
+  // The AuthConfig is nested under authConfig, so a top-level auth_scheme is an ordinary argument.
+  @Test
+  fun withoutCredentialParts_callWithTopLevelAuthSchemeArgument_keepsIt() {
+    val call = FunctionCall(name = "my-func", args = mapOf("auth_scheme" to "basic"))
+    assertFalse(Part(functionCall = call).isDroppedFromEvent(emptySet()))
+  }
+
+  @Test
+  fun withoutCredentialParts_callWhoseAuthConfigArgumentIsNotAnAuthConfig_keepsIt() {
+    val call = FunctionCall(name = "my-func", args = mapOf("authConfig" to "profile-1"))
+    assertFalse(Part(functionCall = call).isDroppedFromEvent(emptySet()))
+  }
+
+  @Test
+  fun withoutCredentialParts_responseHoldingAuthConfig_dropsIt() {
+    val response = FunctionResponse(name = "my-func", response = AUTH_CONFIG)
+    assertTrue(Part(functionResponse = response).isDroppedFromEvent(emptySet()))
+  }
+
+  @Test
+  fun withoutCredentialParts_responseHoldingWrappedSnakeCaseAuthConfig_dropsIt() {
+    val authConfig = mapOf("raw_auth_credential" to mapOf("api_key" to "k"))
+    val response = FunctionResponse(name = "my-func", response = mapOf("result" to authConfig))
+    assertTrue(Part(functionResponse = response).isDroppedFromEvent(emptySet()))
+  }
+
+  @Test
+  fun withoutCredentialParts_responseNamedForCredentialRequest_dropsIt() {
+    val response = FunctionResponse(name = "adk_request_credential", response = mapOf("ok" to true))
+    assertTrue(Part(functionResponse = response).isDroppedFromEvent(emptySet()))
+  }
+
+  @Test
+  fun withoutCredentialParts_responseToCredentialCall_dropsIt() {
+    val response = FunctionResponse(name = "my-func", id = "fc-id", response = mapOf("ok" to true))
+    assertTrue(Part(functionResponse = response).isDroppedFromEvent(setOf("fc-id")))
+  }
+
+  @Test
+  fun withoutCredentialParts_ordinaryResponse_keepsIt() {
+    val response = FunctionResponse(name = "my-func", response = mapOf("result" to "fine"))
+    assertFalse(Part(functionResponse = response).isDroppedFromEvent(emptySet()))
+  }
+
+  @Test
+  fun extractPreprocessedEvents_idLessCredentialRequest_dropsIdLessAnswers() {
+    val agent = DummyAgent(name = "my-agent")
+    val answer = FunctionResponse(name = "my-auth", response = mapOf("token" to "t"))
+    val session = Session(key = SessionKey(appName = "demo", userId = "user", id = "session-1"))
+    session.events.addAll(
+      listOf(
+        Event(
+          author = "other-agent",
+          content = modelMessage(Part(functionCall = FunctionCall(name = "adk_request_credential"))),
+        ),
+        Event(
+          author = Role.USER,
+          content = Content(role = Role.USER, parts = listOf(Part(functionResponse = answer))),
+        ),
+      )
+    )
+    val context =
+      InvocationContext(
+        invocationId = "inv-123",
+        agent = agent,
+        session = session,
+        runConfig = null,
+      )
+
+    assertEquals(
+      emptyList(),
+      context.extractPreprocessedEvents().flatMap { it.content?.parts.orEmpty() },
+    )
+  }
+
+  // An id-less answer cannot be paired with its request, so it fails closed.
+  @Test
+  fun withoutCredentialParts_idLessResponseWithIdLessCredentialRequest_dropsIt() {
+    val response = FunctionResponse(name = "my-func", response = mapOf("ok" to true))
+    assertTrue(Part(functionResponse = response).isDroppedFromEvent(setOf(null)))
+  }
+
+  @Test
+  fun withoutCredentialParts_idLessResponseWithIdentifiedCredentialRequest_keepsIt() {
+    val response = FunctionResponse(name = "my-func", response = mapOf("ok" to true))
+    assertFalse(Part(functionResponse = response).isDroppedFromEvent(setOf("cred-id")))
+  }
+
+  @Test
   fun extractPreprocessedEvents_propagatesContextIdFromLastAgentResponse() {
     val agent = DummyAgent(name = "my-agent")
     val lastAgentResponse =
@@ -363,6 +509,19 @@ class EventA2aSupportTest {
     assertEquals(1, result.size)
     assertEquals("user", result[0].author)
     assertEquals("parent-context-id", result[0].contextId)
+  }
+
+  private fun Part.isDroppedFromEvent(credentialCallIds: Set<String?>): Boolean {
+    val event = Event(author = "agent1", content = Content(role = Role.MODEL, parts = listOf(this)))
+    return event.withoutCredentialParts(credentialCallIds).content?.parts.isNullOrEmpty()
+  }
+
+  companion object {
+    private val AUTH_CONFIG =
+      mapOf(
+        "authScheme" to mapOf("type" to "oauth2"),
+        "rawAuthCredential" to mapOf("oauth2" to mapOf("clientSecret" to "s3cr3t")),
+      )
   }
 }
 

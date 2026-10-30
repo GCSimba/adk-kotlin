@@ -41,6 +41,20 @@ internal object MetadataKeys {
 internal const val ADK_METADATA_TASK_ID = "adk_task_id"
 internal const val ADK_METADATA_CONTEXT_ID = "adk_context_id"
 
+private const val REQUEST_CREDENTIAL_CALL_NAME = "adk_request_credential"
+
+private val AUTH_CONFIG_ARG_KEYS = listOf("authConfig", "auth_config")
+
+private val AUTH_CONFIG_KEYS =
+  setOf(
+    "authScheme",
+    "auth_scheme",
+    "rawAuthCredential",
+    "raw_auth_credential",
+    "exchangedAuthCredential",
+    "exchanged_auth_credential",
+  )
+
 /** Interface for parsing A2A metadata without depending on a specific JSON library. */
 internal interface A2AMetadataParser {
   fun <T : Any> parse(metadata: Any?, clazz: KClass<T>): T?
@@ -94,7 +108,10 @@ internal fun InvocationContext.extractPreprocessedEvents(): List<Event> {
   val lastResponseIndex = events.indexOfLast { it.author == agent.name }
   val contextIdValue = if (lastResponseIndex != -1) events[lastResponseIndex].contextId else ""
 
-  return events.drop(lastResponseIndex + 1).map { event ->
+  val credentialCallIds = events.credentialCallIds()
+
+  return events.drop(lastResponseIndex + 1).map {
+    val event = it.withoutCredentialParts(credentialCallIds)
     if (event.author != Role.USER && event.author != agent.name) {
       presentAsUserMessage(event, contextIdValue, invocationId)
     } else {
@@ -167,6 +184,45 @@ internal fun remoteCallAsUserPart(author: String, part: Part): Part {
     }
     else -> part
   }
+}
+
+/** Returns the ids of the credential requests in these events; null stands for an id-less one. */
+internal fun List<Event>.credentialCallIds(): Set<String?> =
+  flatMap { it.functionCalls() }
+    .filter { it.name == REQUEST_CREDENTIAL_CALL_NAME }
+    .mapTo(mutableSetOf()) { it.id }
+
+/**
+ * Returns whether this part carries credentials: a credential request, a call whose `authConfig`
+ * argument holds an AuthConfig, or an answer named for a credential request, answering one of
+ * [credentialCallIds], or holding an AuthConfig. An answer without an id matches a request without
+ * one.
+ */
+private fun Part.carriesCredential(credentialCallIds: Set<String?>): Boolean {
+  functionResponse?.let { response ->
+    return response.name == REQUEST_CREDENTIAL_CALL_NAME ||
+      response.id in credentialCallIds ||
+      isAuthConfig(response.response)
+  }
+  functionCall?.let { call ->
+    return call.name == REQUEST_CREDENTIAL_CALL_NAME ||
+      AUTH_CONFIG_ARG_KEYS.any { isAuthConfig(call.args[it]) }
+  }
+  return false
+}
+
+/** Returns this event without its credential parts, which are never sent to a remote agent. */
+internal fun Event.withoutCredentialParts(credentialCallIds: Set<String?>): Event {
+  val content = content ?: return this
+  val kept = content.parts.filterNot { it.carriesCredential(credentialCallIds) }
+  return if (kept.size == content.parts.size) this else copy(content = content.copy(parts = kept))
+}
+
+// A serialized AuthConfig, bare or wrapped as {"result": ...}, has at least one of these keys.
+private fun isAuthConfig(payload: Any?): Boolean {
+  val candidate =
+    (payload as? Map<*, *>)?.let { if (it.size == 1 && "result" in it) it["result"] else it }
+  return candidate is Map<*, *> && AUTH_CONFIG_KEYS.any { it in candidate }
 }
 
 /** Returns an empty event with the given invocation context. */

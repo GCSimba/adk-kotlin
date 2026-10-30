@@ -19,9 +19,11 @@ package com.google.adk.kt.a2a.agent
 import com.google.adk.kt.a2a.converters.ADK_METADATA_CONTEXT_ID
 import com.google.adk.kt.a2a.converters.ADK_METADATA_TASK_ID
 import com.google.adk.kt.a2a.converters.contextId
+import com.google.adk.kt.a2a.converters.credentialCallIds
 import com.google.adk.kt.a2a.converters.extractPreprocessedEvents
 import com.google.adk.kt.a2a.converters.findUserFunctionCall
 import com.google.adk.kt.a2a.converters.taskId
+import com.google.adk.kt.a2a.converters.withoutCredentialParts
 import com.google.adk.kt.agents.BaseAgent
 import com.google.adk.kt.agents.InvocationContext
 import com.google.adk.kt.callbacks.AfterAgentCallback
@@ -65,8 +67,16 @@ abstract class BaseRemoteA2AAgent(
     val outboundEvent = prepareOutboundEvent(context)
 
     if (outboundEvent.content?.parts.isNullOrEmpty()) {
-      logger.debug { "No parts to send; skipping remote A2A call." }
-      return flowOf(Event(invocationId = context.invocationId, author = name, turnComplete = true))
+      logger.warn { "No parts to send; skipping remote A2A call." }
+      // Keeps the remote context id, which the next turn reads from this agent's last event.
+      return flowOf(
+        Event(
+          invocationId = context.invocationId,
+          author = name,
+          turnComplete = true,
+          customMetadata = outboundEvent.customMetadata,
+        )
+      )
     }
 
     return createA2aCallbackFlow(context, outboundEvent)
@@ -77,12 +87,18 @@ abstract class BaseRemoteA2AAgent(
     val callEvent = context.session.events.findUserFunctionCall()
 
     if (callEvent != null) {
-      val responseEvent = context.session.events.last()
-      val updatedMetadata = (responseEvent.customMetadata ?: emptyMap()).toMutableMap()
-      updatedMetadata[ADK_METADATA_TASK_ID] = callEvent.taskId
-      updatedMetadata[ADK_METADATA_CONTEXT_ID] = callEvent.contextId
+      val responseEvent =
+        context.session.events
+          .last()
+          .withoutCredentialParts(context.session.events.credentialCallIds())
+      // With nothing left to resume with, the scrubbed history below is sent instead.
+      if (!responseEvent.content?.parts.isNullOrEmpty()) {
+        val updatedMetadata = (responseEvent.customMetadata ?: emptyMap()).toMutableMap()
+        updatedMetadata[ADK_METADATA_TASK_ID] = callEvent.taskId
+        updatedMetadata[ADK_METADATA_CONTEXT_ID] = callEvent.contextId
 
-      return responseEvent.copy(author = Role.USER, customMetadata = updatedMetadata)
+        return responseEvent.copy(author = Role.USER, customMetadata = updatedMetadata)
+      }
     }
     val contextIdValue = context.session.events.findLast { it.author == name }?.contextId
     val customMetadata =
